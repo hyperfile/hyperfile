@@ -224,14 +224,14 @@ impl S3Staging {
 
     pub async fn from(client: &Client, config: StagingConfig, runtime_config: HyperFileRuntimeConfig) -> Result<Self> {
         // convert s3uri in config to bucket / key
-        let s3uri = S3Uri::parse(&config.inode_file_path).unwrap();
+        let s3uri = S3Uri::parse(&config.inode_file_uri).unwrap();
         let inode_file_path = s3uri.key.to_string();
         let inode_exists = Self::try_exists(client, s3uri.bucket, &inode_file_path).await?;
         if !inode_exists {
-            return Err(Error::new(ErrorKind::NotFound, format!("inode not exists: {}", config.inode_file_path)));
+            return Err(Error::new(ErrorKind::NotFound, format!("inode not exists: {}", config.inode_file_uri)));
         }
 
-        let s3uri = S3Uri::parse(&config.root_path).unwrap();
+        let s3uri = S3Uri::parse(&config.root_uri).unwrap();
         let root_path = s3uri.key.to_string();
         let mut root_path_slash = root_path.clone();
         root_path_slash.push('/');
@@ -249,14 +249,14 @@ impl S3Staging {
 
     pub async fn create(client: &Client, config: StagingConfig, runtime_config: HyperFileRuntimeConfig) -> Result<Self> {
         // convert s3uri in config to bucket / key
-        let s3uri = S3Uri::parse(&config.inode_file_path).unwrap();
+        let s3uri = S3Uri::parse(&config.inode_file_uri).unwrap();
         let inode_file_path = s3uri.key.to_string();
         let inode_exists = Self::try_exists(client, s3uri.bucket, &inode_file_path).await?;
         if inode_exists {
             return Err(Error::new(ErrorKind::AlreadyExists, "inode exists"));
         }
 
-        let s3uri = S3Uri::parse(&config.root_path).unwrap();
+        let s3uri = S3Uri::parse(&config.root_uri).unwrap();
         let root_path = s3uri.key.to_string();
         let mut root_path_slash = root_path.clone();
         root_path_slash.push('/');

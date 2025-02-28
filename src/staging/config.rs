@@ -20,8 +20,8 @@ pub enum StagingInodeLocationType {
 pub struct StagingConfig {
     pub typ: StagingType,
     pub inode_loc_type: StagingInodeLocationType,
-    pub root_path: String,
-    pub inode_file_path: String,
+    pub root_uri: String,
+    pub inode_file_uri: String,
 }
 
 impl StagingConfig {
@@ -70,8 +70,8 @@ impl StagingConfig {
         Self {
             typ: StagingType::S3,
             inode_loc_type: StagingInodeLocationType::WithinRootPath,
-            root_path: root_path_uri,
-            inode_file_path: inode_file_uri,
+            root_uri: root_path_uri,
+            inode_file_uri: inode_file_uri,
         }
     }
 
@@ -80,35 +80,35 @@ impl StagingConfig {
         Self {
             typ: self.typ.clone(),
             inode_loc_type: self.inode_loc_type.clone(),
-            root_path: self.root_path.clone().replace(old_key, new_key),
-            inode_file_path: self.inode_file_path.clone().replace(old_key, new_key),
+            root_uri: self.root_uri.clone().replace(old_key, new_key),
+            inode_file_uri: self.inode_file_uri.clone().replace(old_key, new_key),
         }
     }
 
-    pub fn from_staging_root(staging_root: &str, origin_key: &str) -> Self {
-        let typ = if staging_root.starts_with("s3://") {
+    pub fn from_staging_root(staging_root_uri: &str, origin_key: &str) -> Self {
+        let typ = if staging_root_uri.starts_with("s3://") {
             StagingType::S3
         } else {
-            panic!("invalid staging root from input {}", staging_root);
+            panic!("invalid staging root from input {}", staging_root_uri);
         };
 
-        let (root_path, inode_file_path) = if staging_root.ends_with('/') {
+        let (root_uri, inode_file_uri) = if staging_root_uri.ends_with('/') {
             (
-                format!("{}{}", staging_root, origin_key),
-                format!("{}{}/inode", staging_root, origin_key)
+                format!("{}{}", staging_root_uri, origin_key),
+                format!("{}{}/inode", staging_root_uri, origin_key)
             )
         } else {
             (
-                format!("{}/{}", staging_root, origin_key),
-                format!("{}/{}/inode", staging_root, origin_key)
+                format!("{}/{}", staging_root_uri, origin_key),
+                format!("{}/{}/inode", staging_root_uri, origin_key)
             )
         };
 
         Self {
             typ: typ,
             inode_loc_type: StagingInodeLocationType::WithinRootPath,
-            root_path: root_path,
-            inode_file_path: inode_file_path,
+            root_uri: root_uri,
+            inode_file_uri: inode_file_uri,
         }
     }
 
