@@ -1,4 +1,4 @@
-pub mod hyper;
+pub mod file;
 pub mod flags;
 pub mod handler;
 pub mod reactor;

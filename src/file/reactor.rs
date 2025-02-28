@@ -8,7 +8,7 @@ use crate::staging::Staging;
 use crate::segment::SegmentReadWrite;
 use crate::file::{HyperTrait, BlockPtrFormat};
 use crate::buffer::Block;
-use super::hyper::HyperFile;
+use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {

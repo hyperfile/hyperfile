@@ -7,7 +7,7 @@ use reactor::{Task, TaskHandler};
 use crate::{BlockPtr, SegmentId};
 use crate::segment::SegmentReadWrite;
 use crate::staging::Staging;
-use super::hyper::HyperFile;
+use super::file::HyperFile;
 use super::HyperTrait;
 
 pub type FileRespGetAttr = Result<libc::stat>;
