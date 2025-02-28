@@ -194,7 +194,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
         debug!("WRITE - off: {}, buf len: {}", off, len);
         let v = self.write_prepare(off, len);
         let fetched = self.write_retrieve(v).await?;
-        for (blk_idx, block) in fetched.into_iter() {
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
             let None = self.data_blocks_dirty.insert(blk_idx, block) else {
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
@@ -242,7 +243,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
         debug!("WRITE ZERO - off: {}, len: {}", off, len);
         let v = self.write_prepare(off, len);
         let fetched = self.write_retrieve(v).await?;
-        for (blk_idx, block) in fetched.into_iter() {
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
             let None = self.data_blocks_dirty.insert(blk_idx, block) else {
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
@@ -428,7 +430,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
         output
     }
 
-    async fn write_retrieve(&mut self, list: Vec<BlockIndex>) -> Result<Vec<(BlockIndex, Block)>> {
+    async fn write_retrieve(&mut self, list: Vec<BlockIndex>) -> Result<Vec<Block>> {
         let mut output = Vec::new();
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
@@ -439,7 +441,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
                     if !BlockPtrFormat::is_zero_block(&blk_ptr) {
                         let _ = self.load_data_block_write_path(blk_idx, blk_ptr, 0, buf).await?;
                     }
-                    output.push((blk_idx, block));
+                    output.push(block);
                 },
                 Err(e) => {
                     if e.kind() != ErrorKind::NotFound {
@@ -447,7 +449,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
                     let block = Block::new(blk_idx, self.config.data_block_size);
-                    output.push((blk_idx, block));
+                    output.push(block);
                 },
             }
         }
