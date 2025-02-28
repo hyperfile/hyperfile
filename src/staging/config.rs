@@ -75,6 +75,26 @@ impl StagingConfig {
         }
     }
 
+    pub fn new_s3_uri(s3uri: &str, inode_filename: Option<&str>) -> Self {
+        let root_path_uri = if let Some(remove_tail_slash) = s3uri.strip_suffix('/') {
+            remove_tail_slash
+        } else {
+            s3uri
+        };
+        // concat inode
+        let inode_file_uri = if let Some(inode) = inode_filename {
+            format!("{}/{}", root_path_uri, inode)
+        } else {
+            format!("{}/{}", root_path_uri, DEFAULT_INODE_FILE_NAME)
+        };
+        Self {
+            typ: StagingType::S3,
+            inode_loc_type: StagingInodeLocationType::WithinRootPath,
+            root_uri: root_path_uri.to_string(),
+            inode_file_uri: inode_file_uri,
+        }
+    }
+
     // FIXME: simple config derive impl by replace, should be better
     pub fn derive(&self, old_key: &str, new_key: &str) -> Self {
         Self {
