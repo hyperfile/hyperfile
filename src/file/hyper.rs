@@ -19,19 +19,19 @@ use super::flags::HyperFileFlags;
 use super::{HyperTrait, DirtyDataBlocks};
 
 pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
-    client: Client,
-    staging: T,
-    bmap: BMap<'a, BlockIndex, BlockPtr, L>,
-    bmap_ud: BMapUserData,
-    data_blocks_dirty: BTreeMap<BlockIndex, Block>, // index by block uid
-    inode: Inode,
-    config: HyperFileMetaConfig,
-    hyper_config: HyperFileConfig,
-    max_dirty_blocks: usize,
-    flags: HyperFileFlags,
-    last_flush: Instant,
-    sema: Arc<Semaphore>,
-    spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
+    pub(crate) client: Client,
+    pub(crate) staging: T,
+    pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, L>,
+    pub(crate) bmap_ud: BMapUserData,
+    pub(crate) data_blocks_dirty: BTreeMap<BlockIndex, Block>, // index by block uid
+    pub(crate) inode: Inode,
+    pub(crate) config: HyperFileMetaConfig,
+    pub(crate) hyper_config: HyperFileConfig,
+    pub(crate) max_dirty_blocks: usize,
+    pub(crate) flags: HyperFileFlags,
+    pub(crate) last_flush: Instant,
+    pub(crate) sema: Arc<Semaphore>,
+    pub(crate) spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
 }
 
 impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
@@ -44,7 +44,7 @@ impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
     }
 }
 
-impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     pub async fn new(client: Client, staging: T, meta_block_loader: L, hyper_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
         let config = hyper_config.hyper_file.clone();
@@ -303,7 +303,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
     }
 
     // try flush out dirty data if all threshold condition meet
-    async fn try_flush(&mut self) -> Result<bool> {
+    pub(crate) async fn try_flush(&mut self) -> Result<bool> {
         // check if dirty data bytes exceed segment buffer threshold
         let ndatadirty = self.data_blocks_dirty.len();
         let data_block_size = self.config.data_block_size;
@@ -408,11 +408,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
     }
 }
 
-impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     // we only care about incomplete blocks and not in dirty list
     // return:
     //   - vec of data block ptr we need to retrieve
-    fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
+    pub(crate) fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
         let mut output = Vec::new();
         let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
         debug!("start to write prepare for write offset {}, len {}", off, len);
@@ -456,7 +456,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Clone + 'static, L: Bloc
         Ok(output)
     }
 
-    fn update_cache(&mut self, blk_idx: BlockIndex, off: usize, buf: &[u8]) {
+    pub(crate) fn update_cache(&mut self, blk_idx: BlockIndex, off: usize, buf: &[u8]) {
         if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
             // found in dirty list, just update it's content
             block.copy(off, buf);

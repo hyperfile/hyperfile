@@ -3,34 +3,19 @@ use log::{debug, warn};
 use btree_ondisk::BlockLoader;
 use tokio::io::{Result, ErrorKind};
 use tokio::task::JoinHandle;
-use super::HyperFile;
-use crate::{BlockIndex, BlockIndexIter};
-use crate::meta_format::BlockPtr;
+use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId};
 use crate::staging::Staging;
-use crate::segment::{SegmentReadWrite, SegmentId};
-use crate::file::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
+use crate::segment::SegmentReadWrite;
+use crate::file::{HyperTrait, BlockPtrFormat};
+use crate::buffer::Block;
+use super::hyper::HyperFile;
+use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 
-impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + Send + Sync + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     fn spawn_load_data_block_read_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8], _ra: bool) -> Result<JoinHandle<usize>> {
         debug!("load_data_block - block ptr: {}", blk_ptr);
-        // in read path we would check both data and dirty cache before do real data load
-        // check data cache first
-        if let Some(block) = self.data_blocks_cache.borrow_mut().get(&blk_id) {
-            // cache hit
-            debug!("load_data_block - Cache Hit on data blocks cache for block index: {}", blk_id);
-            let slice = unsafe {
-                std::slice::from_raw_parts(block.as_slice().as_ptr() as *const u8, block.as_slice().len())
-            };
-            let data_buf = unsafe {
-                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
-            };
-            let join = tokio::task::spawn(async move {
-                data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
-                data_buf.len()
-            });
-            return Ok(join);
-        }
-        // then check dirty cache
+        // in read path we would check dirty cache before do real data load
+        // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(&blk_id) {
             // cache hit
             debug!("load_data_block - Cache Hit on data blocks dirty for block index: {}", blk_id);
@@ -46,35 +31,21 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
             });
             return Ok(join);
         }
-        if blk_ptr.is_on_origin() {
-            let blk_id = blk_ptr.get_origin_blkid();
-            debug!("load_data_block - Cache Miss for block index: {}", blk_id);
-            // load from origin file
-            let oofile = self.oofile.borrow_mut().clone();
-            let client = self.client.clone();
-            let data_buf = unsafe {
-                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
-            };
-            let join = tokio::task::spawn(async move {
-                let _ = oofile.read(&client, blk_id, offset, data_buf).await;
-                data_buf.len()
-            });
-            return Ok(join);
-        } else if blk_ptr.is_on_staging() {
-            let (segid, staging_off) = blk_ptr.get_staging_info();
+        if BlockPtrFormat::is_on_staging(&blk_ptr) {
+            let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let staging = self.staging.clone();
             let data_block_size = self.config.data_block_size;
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
             let join = tokio::task::spawn(async move {
-                let _ = staging.load_data_block(SegmentId::from_raw(segid), staging_off, offset, data_block_size, data_buf).await;
+                let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
                 data_buf.len()
             });
             return Ok(join);
-        } else if blk_ptr.is_dummy() {
+        } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_id);
-        } else if blk_ptr.is_zero_block() {
+        } else if BlockPtrFormat::is_zero_block(&blk_ptr) {
             debug!("load_data_block - Fill Zero for block index: {}", blk_id);
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
@@ -89,51 +60,20 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
         }
     }
 
-    fn spawn_load_data_block_write_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8], _ra: bool) -> Result<JoinHandle<usize>> {
-        if blk_ptr.is_on_origin() {
-            let blk_id = blk_ptr.get_origin_blkid();
-            debug!("load_data_block - block ptr: {}", blk_ptr);
-            // check cache first
-            if let Some(block) = self.data_blocks_cache.borrow_mut().get(&blk_id) {
-                // cache hit
-                debug!("load_data_block - Cache Hit on data blocks cache for block index: {}", blk_id);
-                let slice = unsafe {
-                    std::slice::from_raw_parts(block.as_slice().as_ptr() as *const u8, block.as_slice().len())
-                };
-                let data_buf = unsafe {
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
-                };
-                let join = tokio::task::spawn(async move {
-                    data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
-                    data_buf.len()
-                });
-                return Ok(join);
-            }
-            debug!("load_data_block - Cache Miss for block index: {}", blk_id);
-            // load from origin file
-            let oofile = self.oofile.borrow_mut().clone();
-            let client = self.client.clone();
-            let data_buf = unsafe {
-                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
-            };
-            let join = tokio::task::spawn(async move {
-                let _ = oofile.read(&client, blk_id, offset, data_buf).await;
-                data_buf.len()
-            });
-            return Ok(join);
-        } else if blk_ptr.is_on_staging() {
-            let (segid, staging_off) = blk_ptr.get_staging_info();
+    fn spawn_load_data_block_write_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<JoinHandle<usize>> {
+        if BlockPtrFormat::is_on_staging(&blk_ptr) {
+            let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let staging = self.staging.clone();
             let data_block_size = self.config.data_block_size;
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
             let join = tokio::task::spawn(async move {
-                let _ = staging.load_data_block(SegmentId::from_raw(segid), staging_off, offset, data_block_size, data_buf).await;
+                let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
                 data_buf.len()
             });
             return Ok(join);
-        } else if blk_ptr.is_dummy() {
+        } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
             if let Some(block) = self.data_blocks_dirty.get(&blk_id) {
                 // cache hit
                 debug!("load_data_block - Cache Hit on data blocks dirty for block index: {}", blk_id);
@@ -150,7 +90,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
                 return Ok(join);
             }
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_id);
-        } else if blk_ptr.is_zero_block() {
+        } else if BlockPtrFormat::is_zero_block(&blk_ptr) {
             debug!("load_data_block - Fill Zero for block index: {}", blk_id);
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
@@ -172,13 +112,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
         let blk_off = off % self.config.data_block_size;
         let blk_count = (buf.len() + self.config.data_block_size - 1) / self.config.data_block_size;
         let mut bytes_read = 0;
-        let ra = if self.hyper_config.feature.read_ahead_chunk_size > 0 {
-            true
-        } else {
-            false
-        };
 
-        debug!("collect_block_ptr - block index {blk_idx}, block offset {blk_off}, block count {blk_count}, read ahead: {ra}");
+        debug!("collect_block_ptr - block index {blk_idx}, block offset {blk_off}, block count {blk_count}");
 
         // blocks need to be read back
         let mut blocks = Vec::new();
@@ -190,7 +125,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
                 Ok(ptr) => { ptr },
                 Err(e) => {
                     match e.kind() {
-                        ErrorKind::NotFound => { BlockPtr::new_zero_block() },
+                        ErrorKind::NotFound => { BlockPtrFormat::new_zero_block() },
                         _ => {
                             warn!("collect_block_ptr - lookup bmap for block index {blk_idx} error: {}", e);
                             return Err(e);
@@ -226,7 +161,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
                 Ok(ptr) => { ptr },
                 Err(e) => {
                     match e.kind() {
-                        ErrorKind::NotFound => { BlockPtr::new_zero_block() },
+                        ErrorKind::NotFound => { BlockPtrFormat::new_zero_block() },
                         _ => {
                             warn!("collect_block_ptr - lookup bmap for block index {next_blk_idx} error: {}", e);
                             return Err(e);
@@ -256,7 +191,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
             let _ = resp.to_read().try_send(Ok(0));
             return Ok(0);
         }
-        // if requested buffer excee file size, cut off tailing buffer
+        // if requested buffer exceed file size, cut off tailing buffer
         if off + buf.len() > self.inode.size() {
             let exceeded_len = off + buf.len() - self.inode.size();
             let mid = buf.len() - exceeded_len;
@@ -294,20 +229,25 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
         assert!(opt_permit.is_some());
 
         let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
-		let mut next_slice = buf;
+        let mut next_slice = buf;
         for (blk_idx, off, len) in blk_iter {
             let (this, next) = next_slice.split_at(len);
             debug!("      - update cache block index {}, offset {}, len {}", blk_idx, off, len);
             self.update_cache(blk_idx, off, this);
             bytes_write += this.len();
+            next_slice = next;
+        }
+
+        // bulk update bmap
+        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        for (blk_idx, _, _) in blk_iter {
             // don't care if insert failed for exist
-            match self.bmap.try_insert(blk_idx, BlockPtr::dummy_value()).await {
+            match self.bmap.try_insert(blk_idx, BlockPtrFormat::dummy_value()).await {
                 Err(e) => {
                     if e.kind() != ErrorKind::AlreadyExists { return Err(e); }
                 },
                 Ok(_) => {},
             }
-            next_slice = next;
         }
 
         let oldsize = self.inode.size();
@@ -339,8 +279,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
             // and insert zero block into block map
             if start_off == 0 && data_len == self.config.data_block_size {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtr::new_zero_block()).await?;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 bytes_write += data_len;
+                let _ = self.data_blocks_dirty.remove(&blk_idx);
                 continue;
             }
             // for a incomplete block
@@ -348,16 +289,18 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
             // TODO: merge this with new cache impl
             if start_off == 0 && (blk_idx as usize * self.config.data_block_size) + start_off + data_len > oldsize {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtr::new_zero_block()).await?;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 bytes_write += data_len;
+                let _ = self.data_blocks_dirty.remove(&blk_idx);
                 continue;
             }
-            debug!("      - update cache block index {}, offset {}, len {}", blk_idx, off, len);
+            // update cache data with zero
+            debug!("      - update cache block index {}, offset {}, len {}", blk_idx, start_off, data_len);
             let mut zero = Vec::with_capacity(data_len);
             zero.resize(data_len, 0);
             self.update_cache(blk_idx, start_off, &zero);
             // don't care if insert failed for exist
-            match self.bmap.try_insert(blk_idx, BlockPtr::dummy_value()).await {
+            match self.bmap.try_insert(blk_idx, BlockPtrFormat::dummy_value()).await {
                 Err(e) => {
                     if e.kind() != ErrorKind::AlreadyExists { return Err(e); }
                 },
@@ -380,60 +323,88 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
         Ok(bytes_write)
     }
 
-    fn spawn_write_retrieve(&self, req: FileReqWrite<'a>,  resp: FileResp, list: Vec<(BlockPtr, BlockIndex)>) -> Result<()> {
+    async fn spawn_write_retrieve(&mut self, req: FileReqWrite<'a>,  resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
-        for (blk_ptr, blk_idx) in list {
-            debug!("retrive block ptr {} for block index {}", blk_ptr, blk_idx);
-            if let Some(block) = self.data_blocks_cache.borrow().peek(&blk_idx) {
-                let buf = block.as_mut_slice();
-                let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf, false)?;
-                joins.push(join);
-            } else {
-                panic!("block index {} is not found on cache list, *SHOULD NOT* happend", blk_idx);
+        let mut fetched = Vec::new();
+        for blk_idx in list {
+            match self.bmap.lookup(&blk_idx).await {
+                Ok(blk_ptr) => {
+                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let buf = block.as_mut_slice();
+                    let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
+                    joins.push(join);
+                    fetched.push(block);
+                },
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                    debug!("block index {} not found in bmap, prepare a new block", blk_idx);
+                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    fetched.push(block);
+                },
             }
         }
 
-        tokio::task::spawn(async move {
-            let mut actual_bytes = 0;
-            while let Some(j) = joins.pop() {
-                let bytes = j.await.unwrap();
-                actual_bytes += bytes;
-            }
-            let _ = actual_bytes;
-            let fh = req.absorb_fh.clone();
-            let ctx = FileContext::write_absorb(req, resp);
-            fh.send(ctx);
-        });
+        let mut actual_bytes = 0;
+        while let Some(j) = joins.pop() {
+            let bytes = j.await.unwrap();
+            actual_bytes += bytes;
+        }
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
+            let None = self.data_blocks_dirty.insert(blk_idx, block) else {
+            panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+            };
+        }
+        let _ = actual_bytes;
+        let fh = req.absorb_fh.clone();
+        let ctx = FileContext::write_absorb(req, resp);
+        fh.send(ctx);
 
         Ok(())
     }
 
     // duplicate logic of spawn_write_retrieve()
     // TODO: can be merge with spawn_write_retrieve
-    fn spawn_write_zero_retrieve(&self, req: FileReqWriteZero<'a>,  resp: FileResp, list: Vec<(BlockPtr, BlockIndex)>) -> Result<()> {
+    async fn spawn_write_zero_retrieve(&mut self, req: FileReqWriteZero<'a>,  resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
-        for (blk_ptr, blk_idx) in list {
-            debug!("retrive block ptr {} for block index {}", blk_ptr, blk_idx);
-            if let Some(block) = self.data_blocks_cache.borrow().peek(&blk_idx) {
-                let buf = block.as_mut_slice();
-                let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf, false)?;
-                joins.push(join);
-            } else {
-                panic!("block index {} is not found on cache list, *SHOULD NOT* happend", blk_idx);
+        let mut fetched = Vec::new();
+        for blk_idx in list {
+            match self.bmap.lookup(&blk_idx).await {
+                Ok(blk_ptr) => {
+                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let buf = block.as_mut_slice();
+                    let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
+                    joins.push(join);
+                    fetched.push(block);
+                },
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                    debug!("block index {} not found in bmap, prepare a new block", blk_idx);
+                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    fetched.push(block);
+                },
             }
         }
 
-        tokio::task::spawn(async move {
-            let mut actual_bytes = 0;
-            while let Some(j) = joins.pop() {
-                let bytes = j.await.unwrap();
-                actual_bytes += bytes;
-            }
-            let _ = actual_bytes;
-            let fh = req.absorb_fh.clone();
-            let ctx = FileContext::write_zero_absorb(req, resp);
-            fh.send(ctx);
-        });
+        let mut actual_bytes = 0;
+        while let Some(j) = joins.pop() {
+            let bytes = j.await.unwrap();
+            actual_bytes += bytes;
+        }
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
+            let None = self.data_blocks_dirty.insert(blk_idx, block) else {
+            panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+            };
+        }
+        let _ = actual_bytes;
+        let fh = req.absorb_fh.clone();
+        let ctx = FileContext::write_zero_absorb(req, resp);
+        fh.send(ctx);
 
         Ok(())
     }
@@ -453,10 +424,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
         let permit = self.sema.clone().acquire_owned().await.unwrap();
 
         debug!("WRITE - off: {}, buf len: {}", off, len);
-        let v: Vec<(BlockPtr, BlockIndex)> = self.write_prepare(off, len).await;
+        let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
-            self.spawn_write_retrieve(req, resp, v)?;
+            self.spawn_write_retrieve(req, resp, v).await?;
             self.spawn_write_permit = Some(permit);
             return Ok(len);
         }
@@ -481,10 +452,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Sync + Clone + 's
         let permit = self.sema.clone().acquire_owned().await.unwrap();
 
         debug!("WRITE ZERO - off: {}, len: {}", off, len);
-        let v: Vec<(BlockPtr, BlockIndex)> = self.write_prepare(off, len).await;
+        let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
-            self.spawn_write_zero_retrieve(req, resp, v)?;
+            self.spawn_write_zero_retrieve(req, resp, v).await?;
             self.spawn_write_permit = Some(permit);
             return Ok(len);
         }
