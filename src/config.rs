@@ -92,10 +92,9 @@ impl Default for HyperFileRuntimeConfig {
 #[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
 pub struct HyperFileConfig {
 	/// metadata config for hyper file
-	pub hyper_file: HyperFileMetaConfig,
+	pub meta: HyperFileMetaConfig,
 	/// staging config for hyper file
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub staging: Option<StagingConfig>,
+	pub staging: StagingConfig,
 	/// hyper file runtime tunables
 	#[serde(default)]
 	pub runtime: HyperFileRuntimeConfig,

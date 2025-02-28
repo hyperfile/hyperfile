@@ -25,8 +25,7 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) bmap_ud: BMapUserData,
     pub(crate) data_blocks_dirty: BTreeMap<BlockIndex, Block>, // index by block uid
     pub(crate) inode: Inode,
-    pub(crate) config: HyperFileMetaConfig,
-    pub(crate) hyper_config: HyperFileConfig,
+    pub(crate) config: HyperFileConfig,
     pub(crate) max_dirty_blocks: usize,
     pub(crate) flags: HyperFileFlags,
     pub(crate) last_flush: Instant,
@@ -37,7 +36,7 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
 impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "==== dump HyperFile ====")?;
-        writeln!(f, "  {}", self.config)?;
+        writeln!(f, "  {:?}", self.config)?;
         writeln!(f, "  max dirty blocks: {}", self.max_dirty_blocks)?;
         writeln!(f, "  data dirty size: {}", self.data_blocks_dirty.len())?;
         writeln!(f, "  {}", self.inode)
@@ -45,18 +44,18 @@ impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
 }
 
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    pub async fn new(client: Client, staging: T, meta_block_loader: L, hyper_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn new(client: Client, staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
-        let config = hyper_config.hyper_file.clone();
+        let meta_config = config.meta.clone();
 
-        let mut bmap = BMap::<BlockIndex, BlockPtr, L>::new(config.root_size, config.meta_block_size, meta_block_loader);
+        let mut bmap = BMap::<BlockIndex, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
         let bmap_ud = BMapUserData::new(BlockPtrFormat::MicroGroup);
         bmap.set_userdata(bmap_ud.as_u32());
 
         let inode = Inode::default_file();
-        let max_dirty_blocks = Self::calc_max_dirty_blocks(config.data_block_size,
-            hyper_config.runtime.data_cache_dirty_max_bytes_threshold,
-            hyper_config.runtime.data_cache_dirty_max_blocks_threshold);
+        let max_dirty_blocks = Self::calc_max_dirty_blocks(meta_config.data_block_size,
+            config.runtime.data_cache_dirty_max_bytes_threshold,
+            config.runtime.data_cache_dirty_max_blocks_threshold);
 
         let mut file = Self {
             client: client,
@@ -66,7 +65,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             data_blocks_dirty: BTreeMap::new(),
             inode: inode,
             config: config,
-            hyper_config: hyper_config,
             max_dirty_blocks: max_dirty_blocks,
             flags: flags,
             last_flush: Instant::now(),
@@ -81,9 +79,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     /// open a hyper file
     /// open by loading inode from staging,
     /// if inode is not found in staging, create hyper file from scratch
-    pub async fn open(client: Client, staging: T, meta_block_loader: L, hyper_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn open(client: Client, staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
-        let config = hyper_config.hyper_file.clone();
+        let meta_config = config.meta.clone();
 
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let inode_state;
@@ -94,20 +92,20 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             },
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
-                    return Self::new(client, staging, meta_block_loader, hyper_config, flags).await;
+                    return Self::new(client, staging, meta_block_loader, config, flags).await;
                 }
                 return Err(e);
             },
         }
         let b = raw_inode.i_bmap;
-        let bmap = BMap::<BlockIndex, BlockPtr, L>::read(&b, config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, BlockPtr, L>::read(&b, meta_config.meta_block_size, meta_block_loader);
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());
 
         // if inode exists, we trust it
 
-        let max_dirty_blocks = Self::calc_max_dirty_blocks(config.data_block_size,
-            hyper_config.runtime.data_cache_dirty_max_bytes_threshold,
-            hyper_config.runtime.data_cache_dirty_max_blocks_threshold);
+        let max_dirty_blocks = Self::calc_max_dirty_blocks(meta_config.data_block_size,
+            config.runtime.data_cache_dirty_max_bytes_threshold,
+            config.runtime.data_cache_dirty_max_blocks_threshold);
 
         let mut file = Self {
             client: client,
@@ -117,7 +115,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             data_blocks_dirty: BTreeMap::new(),
             inode: Inode::from_raw(&raw_inode, inode_state),
             config: config,
-            hyper_config: hyper_config,
             max_dirty_blocks: max_dirty_blocks,
             flags: flags,
             last_flush: Instant::now(),
@@ -137,7 +134,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         // TODO: set dev and rdev here
         let dev = 0;
         let rdev = 0;
-        let blksize = self.config.data_block_size;
+        let blksize = self.config.meta.data_block_size;
         self.inode.to_stat(dev, rdev, blksize)
     }
 
@@ -156,14 +153,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             (buf, _) = buf.split_at_mut(mid);
         }
 
+        let data_block_size = self.config.meta.data_block_size;
         let buf_len = buf.len();
-        let blk_idx = (off / self.config.data_block_size) as BlockIndex;
-        let blk_off = off % self.config.data_block_size;
-        let blk_count = (buf_len + self.config.data_block_size - 1) / self.config.data_block_size;
+        let blk_idx = (off / data_block_size) as BlockIndex;
+        let blk_off = off % data_block_size;
+        let blk_count = (buf_len + data_block_size - 1) / data_block_size;
         debug!("READ - block index {blk_idx}, block offset {blk_off}, block count {blk_count}");
         let mut bytes_read = 0;
 
-        let blk_iter = BlockIndexIter::new(off, buf_len, self.config.data_block_size);
+        let blk_iter = BlockIndexIter::new(off, buf_len, data_block_size);
         let mut next_slice = buf;
         for (blk_idx, off, len) in blk_iter {
             let (this, next) = next_slice.split_at_mut(len);
@@ -202,7 +200,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
         let mut bytes_write = 0;
 
-        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        let data_block_size = self.config.meta.data_block_size;
+        let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         let mut next_slice = buf;
         for (blk_idx, off, len) in blk_iter {
             let (this, next) = next_slice.split_at(len);
@@ -213,7 +212,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
 
         // bulk update bmap
-        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         for (blk_idx, _, _) in blk_iter {
             // don't care if insert failed for exist
             match self.bmap.try_insert(blk_idx, BlockPtrFormat::dummy_value()).await {
@@ -251,13 +250,14 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
         let mut bytes_write = 0;
 
+        let data_block_size = self.config.meta.data_block_size;
         let oldsize = self.inode.size();
-        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         for (blk_idx, start_off, data_len) in blk_iter {
             // for a complete block,
             // no need to update data in cache, because is's already all zero
             // and insert zero block into block map
-            if start_off == 0 && data_len == self.config.data_block_size {
+            if start_off == 0 && data_len == data_block_size {
                 // insert or update
                 let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 bytes_write += data_len;
@@ -267,7 +267,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             // for a incomplete block
             // last block execption which start off from block start and len exceed current file
             // TODO: merge this with new cache impl
-            if start_off == 0 && (blk_idx as usize * self.config.data_block_size) + start_off + data_len > oldsize {
+            if start_off == 0 && (blk_idx as usize * data_block_size) + start_off + data_len > oldsize {
                 // insert or update
                 let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 bytes_write += data_len;
@@ -306,13 +306,13 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     pub(crate) async fn try_flush(&mut self) -> Result<bool> {
         // check if dirty data bytes exceed segment buffer threshold
         let ndatadirty = self.data_blocks_dirty.len();
-        let data_block_size = self.config.data_block_size;
+        let data_block_size = self.config.meta.data_block_size;
         // trigger flush because we meet memory threshold
         let threshold_flush = ndatadirty > self.max_dirty_blocks
-            || (ndatadirty * data_block_size) > self.hyper_config.runtime.segment_buffer_size;
+            || (ndatadirty * data_block_size) > self.config.runtime.segment_buffer_size;
         // trigger flush if file opened in O_SYNC
         let sync_flush = self.flags.is_sync();
-        let max_flush_interval = self.hyper_config.runtime.data_cache_dirty_max_flush_interval;
+        let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
         let last_flush_expired = self.last_flush.elapsed() >= Duration::from_millis(max_flush_interval);
         if last_flush_expired || threshold_flush || sync_flush {
             let _ = self.flush().await?;
@@ -342,8 +342,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             return Ok(());
         }
 
-        let tgt_blk_idx = (new_size / self.config.data_block_size) as BlockIndex;
-        let cur_blk_idx = (size / self.config.data_block_size) as BlockIndex;
+        let data_block_size = self.config.meta.data_block_size;
+        let tgt_blk_idx = (new_size / data_block_size) as BlockIndex;
+        let cur_blk_idx = (size / data_block_size) as BlockIndex;
 
         if tgt_blk_idx == cur_blk_idx {
             // if no need to change metadata blocks, just update the new file size
@@ -400,7 +401,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     }
 
     pub fn staging_config(&self) -> &StagingConfig {
-        self.staging.config()
+        &self.config.staging
     }
 
     pub fn staging_interceptor(&mut self, i: impl StagingIntercept<T> + 'static) {
@@ -414,14 +415,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     //   - vec of data block ptr we need to retrieve
     pub(crate) fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
         let mut output = Vec::new();
-        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        let data_block_size = self.config.meta.data_block_size;
+        let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         debug!("start to write prepare for write offset {}, len {}", off, len);
         for (blk_idx, start_off, data_len) in blk_iter {
             if self.data_blocks_dirty.contains_key(&blk_idx) {
                 continue;
             }
             // for a complete block, we don't need to retrieve
-            if start_off == 0 && data_len == self.config.data_block_size {
+            if start_off == 0 && data_len == data_block_size {
                 continue;
             }
             output.push(blk_idx);
@@ -432,11 +434,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
     async fn write_retrieve(&mut self, list: Vec<BlockIndex>) -> Result<Vec<Block>> {
         let mut output = Vec::new();
+        let data_block_size = self.config.meta.data_block_size;
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
                     debug!("retrive block ptr {} for block index {}", blk_ptr, blk_idx);
-                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let block = Block::new(blk_idx, data_block_size);
                     let buf = block.as_mut_slice();
                     if !BlockPtrFormat::is_zero_block(&blk_ptr) {
                         let _ = self.load_data_block_write_path(blk_idx, blk_ptr, 0, buf).await?;
@@ -448,7 +451,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let block = Block::new(blk_idx, data_block_size);
                     output.push(block);
                 },
             }
@@ -457,12 +460,13 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     }
 
     pub(crate) fn update_cache(&mut self, blk_idx: BlockIndex, off: usize, buf: &[u8]) {
+        let data_block_size = self.config.meta.data_block_size;
         if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
             // found in dirty list, just update it's content
             block.copy(off, buf);
         } else {
             // can't found in dirty list, create a new one
-            let mut block = Block::new(blk_idx, self.config.data_block_size);
+            let mut block = Block::new(blk_idx, data_block_size);
             block.copy(off, buf);
             self.data_blocks_dirty.insert(blk_idx, block);
         }
@@ -480,7 +484,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
-            let _ = self.staging.load_data_block(segid, staging_off, offset, self.config.data_block_size, buf).await?;
+            let _ = self.staging.load_data_block(segid, staging_off, offset, self.config.meta.data_block_size, buf).await?;
             return Ok(());
         } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_idx);
@@ -496,7 +500,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         debug!("load_data_block - block ptr: {}", blk_ptr);
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
-            let _ = self.staging.load_data_block(segid, staging_off, offset, self.config.data_block_size, buf).await?;
+            let _ = self.staging.load_data_block(segid, staging_off, offset, self.config.meta.data_block_size, buf).await?;
             return Ok(());
         } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
             if let Some(block) = self.data_blocks_dirty.get(&blk_idx) {
@@ -574,7 +578,7 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
     }
 
     fn config(&self) -> &HyperFileMetaConfig {
-        &self.config
+        &self.config.meta
     }
 
     fn set_last_flush(&mut self) {

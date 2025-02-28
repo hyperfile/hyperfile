@@ -34,7 +34,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let staging = self.staging.clone();
-            let data_block_size = self.config.data_block_size;
+            let data_block_size = self.config.meta.data_block_size;
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
@@ -64,7 +64,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let staging = self.staging.clone();
-            let data_block_size = self.config.data_block_size;
+            let data_block_size = self.config.meta.data_block_size;
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
@@ -108,9 +108,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     // return:
     //   (total_bytes, Vec<(block index, block ptr, offset in block, out buffer)>)
     pub async fn collect_block_ptr(&self, off: usize, buf: &'a mut [u8]) -> Result<(usize, Vec<(BlockIndex, BlockPtr, usize, &'a mut [u8])>)> {
-        let blk_idx = (off / self.config.data_block_size) as BlockIndex;
-        let blk_off = off % self.config.data_block_size;
-        let blk_count = (buf.len() + self.config.data_block_size - 1) / self.config.data_block_size;
+        let data_block_size = self.config.meta.data_block_size;
+        let blk_idx = (off / data_block_size) as BlockIndex;
+        let blk_off = off % data_block_size;
+        let blk_count = (buf.len() + data_block_size - 1) / data_block_size;
         let mut bytes_read = 0;
 
         debug!("collect_block_ptr - block index {blk_idx}, block offset {blk_off}, block count {blk_count}");
@@ -118,7 +119,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         // blocks need to be read back
         let mut blocks = Vec::new();
 
-        let head_off = off % self.config.data_block_size;
+        let head_off = off % data_block_size;
 
         let (mut next_blk_idx, next_slice) = if head_off != 0 {
             let blk_ptr = match self.bmap.lookup(&blk_idx).await {
@@ -133,7 +134,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                     }
                 },
             };
-            if head_off + buf.len() < self.config.data_block_size {
+            if head_off + buf.len() < data_block_size {
                 let bytes = buf.len();
                 blocks.push((blk_idx, blk_ptr, head_off, buf));
                 bytes_read += bytes;
@@ -141,7 +142,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
 
             // we need to split head bytes if offset is not aligned to block size
-            let split_off = self.config.data_block_size - head_off;
+            let split_off = data_block_size - head_off;
             let (this, next) = buf.split_at_mut(split_off);
             debug!("       - read head data block for block ptr {} at offset {} len {}", blk_ptr, head_off, this.len());
             let bytes = this.len();
@@ -155,7 +156,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             (blk_idx, buf)
         };
 
-        for b in next_slice.chunks_mut(self.config.data_block_size) {
+        for b in next_slice.chunks_mut(data_block_size) {
             debug!("     - lookup block index {next_blk_idx}");
             let blk_ptr = match self.bmap.lookup(&next_blk_idx).await {
                 Ok(ptr) => { ptr },
@@ -228,7 +229,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let opt_permit = self.spawn_write_permit.take();
         assert!(opt_permit.is_some());
 
-        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        let data_block_size = self.config.meta.data_block_size;
+        let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         let mut next_slice = buf;
         for (blk_idx, off, len) in blk_iter {
             let (this, next) = next_slice.split_at(len);
@@ -239,7 +241,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         }
 
         // bulk update bmap
-        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         for (blk_idx, _, _) in blk_iter {
             // don't care if insert failed for exist
             match self.bmap.try_insert(blk_idx, BlockPtrFormat::dummy_value()).await {
@@ -271,13 +273,14 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let opt_permit = self.spawn_write_permit.take();
         assert!(opt_permit.is_some());
 
+        let data_block_size = self.config.meta.data_block_size;
         let oldsize = self.inode.size();
-        let blk_iter = BlockIndexIter::new(off, len, self.config.data_block_size);
+        let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         for (blk_idx, start_off, data_len) in blk_iter {
             // for a complete block,
             // no need to update data in cache, because is's already all zero
             // and insert zero block into block map
-            if start_off == 0 && data_len == self.config.data_block_size {
+            if start_off == 0 && data_len == data_block_size {
                 // insert or update
                 let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 bytes_write += data_len;
@@ -287,7 +290,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             // for a incomplete block
             // last block execption which start off from block start and len exceed current file
             // TODO: merge this with new cache impl
-            if start_off == 0 && (blk_idx as usize * self.config.data_block_size) + start_off + data_len > oldsize {
+            if start_off == 0 && (blk_idx as usize * data_block_size) + start_off + data_len > oldsize {
                 // insert or update
                 let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 bytes_write += data_len;
@@ -326,10 +329,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     async fn spawn_write_retrieve(&mut self, req: FileReqWrite<'a>,  resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
+        let data_block_size = self.config.meta.data_block_size;
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let block = Block::new(blk_idx, data_block_size);
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
                     joins.push(join);
@@ -340,7 +344,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let block = Block::new(blk_idx, data_block_size);
                     fetched.push(block);
                 },
             }
@@ -370,10 +374,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     async fn spawn_write_zero_retrieve(&mut self, req: FileReqWriteZero<'a>,  resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
+        let data_block_size = self.config.meta.data_block_size;
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let block = Block::new(blk_idx, data_block_size);
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
                     joins.push(join);
@@ -384,7 +389,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = Block::new(blk_idx, self.config.data_block_size);
+                    let block = Block::new(blk_idx, data_block_size);
                     fetched.push(block);
                 },
             }
