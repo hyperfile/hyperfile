@@ -20,4 +20,4 @@ btree-ondisk = "0.10.1"
 reactor = { version = "0.1.0", path = "../reactor", optional = true }
 
 [features]
-default = ["reactor"]
+default = []
