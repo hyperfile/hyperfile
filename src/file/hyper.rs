@@ -6,7 +6,7 @@ use crate::SegmentId;
 use crate::staging::config::{StagingConfig, StagingType};
 use crate::config::HyperFileConfig;
 use crate::meta_loader::s3::S3BlockLoader;
-use crate::staging::{Staging, s3::S3Staging};
+use crate::staging::{Staging, StagingIntercept, s3::S3Staging};
 use crate::segment::SegmentSum;
 use super::{HyperTrait, file::HyperFile};
 use super::flags::HyperFileFlags;
@@ -49,5 +49,16 @@ impl<'a: 'static> Hyper<'a> {
         Ok(Self {
             inner: file,
         })
+    }
+}
+
+/// expose helper fn
+impl<'a: 'static> Hyper<'a> {
+    pub fn staging_config(&self) -> &StagingConfig {
+        self.inner.staging_config()
+    }
+
+    pub fn with_staging_interceptor(&mut self, i: impl StagingIntercept<S3Staging> + 'static) {
+        self.inner.staging_interceptor(i)
     }
 }
