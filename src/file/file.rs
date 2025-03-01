@@ -352,8 +352,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
 
         let data_block_size = self.config.meta.data_block_size;
-        let tgt_blk_idx = (new_size / data_block_size) as BlockIndex;
-        let cur_blk_idx = (size / data_block_size) as BlockIndex;
+        let tgt_blk_idx = ((new_size + 4096 - 1)/ data_block_size) as BlockIndex;
+        let cur_blk_idx = ((size + 4096 - 1)/ data_block_size) as BlockIndex;
 
         if tgt_blk_idx == cur_blk_idx {
             // if no need to change metadata blocks, just update the new file size
@@ -391,7 +391,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             return Ok(());
         }
 
-        debug!("truncate bmap to BlockIndex {}", tgt_blk_idx);
+        debug!("truncate - shrink bmap to BlockIndex {}", tgt_blk_idx);
         // if need to shrink bmap
         let _ = self.bmap.truncate(&tgt_blk_idx).await?;
         self.inode.set_size(new_size);
