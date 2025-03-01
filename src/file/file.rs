@@ -343,7 +343,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
     // truncate
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
-        let _permit = self.sema.clone().acquire_owned().await.unwrap();
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
         let size = self.inode.size();
         debug!("truncate file from {} to size: {}", size, new_size);
         if new_size == size {
@@ -386,6 +386,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             self.bmap.dirty();
             self.inode.set_size(new_size);
             self.inode.update_mtime();
+            drop(permit);
             self.flush().await?;
             return Ok(());
         }
@@ -395,6 +396,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let _ = self.bmap.truncate(&tgt_blk_idx).await?;
         self.inode.set_size(new_size);
         self.inode.update_mtime();
+        drop(permit);
         self.flush().await?;
         Ok(())
     }
