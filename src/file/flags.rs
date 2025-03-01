@@ -1,7 +1,7 @@
 use std::fmt;
 use log::warn;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct HyperFileFlags {
     pub read: bool,
     pub write: bool,
