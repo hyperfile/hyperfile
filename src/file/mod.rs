@@ -127,16 +127,15 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
     /// and detect potential dead flush
     async fn refresh_bmap(&mut self) -> Result<SegmentId> {
         // save current in memory state
-        let curr_size = self.inode().size();
         let curr_segid = self.inode().get_last_seq();
         let (raw_inode, inode_state) = self.try_recover_partial_flush().await?;
-        let mut od_inode = Inode::from_raw(&raw_inode, inode_state);
+        let od_last_seq = raw_inode.i_last_seq;
 
-        if curr_segid == od_inode.get_last_seq() {
-            debug!("REFRESH_BMAP - quit due: current segid {} == on disk segid {}", curr_segid, od_inode.get_last_seq());
+        if curr_segid == od_last_seq {
+            debug!("REFRESH_BMAP - quit due: current segid {} == on disk segid {}", curr_segid, od_last_seq);
             return Ok(curr_segid);
-        } else if curr_segid > od_inode.get_last_seq() {
-            warn!("REFRESH_BMAP - current segid {} is ahead of on disk segid {}", curr_segid, od_inode.get_last_seq());
+        } else if curr_segid > od_last_seq {
+            warn!("REFRESH_BMAP - current segid {} is ahead of on disk segid {}", curr_segid, od_last_seq);
             return Ok(curr_segid);
         }
 
@@ -151,17 +150,11 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         // clear cached data
         let _ = self.data_blocks_cache_clear();
 
-
-        // update size if needed
-        if curr_size > od_inode.size() {
-            od_inode.set_size(curr_size);
-        }
-
         let dirty_data_blocks = self.dirty_data_blocks();
 
         // no dirty blocks, just return
         if dirty_data_blocks.len() == 0 {
-            return Ok(self.inode().get_last_seq())
+            return Ok(curr_segid);
         }
 
         // rebuild dirty bmap
@@ -171,13 +164,14 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         }
         assert!(bmap.dirty() == true);
 
-        let last_seq = self.inode().get_last_seq();
-
-        // refresh inner bmap and inode
+        // refresh inner bmap and inode but don't touch inode attr
         *self.bmap_mut() = bmap;
-        *self.inode_mut() = od_inode;
+        (*self.inode_mut()).i_last_seq = raw_inode.i_last_seq;
+        (*self.inode_mut()).i_last_cno = raw_inode.i_last_cno;
+        (*self.inode_mut()).i_last_ondisk_cno = raw_inode.i_last_cno;
+        (*self.inode_mut()).i_ondisk_state = inode_state;
 
-        Ok(last_seq)
+        Ok(self.inode().get_last_seq())
     }
 
     // flush out dirty data

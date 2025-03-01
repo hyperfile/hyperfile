@@ -44,16 +44,17 @@ pub struct Inode {
     i_mode: u32,
     i_flags: u32,
     i_nlink: u64,
-    i_last_seq: SegmentId,
-    i_last_cno: u64,
+    pub(crate) i_last_seq: SegmentId,
+    pub(crate) i_last_cno: u64,
     // in memory only fields
-    i_last_ondisk_cno: u64, // tracking last cno ondisk
-    i_ondisk_state: Option<OnDiskState>,
+    pub(crate) i_last_ondisk_cno: u64, // tracking last cno ondisk
+    pub(crate) i_ondisk_state: Option<OnDiskState>,
+    pub(crate) i_attr_dirty: bool, // tracking any of attr modified
 }
 
 impl fmt::Display for Inode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "==== dump Inode ino: {} ====", self.i_ino)?;
+        writeln!(f, "==== dump Inode ino: {} attr dirty: {}====", self.i_ino, self.i_attr_dirty)?;
         if let Some(od_state) = &self.i_ondisk_state {
             writeln!(f, "  ondisk checksum: {}, ondisk timestamp: {}", od_state.checksum, od_state.timestamp)?;
         } else {
@@ -151,6 +152,7 @@ impl Inode {
             i_last_cno: raw.i_last_cno,
             i_last_ondisk_cno: raw.i_last_cno,
             i_ondisk_state: od_state,
+            i_attr_dirty: false,
         }
     }
 
