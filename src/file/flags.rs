@@ -140,6 +140,14 @@ impl FileFlags {
         Self(libc::O_RDONLY)
     }
 
+    pub fn wronly() -> Self {
+        Self(libc::O_WRONLY)
+    }
+
+    pub fn rdwr() -> Self {
+        Self(libc::O_RDWR)
+    }
+
     pub fn is_rdonly(&self) -> bool {
         (self.0 & libc::O_ACCMODE) == libc::O_RDONLY
     }
