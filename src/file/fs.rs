@@ -56,6 +56,17 @@ impl<'a: 'static> Hyper<'a> {
         return Self::open(client.clone(), file_config, f).await;
     }
 
+    pub async fn fs_open_or_create(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    {
+        debug!("fs_open_or_create - uri: {}, flags: {}", uri, flags);
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let file_config = HyperFileConfigBuilder::new()
+                            .with_staging_config(&staging_config)
+                            .build();
+        let f = HyperFileFlags::from_flags(flags);
+        return Self::do_open_or_create(client.clone(), file_config, f, true).await;
+    }
+
     pub async fn fs_unlink(client: &Client, uri: &str) -> Result<()>
     {
         debug!("fs_unlink - uri: {}", uri);
