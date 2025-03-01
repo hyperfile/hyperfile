@@ -335,6 +335,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         b.copy_from_slice(self.bmap.as_slice());
         let raw_inode = self.inode.to_raw(b);
         let od_state = self.staging.flush_inode(raw_inode.as_u8_slice(), self.inode.get_ondisk_state(), flag).await?;
+        self.inode.clear_attr_dirty();
         self.inode.set_ondisk_state(od_state);
         self.inode.set_last_ondisk_cno(self.inode.get_last_cno());
         Ok(())
@@ -608,6 +609,13 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
         let inode = std::ptr::addr_of!(self.inode) as *mut Inode;
         unsafe {
             (*inode).set_last_cno(segid);
+        }
+    }
+
+    fn inode_clear_attr_dirty(&self) {
+        let inode = std::ptr::addr_of!(self.inode) as *mut Inode;
+        unsafe {
+            (*inode).clear_attr_dirty();
         }
     }
 

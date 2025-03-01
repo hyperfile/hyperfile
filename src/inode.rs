@@ -90,6 +90,7 @@ impl Inode {
         let (sec, nsec) = Self::get_now();
         self.i_ctime = sec;
         self.i_ctime_nsec = nsec;
+        self.i_attr_dirty = true;
     }
 
     #[inline]
@@ -97,6 +98,7 @@ impl Inode {
         let (sec, nsec) = Self::get_now();
         self.i_atime = sec;
         self.i_atime_nsec = nsec;
+        self.i_attr_dirty = true;
     }
 
     #[inline]
@@ -104,6 +106,7 @@ impl Inode {
         let (sec, nsec) = Self::get_now();
         self.i_mtime = sec;
         self.i_mtime_nsec = nsec;
+        self.i_attr_dirty = true;
     }
 
     pub fn default_dir() -> Self {
@@ -122,6 +125,14 @@ impl Inode {
         inode.i_gid = 1000;
         inode.update_ctime();
         inode
+    }
+
+    pub fn is_attr_dirty(&self) -> bool {
+        self.i_attr_dirty
+    }
+
+    pub fn clear_attr_dirty(&mut self) {
+        self.i_attr_dirty = false
     }
 
     pub fn from_origin(origin_size: usize) -> Self {
@@ -208,6 +219,7 @@ impl Inode {
     pub fn set_size(&mut self, size: usize) {
         self.i_size = size as u64;
         self.i_blocks = ((size + 511) / 512) as u64;
+        self.i_attr_dirty = true;
     }
 
     // for sparse file:
@@ -216,8 +228,10 @@ impl Inode {
         let blocks_diff = ((diff.abs() + 511) / 512) as u64;
         if diff > 0 {
             self.i_blocks += blocks_diff;
+            self.i_attr_dirty = true;
         } else if diff < 0 {
             self.i_blocks -= blocks_diff;
+            self.i_attr_dirty = true;
         }
     }
 
@@ -225,6 +239,7 @@ impl Inode {
     //   - size: max size of file
     pub fn extend_size(&mut self, size: usize) {
         self.i_size = size as u64;
+        self.i_attr_dirty = true;
     }
 
     pub fn get_next_seq(&mut self) -> SegmentId {
