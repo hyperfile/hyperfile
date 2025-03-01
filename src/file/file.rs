@@ -390,6 +390,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             return Ok(());
         }
 
+        debug!("truncate bmap to BlockIndex {}", tgt_blk_idx);
         // if need to shrink bmap
         let _ = self.bmap.truncate(&tgt_blk_idx).await?;
         self.inode.set_size(new_size);
