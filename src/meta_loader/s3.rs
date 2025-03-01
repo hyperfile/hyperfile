@@ -36,10 +36,10 @@ impl S3BlockLoader {
 }
 
 impl BlockLoader<BlockPtr> for S3BlockLoader {
-    async fn read(&self, v: &BlockPtr, buf: &mut [u8], user_data: u32) -> Result<Vec<(BlockPtr, Vec<u8>)>> {
+    async fn read(&self, v: BlockPtr, buf: &mut [u8], user_data: u32) -> Result<Vec<(BlockPtr, Vec<u8>)>> {
         let meta_block_size = buf.len();
         let ud = BMapUserData::from_u32(user_data);
-        let (segid, offset) = BlockPtrFormat::decode(v, &ud.blk_ptr_format);
+        let (segid, offset) = BlockPtrFormat::decode(&v, &ud.blk_ptr_format);
         let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
         let end = offset + meta_block_size - 1;
         let range = format!("bytes={}-{}", offset, end);
