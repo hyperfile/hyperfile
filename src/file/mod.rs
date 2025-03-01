@@ -2,6 +2,8 @@ pub mod file;
 pub mod flags;
 pub mod handler;
 pub mod reactor;
+pub mod hyper;
+pub mod fs;
 
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
