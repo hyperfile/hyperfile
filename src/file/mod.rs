@@ -185,6 +185,15 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let dirty_data_blocks = self.dirty_data_blocks();
 
         if dirty_data_blocks.len() == 0 && !self.bmap().dirty() {
+            if self.inode().is_attr_dirty() {
+                debug!("inode attr is dirty, flush inode ONLY");
+                let b = self.bmap_get_raw();
+                let raw_inode = self.inode().to_raw(b);
+                let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), self.inode().get_ondisk_state(), FlushInodeFlag::Update).await?;
+                self.inode_clear_attr_dirty();
+                self.inode_set_ondisk_state(od_state);
+                self.inode_set_last_ondisk_cno(self.inode().get_last_cno());
+            }
             debug!("flush quit, NO dirty data blocks amd bmap is NOT dirty");
             let segid = self.inode().get_last_seq();
             return Ok(segid);
