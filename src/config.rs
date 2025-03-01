@@ -99,3 +99,43 @@ pub struct HyperFileConfig {
 	#[serde(default)]
 	pub runtime: HyperFileRuntimeConfig,
 }
+
+pub struct HyperFileConfigBuilder {
+	pub(crate) config: HyperFileConfig,
+}
+
+impl HyperFileConfigBuilder {
+	/// Get a new hyper file config builder with all default values,
+	/// by default, it is a read-only hyper file with 4KiB block size.
+	pub fn new() -> Self {
+		let mut config = HyperFileConfig::default();
+		Self {
+			config
+		}
+	}
+
+	pub fn from(config: &HyperFileConfig) -> Self {
+		Self {
+			config: config.to_owned(),
+		}
+	}
+
+	pub fn with_meta_config(mut self, meta: &HyperFileMetaConfig) -> Self {
+		self.config.meta = meta.to_owned();
+		self
+	}
+
+	pub fn with_staging_config(mut self, staging: &StagingConfig) -> Self {
+		self.config.staging = staging.to_owned();
+		self
+	}
+
+	pub fn with_runtime_config(mut self, runtime: &HyperFileRuntimeConfig) -> Self {
+		self.config.runtime = runtime.to_owned();
+		self
+	}
+
+	pub fn build(&self) -> HyperFileConfig {
+		self.config.clone()
+	}
+}
