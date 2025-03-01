@@ -1,6 +1,8 @@
 pub mod file;
 pub mod flags;
+#[cfg(feature = "reactor")]
 pub mod handler;
+#[cfg(feature = "reactor")]
 pub mod reactor;
 pub mod hyper;
 pub mod fs;
