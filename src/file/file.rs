@@ -171,7 +171,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 block.copy_out(off, this);
             } else {
                 debug!("      - lookup BlockIndex {blk_idx} for BlockPtr");
-                let blk_ptr = self.bmap.lookup(&blk_idx).await?;
+                let blk_ptr = self.bmap.lookup(&blk_idx).await
+                                        .or_else(|e| {
+                                            // translate NotFound -> zero block from bmap
+                                            if e.kind() == ErrorKind::NotFound {
+                                                return Ok(BlockPtrFormat::new_zero_block());
+                                            }
+                                            warn!("READ - lookup bmap for block index {blk_idx} error: {}", e);
+                                            Err(e)
+                                        })?;
                 debug!("      - load data block for block ptr {} at offset {} len {}", blk_ptr, off, this.len());
                 let _ = self.load_data_block_read_path(blk_idx, blk_ptr, off, this).await?;
             }
