@@ -345,7 +345,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let size = self.inode.size();
-        debug!("truncate file from {} to size: {}", size, new_size);
+        debug!("truncate - file size from {} to {}", size, new_size);
         if new_size == size {
             // current size same as expected size
             return Ok(());
