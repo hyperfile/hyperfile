@@ -359,6 +359,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             // if no need to change metadata blocks, just update the new file size
             self.inode.set_size(new_size);
             self.inode.update_mtime();
+            debug!("truncate - no bmap change, update file attr only");
             self.flush_inode(FlushInodeFlag::Update).await?;
             return Ok(());
         }
@@ -379,7 +380,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 (last_key_res.unwrap() + 1, tgt_blk_idx)
             };
             // extending bmap
-            debug!("truncate operation need to extend current bmap index from {} to {}", start_blkidx, end_blkidx);
+            debug!("truncate - operation need to extend current bmap index from {} to {}", start_blkidx, end_blkidx);
             for i in start_blkidx..=end_blkidx as BlockIndex {
                 let _ = self.bmap.insert(i, BlockPtrFormat::new_zero_block()).await?;
             }
