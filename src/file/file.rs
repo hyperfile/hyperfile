@@ -552,17 +552,19 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
         BlockPtrFormat::decode(blk_ptr, &self.bmap_ud.blk_ptr_format)
     }
 
-    fn dirty_data_blocks(&self) -> DirtyDataBlocks<'_> {
+    fn clear_data_blocks_cache(&mut self) {
+        // do nothing
+    }
+
+    fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_> {
         let b: BTreeMap<BlockIndex, &Block> = self.data_blocks_dirty.iter()
                         .map(|(idx, blk)| (*idx, blk))
                         .collect();
         DirtyDataBlocks { inner: Some(b), owned: None }
     }
 
-    fn data_blocks_cache_clear(&mut self) {
-    }
-
-    fn move_dirty_blocks_to_cache(&mut self) {
+    fn clear_data_blocks_dirty(&mut self) {
+        self.data_blocks_dirty.clear();
     }
 
     async fn lock(&self) -> OwnedSemaphorePermit {

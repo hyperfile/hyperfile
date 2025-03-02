@@ -54,20 +54,27 @@ impl<'a> DirtyDataBlocks<'a> {
 }
 
 pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone> {
+    // block ptr
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr;
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset);
-    fn dirty_data_blocks(&self) -> DirtyDataBlocks<'_>;
-    fn data_blocks_cache_clear(&mut self);
-    fn move_dirty_blocks_to_cache(&mut self);
+    // data cache
+    fn clear_data_blocks_cache(&mut self);
+    // dirty data
+    fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_>;
+    fn clear_data_blocks_dirty(&mut self);
+    // lock
     fn lock(&self) -> impl Future<Output = OwnedSemaphorePermit>;
     fn unlock(&self, permit: OwnedSemaphorePermit);
+    // bmap
     fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, L>;
     fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, L>;
+    // inode
+    fn inode(&self) -> &Inode;
+    fn inode_mut(&mut self) -> &mut Inode;
+    // others
     fn staging(&self) -> &T;
     fn config(&self) -> &HyperFileConfig;
     fn set_last_flush(&mut self);
-    fn inode(&self) -> &Inode;
-    fn inode_mut(&mut self) -> &mut Inode;
     fn sleep(dur: Duration) -> impl Future<Output = ()>;
 
     // provided method
@@ -147,9 +154,9 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let _permit = self.lock().await;
 
         // clear cached data
-        let _ = self.data_blocks_cache_clear();
+        let _ = self.clear_data_blocks_cache();
 
-        let dirty_data_blocks = self.dirty_data_blocks();
+        let dirty_data_blocks = self.get_data_blocks_dirty();
 
         // no dirty blocks, just return
         if dirty_data_blocks.len() == 0 {
@@ -179,7 +186,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let fn_start = Instant::now();
         debug!("flush started");
 
-        let dirty_data_blocks = self.dirty_data_blocks();
+        let dirty_data_blocks = self.get_data_blocks_dirty();
 
         if dirty_data_blocks.len() == 0 && !self.bmap().dirty() {
             if self.inode().is_attr_dirty() {
@@ -283,7 +290,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
             n.clear_dirty();
         }
 
-        self.move_dirty_blocks_to_cache();
+        self.clear_data_blocks_dirty();
 
         // clear dirty for bmap
         self.bmap_mut().clear_dirty();
