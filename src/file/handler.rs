@@ -2,12 +2,10 @@
 use std::mem::ManuallyDrop;
 use std::io::Result;
 use tokio::sync::{mpsc, oneshot};
-use btree_ondisk::BlockLoader;
 use reactor::{Task, TaskHandler};
 use crate::{BlockPtr, SegmentId};
-use crate::segment::SegmentReadWrite;
 use crate::staging::Staging;
-use super::file::HyperFile;
+use super::hyper::Hyper;
 use super::HyperTrait;
 
 pub type FileRespGetAttr = Result<libc::stat>;
@@ -256,17 +254,14 @@ impl<'a> FileContext<'a> {
     }
 }
 
-impl<'a: 'static, T, L> Task<FileContext<'a>> for HyperFile<'a, T, L>
-    where
-        T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static,
-        L: BlockLoader<BlockPtr> + Clone + 'static,
+impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
 {
     // main loop
     async fn handler(&mut self, ctx: FileContext<'a>) {
         let (req, resp) = ctx.take();
         match req.op {
             FileReqOp::GetAttr => {
-                let stat = self.stat();
+                let stat = self.inner.stat();
                 let resp = resp.to_getattr();
                 let _ = resp.send(Ok(stat));
             },
@@ -279,7 +274,7 @@ impl<'a: 'static, T, L> Task<FileContext<'a>> for HyperFile<'a, T, L>
                 let resp = FileResp {
                     read: ManuallyDrop::new(_resp_read),
                 };
-                let res = self.spawn_read(req, resp).await;
+                let res = self.inner.spawn_read(req, resp).await;
                 if res.is_err() {
                     let _ = resp_read.try_send(res);
                 }
@@ -293,7 +288,7 @@ impl<'a: 'static, T, L> Task<FileContext<'a>> for HyperFile<'a, T, L>
                 let resp = FileResp {
                     write: ManuallyDrop::new(_resp_write),
                 };
-                let res = self.spawn_write(req, resp).await;
+                let res = self.inner.spawn_write(req, resp).await;
                 if res.is_err() {
                     let _ = resp_write.try_send(res);
                 }
@@ -303,7 +298,7 @@ impl<'a: 'static, T, L> Task<FileContext<'a>> for HyperFile<'a, T, L>
                 let req = ManuallyDrop::into_inner(md);
                 let off = req.offset;
                 let buf = req.buf;
-                let res = self.absorb_write(off, buf).await;
+                let res = self.inner.absorb_write(off, buf).await;
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::WriteZero => {
@@ -315,7 +310,7 @@ impl<'a: 'static, T, L> Task<FileContext<'a>> for HyperFile<'a, T, L>
                 let resp = FileResp {
                     write: ManuallyDrop::new(_resp_write),
                 };
-                let res = self.spawn_write_zero(req, resp).await;
+                let res = self.inner.spawn_write_zero(req, resp).await;
                 if res.is_err() {
                     let _ = resp_write.try_send(res);
                 }
@@ -325,25 +320,25 @@ impl<'a: 'static, T, L> Task<FileContext<'a>> for HyperFile<'a, T, L>
                 let req = ManuallyDrop::into_inner(md);
                 let off = req.offset;
                 let len = req.len;
-                let res = self.absorb_write_zero(off, len).await;
+                let res = self.inner.absorb_write_zero(off, len).await;
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::Trunc => {
                 let body = unsafe { req.body.trunc };
                 let offset = body.offset;
-                let res = self.truncate(offset).await;
+                let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
             },
             FileReqOp::Flush => {
-                let res = self.flush().await;
+                let res = self.inner.flush().await;
                 let _ = resp.to_flush().send(res);
             },
             FileReqOp::Release => {
-                let res = self.release().await;
+                let res = self.inner.release().await;
                 let _ = resp.to_release().send(res);
             },
             FileReqOp::LastCno => {
-                let res = self.last_cno();
+                let res = self.inner.last_cno();
                 let _ = resp.to_last_cno().send(res);
             },
         }
