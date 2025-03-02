@@ -602,41 +602,6 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
         &self.inode
     }
 
-    fn inode_get_next_seq(&self) -> SegmentId {
-        let inode = std::ptr::addr_of!(self.inode) as *mut Inode;
-        unsafe {
-            (*inode).get_next_seq()
-        }
-    }
-
-    fn inode_set_last_cno(&self, segid: u64) {
-        let inode = std::ptr::addr_of!(self.inode) as *mut Inode;
-        unsafe {
-            (*inode).set_last_cno(segid);
-        }
-    }
-
-    fn inode_clear_attr_dirty(&self) {
-        let inode = std::ptr::addr_of!(self.inode) as *mut Inode;
-        unsafe {
-            (*inode).clear_attr_dirty();
-        }
-    }
-
-    fn inode_set_ondisk_state(&self, od_state: Option<OnDiskState>) {
-        let inode = std::ptr::addr_of!(self.inode) as *mut Inode;
-        unsafe {
-            (*inode).set_ondisk_state(od_state);
-        }
-    }
-
-    fn inode_set_last_ondisk_cno(&self, cno: u64) {
-        let inode = std::ptr::addr_of!(self.inode) as *mut Inode;
-        unsafe {
-            (*inode).set_last_ondisk_cno(cno);
-        }
-    }
-
     fn inode_mut(&mut self) -> &mut Inode {
         &mut self.inode
     }

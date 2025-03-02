@@ -73,11 +73,6 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
     fn config(&self) -> &HyperFileMetaConfig;
     fn set_last_flush(&mut self);
     fn inode(&self) -> &Inode;
-    fn inode_get_next_seq(&self) -> SegmentId;
-    fn inode_set_last_cno(&self, segid: u64);
-    fn inode_clear_attr_dirty(&self);
-    fn inode_set_ondisk_state(&self, od_state: Option<OnDiskState>);
-    fn inode_set_last_ondisk_cno(&self, cno: u64);
     fn inode_mut(&mut self) -> &mut Inode;
     fn sleep(dur: Duration) -> impl Future<Output = ()>;
 
@@ -86,9 +81,10 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let _ = self.staging().load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), segid).await?;
         let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), od_state, FlushInodeFlag::Update).await?;
-        self.inode_clear_attr_dirty();
-        self.inode_set_ondisk_state(od_state);
-        self.inode_set_last_ondisk_cno(self.inode().get_last_cno());
+        self.inode_mut().clear_attr_dirty();
+        self.inode_mut().set_ondisk_state(od_state);
+        let last_cno = self.inode().get_last_cno();
+        self.inode_mut().set_last_ondisk_cno(last_cno);
         Ok(())
     }
 
@@ -190,9 +186,10 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
                 let b = self.bmap_get_raw();
                 let raw_inode = self.inode().to_raw(b);
                 let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), self.inode().get_ondisk_state(), FlushInodeFlag::Update).await?;
-                self.inode_clear_attr_dirty();
-                self.inode_set_ondisk_state(od_state);
-                self.inode_set_last_ondisk_cno(self.inode().get_last_cno());
+                self.inode().clear_attr_dirty_unsafe();
+                self.inode().set_ondisk_state_unsafe(od_state);
+                let last_cno = self.inode().get_last_cno();
+                self.inode().set_last_ondisk_cno_unsafe(last_cno);
             }
             debug!("flush quit, NO dirty data blocks amd bmap is NOT dirty");
             let segid = self.inode().get_last_seq();
@@ -207,7 +204,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
             dirty_meta_vec.len(), dirty_data_blocks.len());
 
-        let segid = self.inode_get_next_seq();
+        let segid = self.inode().get_next_seq_unsafe();
         let mut file_off = 0;
         let mut segwr = self.staging().new_segwr(segid, self.config());
 
@@ -243,7 +240,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let _ = _start.elapsed();
 
         // prepare inode
-        self.inode_set_last_cno(segid);
+        self.inode().set_last_cno_unsafe(segid);
         let b = self.bmap_get_raw();
         let raw_inode = self.inode().to_raw(b);
         // TODO: calc segment checksum
@@ -272,9 +269,10 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let _start = Instant::now();
         let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), self.inode().get_ondisk_state(), FlushInodeFlag::Update).await?;
         let _ = _start.elapsed();
-        self.inode_clear_attr_dirty();
-        self.inode_set_ondisk_state(od_state);
-        self.inode_set_last_ondisk_cno(self.inode().get_last_cno());
+        self.inode_mut().clear_attr_dirty();
+        self.inode_mut().set_ondisk_state(od_state);
+        let last_cno = self.inode().get_last_cno();
+        self.inode_mut().set_last_ondisk_cno(last_cno);
 
         // start to cleanup
         let _start = Instant::now();
