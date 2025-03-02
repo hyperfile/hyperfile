@@ -590,8 +590,8 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
         &self.staging
     }
 
-    fn config(&self) -> &HyperFileMetaConfig {
-        &self.config.meta
+    fn config(&self) -> &HyperFileConfig {
+        &self.config
     }
 
     fn set_last_flush(&mut self) {

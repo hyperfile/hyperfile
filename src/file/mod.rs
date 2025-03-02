@@ -17,7 +17,7 @@ use crate::*;
 use crate::buffer::Block;
 use crate::{BlockIndex, BlockPtr};
 use crate::{SegmentId, SegmentOffset};
-use crate::config::HyperFileMetaConfig;
+use crate::config::HyperFileConfig;
 use crate::ondisk::{BMapRawType, InodeRaw};
 use crate::inode::{Inode, OnDiskState, FlushInodeFlag};
 use crate::staging::Staging;
@@ -70,7 +70,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         b
     }
     fn staging(&self) -> &T;
-    fn config(&self) -> &HyperFileMetaConfig;
+    fn config(&self) -> &HyperFileConfig;
     fn set_last_flush(&mut self);
     fn inode(&self) -> &Inode;
     fn inode_mut(&mut self) -> &mut Inode;
@@ -141,7 +141,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let meta_block_loader = self.bmap().get_block_loader();
 
         let b = raw_inode.i_bmap;
-        let mut bmap = BMap::<BlockIndex, BlockPtr, L>::read(&b, self.config().meta_block_size, meta_block_loader);
+        let mut bmap = BMap::<BlockIndex, BlockPtr, L>::read(&b, self.config().meta.meta_block_size, meta_block_loader);
 
         let _permit = self.lock().await;
 
@@ -206,7 +206,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
 
         let segid = self.inode().get_next_seq_unsafe();
         let mut file_off = 0;
-        let mut segwr = self.staging().new_segwr(segid, self.config());
+        let mut segwr = self.staging().new_segwr(segid, &self.config().meta);
 
         let ndatadirty = dirty_data_blocks.len();
         file_off += segment::Writer::<'_, T>::calc_ss_aligned_bytes(ndatadirty);
