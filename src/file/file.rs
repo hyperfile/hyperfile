@@ -545,11 +545,11 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
         L: BlockLoader<BlockPtr> + Clone,
 {
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
-        BlockPtrFormat::encode(segid, offset, seq, &self.bmap_ud().blk_ptr_format)
+        BlockPtrFormat::encode(segid, offset, seq, &self.bmap_ud.blk_ptr_format)
     }
 
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
-        BlockPtrFormat::decode(blk_ptr, &self.bmap_ud().blk_ptr_format)
+        BlockPtrFormat::decode(blk_ptr, &self.bmap_ud.blk_ptr_format)
     }
 
     fn dirty_data_blocks(&self) -> DirtyDataBlocks<'_> {
@@ -580,10 +580,6 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
 
     fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, L> {
         &mut self.bmap
-    }
-
-    fn bmap_ud(&self) -> &BMapUserData {
-        &self.bmap_ud
     }
 
     fn staging(&self) -> &T {
