@@ -63,18 +63,19 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
     fn unlock(&self, permit: OwnedSemaphorePermit);
     fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, L>;
     fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, L>;
-    fn bmap_ud(&self) -> &BMapUserData;
-    fn bmap_get_raw(&self) -> BMapRawType {
-        let mut b: BMapRawType = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        b.copy_from_slice(self.bmap().as_slice());
-        b
-    }
     fn staging(&self) -> &T;
     fn config(&self) -> &HyperFileConfig;
     fn set_last_flush(&mut self);
     fn inode(&self) -> &Inode;
     fn inode_mut(&mut self) -> &mut Inode;
     fn sleep(dur: Duration) -> impl Future<Output = ()>;
+
+    // provided method
+    fn bmap_get_raw(&self) -> BMapRawType {
+        let mut b: BMapRawType = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        b.copy_from_slice(self.bmap().as_slice());
+        b
+    }
 
     // recover inode from segment
     async fn recover_partial_flush(&mut self, segid: u64, od_state: &Option<OnDiskState>) -> Result<()> {
