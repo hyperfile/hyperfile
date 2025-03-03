@@ -22,15 +22,15 @@ unsafe impl GlobalAlloc for AlignedAlloc {
     }
 }
 
-pub struct AlignedBlock {
+struct AlignedDataBlock {
     ptr: *mut u8,
     layout: Layout,
 }
 
-unsafe impl Send for AlignedBlock {}
-unsafe impl Sync for AlignedBlock {}
+unsafe impl Send for AlignedDataBlock {}
+unsafe impl Sync for AlignedDataBlock {}
 
-impl AlignedBlock {
+impl AlignedDataBlock {
     pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, MIN_ALIGNED).expect("unable to create layout for aligned block");
         Self {
@@ -52,7 +52,7 @@ impl AlignedBlock {
     }
 }
 
-impl Drop for AlignedBlock {
+impl Drop for AlignedDataBlock {
     fn drop(&mut self) {
         unsafe {
             dealloc(self.ptr, self.layout);
@@ -61,21 +61,21 @@ impl Drop for AlignedBlock {
 }
 
 pub(crate) struct Block {
-    data: Pin<Box<AlignedBlock>>,
+    data: Pin<Box<AlignedDataBlock>>,
     index: BlockIndex,
 }
 
 impl Block {
     pub(crate) fn new(index: BlockIndex, size: usize) -> Self {
         Self {
-            data: Box::pin(AlignedBlock::new(size)),
+            data: Box::pin(AlignedDataBlock::new(size)),
             index: index,
         }
     }
 
     pub(crate) fn dup(&self) -> Self {
         let n = Self {
-            data: Box::pin(AlignedBlock::new(self.size())),
+            data: Box::pin(AlignedDataBlock::new(self.size())),
             index: self.index(),
         };
         self.copy_out(0, n.as_mut_slice());
