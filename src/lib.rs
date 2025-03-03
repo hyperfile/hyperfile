@@ -85,7 +85,7 @@ impl BMapUserData {
     }
 
     pub(crate) fn as_u32(&self) -> u32 {
-        let ptr = std::ptr::addr_of!(self) as *const u32;
+        let ptr = std::ptr::addr_of!(*self) as *const u32;
         unsafe {
             *ptr
         }
