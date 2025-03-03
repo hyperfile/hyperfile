@@ -73,6 +73,8 @@ impl DataBlock {
         }
     }
 
+    // duplicate a data block by copy
+    #[allow(dead_code)]
     pub(crate) fn dup(&self) -> Self {
         let n = Self {
             data: Box::pin(AlignedDataBlock::new(self.size())),
