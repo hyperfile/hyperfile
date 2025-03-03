@@ -6,6 +6,8 @@ pub mod handler;
 pub mod reactor;
 pub mod hyper;
 pub mod fs;
+#[cfg(feature = "reactor")]
+pub mod fh;
 
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
