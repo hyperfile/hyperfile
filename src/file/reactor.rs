@@ -12,7 +12,7 @@ use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    fn spawn_load_data_block_read_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8], _ra: bool) -> Result<JoinHandle<usize>> {
+    fn spawn_load_data_block_read_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<JoinHandle<usize>> {
         debug!("load_data_block - block ptr: {}", blk_ptr);
         // in read path we would check dirty cache before do real data load
         // check dirty cache
@@ -203,7 +203,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let (total_bytes, blocks) = self.collect_block_ptr(off, buf).await?;
         let mut joins = Vec::new();
         for (blk_idx, blk_ptr, off, buf) in blocks {
-            let join = self.spawn_load_data_block_read_path(blk_idx, blk_ptr, off, buf, false)?;
+            let join = self.spawn_load_data_block_read_path(blk_idx, blk_ptr, off, buf)?;
             joins.push(join)
         }
 
