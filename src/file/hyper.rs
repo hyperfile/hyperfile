@@ -30,7 +30,7 @@ impl<'a: 'static> Hyper<'a> {
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
-        let file = HyperFile::<S3Staging, S3BlockLoader>::open(client, staging, loader, file_config, flags).await?;
+        let file = HyperFile::<S3Staging, S3BlockLoader>::open(staging, loader, file_config, flags).await?;
         Ok(Self {
             inner: file,
         })
@@ -40,7 +40,7 @@ impl<'a: 'static> Hyper<'a> {
     {
         let staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
-        let file = HyperFile::<S3Staging, S3BlockLoader>::new(client, staging, loader, file_config, flags).await?;
+        let file = HyperFile::<S3Staging, S3BlockLoader>::new(staging, loader, file_config, flags).await?;
         Ok(Self {
             inner: file,
         })

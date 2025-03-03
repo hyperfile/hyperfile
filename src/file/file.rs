@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 use std::io::{ErrorKind, Result};
 use log::{debug, warn};
-use aws_sdk_s3::Client;
 use btree_ondisk::{bmap::BMap, BlockLoader};
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
@@ -19,7 +18,6 @@ use super::flags::HyperFileFlags;
 use super::{HyperTrait, DirtyDataBlocks};
 
 pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
-    pub(crate) client: Client,
     pub(crate) staging: T,
     pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, L>,
     pub(crate) bmap_ud: BMapUserData,
@@ -44,7 +42,7 @@ impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
 }
 
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    pub async fn new(client: Client, staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
         let meta_config = config.meta.clone();
 
@@ -58,7 +56,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             config.runtime.data_cache_dirty_max_blocks_threshold);
 
         let mut file = Self {
-            client: client,
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
@@ -79,7 +76,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     /// open a hyper file
     /// open by loading inode from staging,
     /// if inode is not found in staging, create hyper file from scratch
-    pub async fn open(client: Client, staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn open(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
         let meta_config = config.meta.clone();
 
@@ -92,7 +89,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             },
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
-                    return Self::new(client, staging, meta_block_loader, config, flags).await;
+                    return Self::new(staging, meta_block_loader, config, flags).await;
                 }
                 return Err(e);
             },
@@ -108,7 +105,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             config.runtime.data_cache_dirty_max_blocks_threshold);
 
         let mut file = Self {
-            client: client,
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
