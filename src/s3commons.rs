@@ -121,8 +121,8 @@ impl S3Ops {
         match op.send().await {
             Ok(output) => {
                 let mut bytes = output.body.collect().await?;
-                if bytes.remaining() != buf.len() {
-                    let err_str = format!("GetObject s3://{}/{} feched size {} not match input buffer size {}",
+                if bytes.remaining() < buf.len() {
+                    let err_str = format!("GetObject s3://{}/{} feched size {} less than input buffer size {}",
                         bucket, key, bytes.remaining(), buf.len());
                     error!("{}", err_str);
                     return Err(Error::new(ErrorKind::InvalidData, err_str));
