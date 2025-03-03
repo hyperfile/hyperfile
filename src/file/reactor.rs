@@ -7,7 +7,7 @@ use crate::{BlockIndex, BlockPtr, BlockIndexIter};
 use crate::staging::Staging;
 use crate::segment::SegmentReadWrite;
 use crate::file::{HyperTrait, BlockPtrFormat};
-use crate::buffer::Block;
+use crate::buffer::DataBlock;
 use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 
@@ -333,7 +333,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let block = Block::new(blk_idx, data_block_size);
+                    let block = DataBlock::new(blk_idx, data_block_size);
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
                     joins.push(join);
@@ -344,7 +344,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = Block::new(blk_idx, data_block_size);
+                    let block = DataBlock::new(blk_idx, data_block_size);
                     fetched.push(block);
                 },
             }
@@ -378,7 +378,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let block = Block::new(blk_idx, data_block_size);
+                    let block = DataBlock::new(blk_idx, data_block_size);
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
                     joins.push(join);
@@ -389,7 +389,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = Block::new(blk_idx, data_block_size);
+                    let block = DataBlock::new(blk_idx, data_block_size);
                     fetched.push(block);
                 },
             }

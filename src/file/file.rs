@@ -8,7 +8,7 @@ use btree_ondisk::{bmap::BMap, BlockLoader};
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
-use crate::buffer::Block;
+use crate::buffer::DataBlock;
 use crate::staging::{StagingIntercept, Staging, config::StagingConfig};
 use crate::segment::SegmentReadWrite;
 use crate::ondisk::{InodeRaw, BMapRawType};
@@ -21,7 +21,7 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) staging: T,
     pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, L>,
     pub(crate) bmap_ud: BMapUserData,
-    pub(crate) data_blocks_dirty: BTreeMap<BlockIndex, Block>, // index by block uid
+    pub(crate) data_blocks_dirty: BTreeMap<BlockIndex, DataBlock>, // index by block uid
     pub(crate) inode: Inode,
     pub(crate) config: HyperFileConfig,
     pub(crate) max_dirty_blocks: usize,
@@ -441,14 +441,14 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         output
     }
 
-    async fn write_retrieve(&mut self, list: Vec<BlockIndex>) -> Result<Vec<Block>> {
+    async fn write_retrieve(&mut self, list: Vec<BlockIndex>) -> Result<Vec<DataBlock>> {
         let mut output = Vec::new();
         let data_block_size = self.config.meta.data_block_size;
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
                     debug!("retrive block ptr {} for block index {}", blk_ptr, blk_idx);
-                    let block = Block::new(blk_idx, data_block_size);
+                    let block = DataBlock::new(blk_idx, data_block_size);
                     let buf = block.as_mut_slice();
                     if !BlockPtrFormat::is_zero_block(&blk_ptr) {
                         let _ = self.load_data_block_write_path(blk_idx, blk_ptr, 0, buf).await?;
@@ -460,7 +460,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = Block::new(blk_idx, data_block_size);
+                    let block = DataBlock::new(blk_idx, data_block_size);
                     output.push(block);
                 },
             }
@@ -475,7 +475,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             block.copy(off, buf);
         } else {
             // can't found in dirty list, create a new one
-            let mut block = Block::new(blk_idx, data_block_size);
+            let mut block = DataBlock::new(blk_idx, data_block_size);
             block.copy(off, buf);
             self.data_blocks_dirty.insert(blk_idx, block);
         }
@@ -553,7 +553,7 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
     }
 
     fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_> {
-        let b: BTreeMap<BlockIndex, &Block> = self.data_blocks_dirty.iter()
+        let b: BTreeMap<BlockIndex, &DataBlock> = self.data_blocks_dirty.iter()
                         .map(|(idx, blk)| (*idx, blk))
                         .collect();
         DirtyDataBlocks { inner: Some(b), owned: None }

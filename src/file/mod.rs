@@ -16,7 +16,7 @@ use log::{debug, warn};
 use tokio::sync::OwnedSemaphorePermit;
 use btree_ondisk::{bmap::BMap, BlockLoader};
 use crate::*;
-use crate::buffer::Block;
+use crate::buffer::DataBlock;
 use crate::{BlockIndex, BlockPtr};
 use crate::{SegmentId, SegmentOffset};
 use crate::config::HyperFileConfig;
@@ -26,9 +26,9 @@ use crate::staging::Staging;
 use crate::meta_format::BlockPtrFormat;
 
 pub(crate) struct DirtyDataBlocks<'a> {
-    pub(crate) inner: Option<BTreeMap<BlockIndex, &'a Block>>,
+    pub(crate) inner: Option<BTreeMap<BlockIndex, &'a DataBlock>>,
     // if we need to owned (clone) the data
-    pub(crate) owned: Option<BTreeMap<BlockIndex, Block>>,
+    pub(crate) owned: Option<BTreeMap<BlockIndex, DataBlock>>,
 }
 
 impl<'a> DirtyDataBlocks<'a> {
@@ -41,11 +41,11 @@ impl<'a> DirtyDataBlocks<'a> {
         panic!("invalid DirtyDataBlocks");
     }
 
-    fn data(&'a self) -> BTreeMap<BlockIndex, &'a Block> {
+    fn data(&'a self) -> BTreeMap<BlockIndex, &'a DataBlock> {
         if let Some(inner) = &self.inner {
             return inner.clone();
         } else if let Some(owned) = &self.owned {
-            let inner: BTreeMap<BlockIndex, &'a Block> = owned
+            let inner: BTreeMap<BlockIndex, &'a DataBlock> = owned
                                 .iter()
                                 .map(|(idx, blk)| (*idx, blk))
                                 .collect();

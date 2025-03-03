@@ -60,12 +60,12 @@ impl Drop for AlignedDataBlock {
     }
 }
 
-pub(crate) struct Block {
+pub(crate) struct DataBlock {
     data: Pin<Box<AlignedDataBlock>>,
     index: BlockIndex,
 }
 
-impl Block {
+impl DataBlock {
     pub(crate) fn new(index: BlockIndex, size: usize) -> Self {
         Self {
             data: Box::pin(AlignedDataBlock::new(size)),
