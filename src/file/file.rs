@@ -392,8 +392,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
 
         let data_block_size = self.config.meta.data_block_size;
-        let tgt_blk_idx = ((new_size + 4096 - 1)/ data_block_size) as BlockIndex;
-        let cur_blk_idx = ((size + 4096 - 1)/ data_block_size) as BlockIndex;
+        let tgt_blk_idx = ((new_size + data_block_size - 1) / data_block_size) as BlockIndex;
+        let cur_blk_idx = ((size + data_block_size - 1) / data_block_size) as BlockIndex;
         let offset_to_discard = new_size % data_block_size;
 
         if tgt_blk_idx == cur_blk_idx {
