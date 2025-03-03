@@ -340,6 +340,47 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         Ok(())
     }
 
+    async fn truncate_last_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> Result<()> {
+        if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
+            let buf = block.as_mut_slice();
+            let (_, to_clear) = buf.split_at_mut(offset_to_discard);
+            to_clear.fill(0);
+            return Ok(());
+        }
+
+        // blk index not in dirty list
+        // or block ptr is zero block in bmap or not exist in bmap, no need to discard data
+        let blk_ptr = match self.bmap.lookup(blk_idx).await {
+            Ok(blk_ptr) => {
+                if BlockPtrFormat::is_zero_block(&blk_ptr) {
+                    // no need to discard data for a zero block
+                    return Ok(());
+                } else if BlockPtrFormat::is_on_staging(&blk_ptr) {
+                    blk_ptr
+                } else {
+                    panic!("invalid block ptr {} of block index {}", blk_ptr, blk_idx);
+                }
+            },
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    return Err(e);
+                }
+                // no need to discard data for a non exists data block
+                return Ok(());
+            },
+        };
+        debug!("retrive block ptr {} for block index {}", blk_ptr, blk_idx);
+        let block = DataBlock::new(*blk_idx, self.config.meta.data_block_size);
+        let buf = block.as_mut_slice();
+        let _ = self.load_data_block_read_path(*blk_idx, blk_ptr, 0, buf).await?;
+        // discard rest of data in the block
+        let (_, to_clear) = buf.split_at_mut(offset_to_discard);
+        to_clear.fill(0);
+        // back to dirty list
+        self.data_blocks_dirty.insert(*blk_idx, block);
+        Ok(())
+    }
+
     // truncate
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
         let permit = self.sema.clone().acquire_owned().await.unwrap();
@@ -353,9 +394,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let data_block_size = self.config.meta.data_block_size;
         let tgt_blk_idx = ((new_size + 4096 - 1)/ data_block_size) as BlockIndex;
         let cur_blk_idx = ((size + 4096 - 1)/ data_block_size) as BlockIndex;
+        let offset_to_discard = new_size % data_block_size;
 
         if tgt_blk_idx == cur_blk_idx {
-            // if no need to change metadata blocks, just update the new file size
+            let _ = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
+            // no need to change metadata blocks, just update the new file size
             self.inode.set_size(new_size);
             self.inode.update_mtime();
             debug!("truncate - no bmap change, update file attr only");
@@ -394,6 +437,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         debug!("truncate - shrink bmap to BlockIndex {}", tgt_blk_idx);
         // if need to shrink bmap
         let _ = self.bmap.truncate(&tgt_blk_idx).await?;
+        if new_size > 0 {
+            let tgt_blk_idx = tgt_blk_idx - 1;
+            let _ = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
+        }
         self.inode.set_size(new_size);
         self.inode.update_mtime();
         drop(permit);
