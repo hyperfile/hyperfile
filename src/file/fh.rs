@@ -1,14 +1,10 @@
-use log::{debug, info};
-use tokio::io::{Result, Error, ErrorKind};
+use std::io::Result;
 use tokio::sync::oneshot;
 use aws_sdk_s3::Client;
 use reactor::{LocalSpawner, TaskHandler};
-use crate::staging::config::{StagingConfig, StagingType};
-use crate::staging::{Staging, StagingIntercept, s3::S3Staging};
-use crate::config::{HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
-use super::HyperTrait;
+use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use super::hyper::Hyper;
-use super::flags::{HyperFileFlags, FileFlags};
+use super::flags::FileFlags;
 use super::handler::FileContext;
 
 pub struct HyperFileHandler<'a> {
@@ -28,13 +24,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_create_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags,
             meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
-        let staging_config = StagingConfig::new_s3_uri(uri, None);
-        let file_config = HyperFileConfigBuilder::new()
-                            .with_meta_config(meta_config)
-                            .with_staging_config(&staging_config)
-                            .with_runtime_config(runtime_config)
-                            .build();
-        let hyper = Hyper::fs_create(client, uri, flags).await?;
+        let hyper = Hyper::fs_create_opt(client, uri, flags, meta_config, runtime_config).await?;
         let (tx, rx) = oneshot::channel();
         spawner.spawn(hyper, tx);
         let fh = rx.await.expect("failed to get back file handler");
@@ -53,12 +43,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_open_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags,
             runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
-        let staging_config = StagingConfig::new_s3_uri(uri, None);
-        let file_config = HyperFileConfigBuilder::new()
-                            .with_staging_config(&staging_config)
-                            .with_runtime_config(runtime_config)
-                            .build();
-        let hyper = Hyper::fs_open(client, uri, flags).await?;
+        let hyper = Hyper::fs_open_opt(client, uri, flags, runtime_config).await?;
         let (tx, rx) = oneshot::channel();
         spawner.spawn(hyper, tx);
         let fh = rx.await.expect("failed to get back file handler");

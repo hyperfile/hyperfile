@@ -13,8 +13,8 @@ use crate::buffer::Block;
 use crate::staging::{StagingIntercept, Staging, config::StagingConfig};
 use crate::segment::SegmentReadWrite;
 use crate::ondisk::{InodeRaw, BMapRawType};
-use crate::inode::{Inode, OnDiskState, FlushInodeFlag};
-use crate::config::{HyperFileConfig, HyperFileMetaConfig};
+use crate::inode::{Inode, FlushInodeFlag};
+use crate::config::HyperFileConfig;
 use super::flags::HyperFileFlags;
 use super::{HyperTrait, DirtyDataBlocks};
 
@@ -48,7 +48,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     {
         let meta_config = config.meta.clone();
 
-        let mut bmap = BMap::<BlockIndex, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
         let bmap_ud = BMapUserData::new(BlockPtrFormat::MicroGroup);
         bmap.set_userdata(bmap_ud.as_u32());
 
@@ -239,7 +239,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         // TODO: rollback to old size if flush failed
         drop(permit);
 
-        let flushed = self.try_flush().await?;
+        let _flushed = self.try_flush().await?;
         let _ = fn_start;
         Ok(bytes_write)
     }
@@ -305,7 +305,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         // TODO: rollback to old size if flush failed
         drop(permit);
 
-        let flushed = self.try_flush().await?;
+        let _flushed = self.try_flush().await?;
         let _ = fn_start;
         Ok(bytes_write)
     }

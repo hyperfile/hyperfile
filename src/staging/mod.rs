@@ -3,7 +3,6 @@ use crate::SegmentId;
 use crate::segment;
 use crate::config::HyperFileMetaConfig;
 use crate::staging::config::StagingConfig;
-use crate::config::HyperFileRuntimeConfig;
 use crate::inode::{OnDiskState, FlushInodeFlag};
 
 pub trait StagingIntercept<T>: Send + Sync {

@@ -1,9 +1,8 @@
-use std::io::{Error, ErrorKind, Result};
-use log::{debug, error};
-use bytes::Buf;
+use std::io::Result;
+use log::debug;
 use aws_sdk_s3::Client;
 use btree_ondisk::BlockLoader;
-use crate::{BlockPtr, SegmentId, BMapUserData};
+use crate::{BlockPtr, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
 use crate::segment::Segment;
 use crate::s3uri::S3Uri;

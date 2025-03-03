@@ -1,9 +1,9 @@
 //! IO function used by LocalSpawner reactor
+use std::io::{Result, ErrorKind};
 use log::{debug, warn};
 use btree_ondisk::BlockLoader;
-use tokio::io::{Result, ErrorKind};
 use tokio::task::JoinHandle;
-use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId};
+use crate::{BlockIndex, BlockPtr, BlockIndexIter};
 use crate::staging::Staging;
 use crate::segment::SegmentReadWrite;
 use crate::file::{HyperTrait, BlockPtrFormat};

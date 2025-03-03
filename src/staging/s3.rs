@@ -1,9 +1,7 @@
+use std::io::{Result, Error, ErrorKind};
 use std::sync::Arc;
-use log::{debug, error, warn};
-use tokio::io::{Error, ErrorKind, Result};
-use bytes::Buf;
+use log::{debug, error};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::types::Object;
 use crate::staging::{Staging, FlushInodeFlag};
 use crate::staging::config::StagingConfig;
@@ -125,7 +123,6 @@ impl Staging<S3Staging, S3BlockLoader> for S3Staging {
     }
 
     async fn flush_inode(&self, buf: &[u8], inode_state: &Option<OnDiskState>, flag: FlushInodeFlag) -> Result<Option<OnDiskState>> {
-        let key = &self.inode_file;
         let inode_state = S3Ops::do_put_object(&self.client, &self.bucket, &self.inode_file, buf, inode_state).await?;
         if let Some(i) = &self.interceptor {
             let _ = i.after_flush_inode(&self, buf, flag).await;
@@ -134,7 +131,6 @@ impl Staging<S3Staging, S3BlockLoader> for S3Staging {
     }
 
     async fn remove_inode(&self, inode_state: &Option<OnDiskState>) -> Result<()> {
-        let key = &self.inode_file;
         if self.is_directory_bucket() {
             let _  = S3Ops::do_delete_object(&self.client, &self.bucket, &self.inode_file, inode_state).await?;
         } else {

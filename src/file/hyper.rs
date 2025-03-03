@@ -1,14 +1,9 @@
-use std::fmt;
-use log::info;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{ErrorKind, Result};
 use aws_sdk_s3::Client;
-use crate::SegmentId;
-use crate::staging::config::{StagingConfig, StagingType};
 use crate::config::HyperFileConfig;
 use crate::meta_loader::s3::S3BlockLoader;
-use crate::staging::{Staging, StagingIntercept, s3::S3Staging};
-use crate::segment::SegmentSum;
-use super::{HyperTrait, file::HyperFile};
+use crate::staging::{Staging, StagingIntercept, config::StagingConfig, s3::S3Staging};
+use super::file::HyperFile;
 use super::flags::HyperFileFlags;
 
 pub struct Hyper<'a> {

@@ -108,7 +108,7 @@ impl HyperFileConfigBuilder {
 	/// Get a new hyper file config builder with all default values,
 	/// by default, it is a read-only hyper file with 4KiB block size.
 	pub fn new() -> Self {
-		let mut config = HyperFileConfig::default();
+		let config = HyperFileConfig::default();
 		Self {
 			config
 		}

@@ -3,8 +3,7 @@ use std::mem::ManuallyDrop;
 use std::io::Result;
 use tokio::sync::{mpsc, oneshot};
 use reactor::{Task, TaskHandler};
-use crate::{BlockPtr, SegmentId};
-use crate::staging::Staging;
+use crate::SegmentId;
 use super::hyper::Hyper;
 use super::HyperTrait;
 

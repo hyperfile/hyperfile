@@ -1,5 +1,5 @@
 use std::fmt;
-use tokio::io::Result;
+use std::io::Result;
 use crate::SegmentId;
 use crate::ondisk::{SegmentHeader, SegmentBlockEntryRaw};
 use crate::{BlockIndex, BlockPtr};

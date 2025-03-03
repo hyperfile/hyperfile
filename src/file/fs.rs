@@ -1,8 +1,7 @@
-use log::{debug, info};
-use tokio::io::{Result, Error, ErrorKind};
+use std::io::Result;
+use log::debug;
 use aws_sdk_s3::Client;
-use crate::staging::config::{StagingConfig, StagingType};
-use crate::staging::{Staging, StagingIntercept, s3::S3Staging};
+use crate::staging::{Staging, config::StagingConfig, s3::S3Staging};
 use crate::config::{HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use super::HyperTrait;
 use super::hyper::Hyper;
