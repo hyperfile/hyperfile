@@ -71,21 +71,29 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.expect("task channel closed")
     }
 
-    pub async fn fh_read(&mut self, off: usize, buf: &'static mut [u8]) -> Result<usize>
+    pub async fn fh_read(&mut self, off: usize, buf: &mut [u8]) -> Result<usize>
     {
-        let (ctx, tx, mut rx) = FileContext::new_read(buf, off);
+        let b = unsafe {
+            std::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
+        };
+        let (ctx, tx, mut rx) = FileContext::new_read(b, off);
         self.inner.send(ctx);
         let res = rx.recv().await.expect("task channel closed");
         drop(tx);
+        let _ = buf;
         res
     }
 
-    pub async fn fh_write(&mut self, off: usize, buf: &'static [u8]) -> Result<usize>
+    pub async fn fh_write(&mut self, off: usize, buf: &[u8]) -> Result<usize>
     {
-        let (ctx, tx, mut rx) = FileContext::new_write(buf, off, self.inner.clone());
+        let b = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len())
+        };
+        let (ctx, tx, mut rx) = FileContext::new_write(b, off, self.inner.clone());
         self.inner.send(ctx);
         let res = rx.recv().await.expect("task channel closed");
         drop(tx);
+        let _ = buf;
         res
     }
 
