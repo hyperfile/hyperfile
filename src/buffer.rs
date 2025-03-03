@@ -120,15 +120,11 @@ impl Block {
 
     // expose inner data as slice
     pub(crate) fn as_slice(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(self.data.ptr, self.size())
-        }
+        self.data.as_slice()
     }
 
     // expose inner data as slice
     pub(crate) fn as_mut_slice(&self) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(self.data.ptr, self.size())
-        }
+        self.data.as_mut_slice()
     }
 }
