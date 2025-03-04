@@ -52,6 +52,16 @@ impl BlockPtrFormat {
     }
 
     #[inline]
+    pub fn invalid_value() -> BlockPtr {
+        BlockPtr::MIN
+    }
+
+    #[inline]
+    pub fn is_invalid_value(blk_ptr: &BlockPtr) -> bool {
+        *blk_ptr == BlockPtr::MIN
+    }
+
+    #[inline]
     pub fn is_on_staging(blk_ptr: &BlockPtr) -> bool {
         *blk_ptr & BLOCK_PTR_LOCATION_MASK == BLOCK_PTR_STAGING
     }
@@ -111,5 +121,10 @@ impl BlockPtrFormat {
         // convert to bytes offset
         let offset = seg_offset_id << BLOCK_PTR_SEGMENT_MG_OFFSET_ID_SHIFT; // multiple 4KiB
         (segid as SegmentId, offset as SegmentOffset)
+    }
+
+    #[inline]
+    pub(crate) fn decode_micro_group_id(blk_ptr: &BlockPtr) -> u64 {
+        blk_ptr & BLOCK_PTR_SEGMENT_MG_GROUP_INDEX_MASK
     }
 }
