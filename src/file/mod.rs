@@ -59,6 +59,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
     // block ptr
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr;
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset);
+    fn blk_ptr_decode_display(&self, blk_ptr: &BlockPtr) -> String;
     // data cache
     fn clear_data_blocks_cache(&mut self);
     // dirty data

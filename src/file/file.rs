@@ -179,7 +179,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                                             warn!("READ - lookup bmap for block index {blk_idx} error: {}", e);
                                             Err(e)
                                         })?;
-                debug!("      - load data block for block ptr {} at offset {} len {}", blk_ptr, off, this.len());
+                debug!("      - load data block for block ptr {} at offset {} len {}", self.blk_ptr_decode_display(&blk_ptr), off, this.len());
                 let _ = self.load_data_block_read_path(blk_idx, blk_ptr, off, this).await?;
             }
             bytes_read += this.len();
@@ -358,7 +358,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 } else if BlockPtrFormat::is_on_staging(&blk_ptr) {
                     blk_ptr
                 } else {
-                    panic!("invalid block ptr {} of block index {}", blk_ptr, blk_idx);
+                    panic!("invalid block ptr {} of block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
                 }
             },
             Err(e) => {
@@ -369,7 +369,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 return Ok(());
             },
         };
-        debug!("retrive block ptr {} for block index {}", blk_ptr, blk_idx);
+        debug!("retrive block ptr {} for block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
         let block = DataBlock::new(*blk_idx, self.config.meta.data_block_size);
         let buf = block.as_mut_slice();
         let _ = self.load_data_block_read_path(*blk_idx, blk_ptr, 0, buf).await?;
@@ -502,7 +502,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    debug!("retrive block ptr {} for block index {}", blk_ptr, blk_idx);
+                    debug!("retrive block ptr {} for block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
                     let block = DataBlock::new(blk_idx, data_block_size);
                     let buf = block.as_mut_slice();
                     if !BlockPtrFormat::is_zero_block(&blk_ptr) {
@@ -537,7 +537,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     }
 
     async fn load_data_block_read_path(&self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
-        debug!("load_data_block - block ptr: {}", blk_ptr);
+        debug!("load_data_block - block ptr: {}", self.blk_ptr_decode_display(&blk_ptr));
         // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(&blk_idx) {
             // cache hit
@@ -556,12 +556,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             buf.fill(0);
             return Ok(());
         } else {
-            panic!("incorrect block ptr {} to load", blk_ptr);
+            panic!("incorrect block ptr {} to load", self.blk_ptr_decode_display(&blk_ptr));
         }
     }
 
     async fn load_data_block_write_path(&self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
-        debug!("load_data_block - block ptr: {}", blk_ptr);
+        debug!("load_data_block - block ptr: {}", self.blk_ptr_decode_display(&blk_ptr));
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let _ = self.staging.load_data_block(segid, staging_off, offset, self.config.meta.data_block_size, buf).await?;
@@ -579,7 +579,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             buf.fill(0);
             return Ok(());
         } else {
-            panic!("incorrect block ptr {} to load", blk_ptr);
+            panic!("incorrect block ptr {} to load", self.blk_ptr_decode_display(&blk_ptr));
         }
     }
 
@@ -601,6 +601,22 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
 
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
         BlockPtrFormat::decode(blk_ptr, &self.bmap_ud.blk_ptr_format)
+    }
+
+    fn blk_ptr_decode_display(&self, blk_ptr: &BlockPtr) -> String {
+        if BlockPtrFormat::is_dummy_value(blk_ptr) {
+            return format!("[Dummy]");
+        } else if BlockPtrFormat::is_invalid_value(blk_ptr) {
+            return format!("[Invalid]");
+        } else if BlockPtrFormat::is_zero_block(blk_ptr) {
+            return format!("[Zero Block]");
+        } else if BlockPtrFormat::is_on_staging(blk_ptr) {
+            let (id, off) = self.blk_ptr_decode(blk_ptr);
+            let group_id = BlockPtrFormat::decode_micro_group_id(blk_ptr);
+            return format!("[Staging: id {} - offset {} - group {}]", id, off, group_id);
+        } else {
+            return format!("[Unkown: 0x{:x}]", blk_ptr);
+        }
     }
 
     fn clear_data_blocks_cache(&mut self) {
