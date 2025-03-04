@@ -436,7 +436,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
         debug!("truncate - shrink bmap to BlockIndex {}", tgt_blk_idx);
         // if need to shrink bmap
-        let _ = self.bmap.truncate(&tgt_blk_idx).await?;
+        if let Err(e) = self.bmap.truncate(&tgt_blk_idx).await {
+            if e.kind() != ErrorKind::NotFound {
+                return Err(e);
+            }
+            // NotFound is fine, let's continue
+        }
         if new_size > 0 {
             let tgt_blk_idx = tgt_blk_idx - 1;
             let _ = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
