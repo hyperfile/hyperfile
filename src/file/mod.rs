@@ -199,10 +199,10 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
                 let b = self.bmap_get_raw();
                 let raw_inode = self.inode().to_raw(b);
                 let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), self.inode().get_ondisk_state(), FlushInodeFlag::Update).await?;
-                self.inode().clear_attr_dirty_unsafe();
-                self.inode().set_ondisk_state_unsafe(od_state);
+                self.inode_mut().clear_attr_dirty();
+                self.inode_mut().set_ondisk_state(od_state);
                 let last_cno = self.inode().get_last_cno();
-                self.inode().set_last_ondisk_cno_unsafe(last_cno);
+                self.inode_mut().set_last_ondisk_cno(last_cno);
             }
             debug!("flush quit, NO dirty data blocks amd bmap is NOT dirty");
             let segid = self.inode().get_last_seq();
@@ -217,10 +217,11 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
             dirty_meta_vec.len(), dirty_data_blocks.len());
 
-        let segid = self.inode().get_next_seq_unsafe();
+        let segid = self.inode_mut().get_next_seq();
         let mut file_off = 0;
         let mut segwr = self.staging().new_segwr(segid, &self.config().meta);
 
+        let dirty_data_blocks = self.get_data_blocks_dirty();
         let ndatadirty = dirty_data_blocks.len();
         file_off += segment::Writer::<'_, T>::calc_ss_aligned_bytes(ndatadirty);
 
@@ -253,9 +254,9 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let _ = _start.elapsed();
 
         // prepare inode
-        self.inode().set_last_cno_unsafe(segid);
         let b = self.bmap_get_raw();
-        let raw_inode = self.inode().to_raw(b);
+        let mut raw_inode = self.inode().to_raw(b);
+        raw_inode.i_last_cno = segid;
         // TODO: calc segment checksum
         segwr.realize_ss(0, &raw_inode);
 
@@ -276,6 +277,8 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
 
         let _start = Instant::now();
         segwr.done().await?;
+        // update last cno in memory after segment write out
+        self.inode_mut().set_last_cno(segid);
         let _ = _start.elapsed();
 
         // flush inode after writeout segment

@@ -254,13 +254,6 @@ impl Inode {
         self.i_last_seq
     }
 
-    pub fn get_next_seq_unsafe(&self) -> SegmentId {
-        let inode = std::ptr::addr_of!(*self) as *mut Inode;
-        unsafe {
-            (*inode).get_next_seq()
-        }
-    }
-
     pub fn get_last_seq(&self) -> SegmentId {
         self.i_last_seq
     }
@@ -276,14 +269,6 @@ impl Inode {
     }
 
     #[inline]
-    pub fn set_last_cno_unsafe(&self, segid: u64) {
-        let inode = std::ptr::addr_of!(*self) as *mut Inode;
-        unsafe {
-            (*inode).set_last_cno(segid);
-        }
-    }
-
-    #[inline]
     pub fn get_last_ondisk_cno(&self) -> u64 {
         self.i_last_ondisk_cno
     }
@@ -291,14 +276,6 @@ impl Inode {
     #[inline]
     pub fn set_last_ondisk_cno(&mut self, cno: u64) {
         self.i_last_ondisk_cno = cno;
-    }
-
-    #[inline]
-    pub fn set_last_ondisk_cno_unsafe(&self, cno: u64) {
-        let inode = std::ptr::addr_of!(*self) as *mut Inode;
-        unsafe {
-            (*inode).set_last_ondisk_cno(cno);
-        }
     }
 
     #[inline]
@@ -315,13 +292,6 @@ impl Inode {
 
     pub fn set_ondisk_state(&mut self, od_state: Option<OnDiskState>) {
         self.i_ondisk_state = od_state;
-    }
-
-    pub fn set_ondisk_state_unsafe(&self, od_state: Option<OnDiskState>) {
-        let inode = std::ptr::addr_of!(*self) as *mut Inode;
-        unsafe {
-            (*inode).set_ondisk_state(od_state);
-        }
     }
 }
 
