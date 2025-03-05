@@ -104,10 +104,12 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let mut inode_state;
         loop {
+            debug!("try_recover_partial_flush - loop entry");
             match self.staging().load_inode(&mut raw_inode.as_mut_u8_slice()).await {
                 Ok(od_state) => { inode_state = od_state; },
                 Err(e) => { return Err(e); },
             }
+            debug!("try_recover_partial_flush - inode ondisk state: {:?}", inode_state);
 
             // test next segid
             let next_segid = raw_inode.i_last_seq + 1;
