@@ -408,36 +408,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
         // if need to extend file length
         if tgt_blk_idx > cur_blk_idx {
-            let last_key_res = self.bmap.last_key().await;
-            let (start_blkidx, end_blkidx) = if cur_blk_idx == 0 {
-                if size == 0 {
-                    // assume bmap is empty
-                    assert!(last_key_res.unwrap_err().kind() == ErrorKind::NotFound);
-                    (0, tgt_blk_idx)
-                } else {
-                    (1, tgt_blk_idx)
-                }
-            } else {
-                match last_key_res {
-                    Ok(last_key) => {
-                        (last_key + 1, tgt_blk_idx)
-                    },
-                    Err(e) => {
-                        if e.kind() != ErrorKind::NotFound { return Err(e); }
-                        (0, tgt_blk_idx)
-                    },
-                }
-            };
-            // extending bmap
-            debug!("truncate - operation need to extend current bmap index from {} to {}", start_blkidx, end_blkidx);
-            for i in start_blkidx..=end_blkidx as BlockIndex {
-                let _ = self.bmap.insert(i, BlockPtrFormat::new_zero_block()).await?;
-            }
-            self.bmap.dirty();
+            // no need to modify bmap, just update new file size
             self.inode.set_size(new_size);
             self.inode.update_mtime();
-            drop(permit);
-            self.flush().await?;
+            debug!("truncate - extend file size with no bmap change, update file attr only");
+            self.flush_inode(FlushInodeFlag::Update).await?;
             return Ok(());
         }
 
