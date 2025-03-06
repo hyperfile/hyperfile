@@ -418,8 +418,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                     (1, tgt_blk_idx)
                 }
             } else {
-                assert!(last_key_res.is_ok());
-                (last_key_res.unwrap() + 1, tgt_blk_idx)
+                match last_key_res {
+                    Ok(last_key) => {
+                        (last_key + 1, tgt_blk_idx)
+                    },
+                    Err(e) => {
+                        if e.kind() != ErrorKind::NotFound { return Err(e); }
+                        (0, tgt_blk_idx)
+                    },
+                }
             };
             // extending bmap
             debug!("truncate - operation need to extend current bmap index from {} to {}", start_blkidx, end_blkidx);
