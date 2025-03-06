@@ -1,6 +1,6 @@
 use std::io::{Result, Error, ErrorKind};
 use std::sync::Arc;
-use log::{debug, error};
+use log::{debug, warn, error};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::Object;
 use crate::staging::{Staging, FlushInodeFlag};
@@ -112,7 +112,7 @@ impl Staging<S3Staging, S3BlockLoader> for S3Staging {
             Err(sdk_err) => {
                 if sdk_err.as_service_error().map(|e| e.is_not_found()) == Some(true) {
                     let err_str = format!("HeadObject s3://{}/{} not exist", self.bucket, key);
-                    error!("{}", err_str);
+                    warn!("{}", err_str);
                     return Err(Error::new(ErrorKind::NotFound, err_str));
                 }
                 let err_str = format!("HeadObject s3://{}/{} error: {}", self.bucket, key, sdk_err);

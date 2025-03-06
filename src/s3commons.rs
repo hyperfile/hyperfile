@@ -1,5 +1,5 @@
 use std::io::{Error, ErrorKind, Result};
-use log::error;
+use log::{error, warn};
 use bytes::Buf;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::SdkBody;
@@ -58,10 +58,11 @@ impl S3Ops {
                 } else {
                     err_str.push_str(&format!("{}", sdk_err));
                 };
-                error!("{}", err_str);
                 if sdk_err.as_service_error().map(|e| e.is_not_found()) == Some(true) {
+                    warn!("{}", err_str);
                     return Err(Error::new(ErrorKind::NotFound, err_str));
                 }
+                error!("{}", err_str);
                 return Err(Error::new(ErrorKind::Other, err_str));
             }
         }
@@ -89,7 +90,7 @@ impl S3Ops {
                 if let Some(resp) = sdk_err.raw_response() {
                     if resp.status().as_u16() == 412 {
                         let err_str = format!("Conditional DeleteObject failed on s3://{}/{}, status: {}", bucket, key, resp.status().as_u16());
-                        error!("{}", err_str);
+                        warn!("{}", err_str);
                         return Err(Error::new(ErrorKind::ResourceBusy, err_str));
                     }
                 }
@@ -148,10 +149,11 @@ impl S3Ops {
                 } else {
                     err_str.push_str(&format!("{}", sdk_err));
                 };
-                error!("{}", err_str);
                 if sdk_err.as_service_error().map(|e| e.is_no_such_key()) == Some(true) {
+                    warn!("{}", err_str);
                     return Err(Error::new(ErrorKind::NotFound, err_str));
                 }
+                error!("{}", err_str);
                 return Err(Error::new(ErrorKind::Other, err_str));
             },
         }
@@ -186,7 +188,7 @@ impl S3Ops {
                     match resp.status().as_u16() {
                         412 | 409 => {
                             let err_str = format!("Conditional PutObject failed on s3://{}/{}, status: {}", bucket, key, resp.status().as_u16());
-                            error!("{}", err_str);
+                            warn!("{}", err_str);
                             return Err(Error::new(ErrorKind::ResourceBusy, err_str));
                         },
                         _ => {},
@@ -309,7 +311,7 @@ impl S3Ops {
                         412 | 409 => {
                             let err_str = format!("Conditional CompleteMultipartUpload failed on s3://{}/{}, status: {}",
                                 bucket, key, resp.status().as_u16());
-                            error!("{}", err_str);
+                            warn!("{}", err_str);
                             return Err(Error::new(ErrorKind::ResourceBusy, err_str));
                         },
                         _ => {},
