@@ -1,7 +1,9 @@
 mod settings;
 use std::io::{Result, ErrorKind};
+use std::time::Instant;
 use rand::Rng;
 use aws_sdk_s3::Client;
+use human_bytes::human_bytes;
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
 use settings::*;
@@ -76,9 +78,13 @@ async fn read_check(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()
 
     let mut buf = Vec::new();
     buf.resize(total_bytes, 0);
+    let start = Instant::now();
     let read_bytes = hyper.fs_read(0, &mut buf).await?;
+    let millis = start.elapsed().as_millis();
     println!("real data in memory md5: {:?} - read data from file md5: {:?}", md5::compute(&data), md5::compute(&buf));
     assert!(read_bytes == total_bytes);
+    let throughput = (read_bytes as u128 * 1000) / millis;
+    println!("bytes read {} throughput {}/s", human_bytes(read_bytes as f64), human_bytes(throughput as f64));
     let _last_cno = hyper.fs_release().await?;
     Ok(())
 }
