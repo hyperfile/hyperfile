@@ -1,15 +1,10 @@
+mod settings;
 use std::io::{Result, ErrorKind};
-use std::ops::Range;
 use rand::Rng;
 use aws_sdk_s3::Client;
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
-
-const NUM_ITER: usize = 100;
-const DEFAULT_BLOCK_SIZE: usize = 4096;
-const DEFAULT_MAX_FILE_SIZE: usize = 50 * 1024 * 1024; // 50MiB
-const DEFAULT_RANDOM_WRITE_OFFSET: Range<usize> = 0..DEFAULT_MAX_FILE_SIZE;
-const DEFAULT_RANDOM_WRITE_BYTES: Range<usize> = 1..DEFAULT_BLOCK_SIZE*1024; // 1Byte to 4MiB
+use settings::*;
 
 async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()> {
     let rand_data_offset = rand::random_range(DEFAULT_RANDOM_WRITE_OFFSET);
@@ -38,7 +33,9 @@ async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<
 async fn random_truncate(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()> {
     let curr_len = data.len();
     // ratio to truncate only one byte
-    let new_file_len = if rand::rng().random_ratio(2, 10) {
+    let new_file_len = if curr_len == 0 {
+        rand::random_range(0..DEFAULT_MAX_FILE_SIZE)
+    } else if rand::rng().random_ratio(2, 10) {
         curr_len - 1
     } else if rand::rng().random_ratio(2, 10) {
         curr_len + 1
