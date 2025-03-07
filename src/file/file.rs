@@ -340,12 +340,13 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         Ok(())
     }
 
-    async fn truncate_last_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> Result<()> {
+    // return: if last block data changed
+    async fn truncate_last_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> Result<bool> {
         if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
             to_clear.fill(0);
-            return Ok(());
+            return Ok(true);
         }
 
         // blk index not in dirty list
@@ -354,7 +355,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             Ok(blk_ptr) => {
                 if BlockPtrFormat::is_zero_block(&blk_ptr) {
                     // no need to discard data for a zero block
-                    return Ok(());
+                    return Ok(false);
                 } else if BlockPtrFormat::is_on_staging(&blk_ptr) {
                     blk_ptr
                 } else {
@@ -366,7 +367,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                     return Err(e);
                 }
                 // no need to discard data for a non exists data block
-                return Ok(());
+                return Ok(false);
             },
         };
         debug!("retrive block ptr {} for block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
@@ -378,7 +379,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         to_clear.fill(0);
         // back to dirty list
         self.data_blocks_dirty.insert(*blk_idx, block);
-        Ok(())
+        Ok(true)
     }
 
     // truncate
@@ -397,12 +398,18 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let offset_to_discard = new_size % data_block_size;
 
         if tgt_blk_idx == cur_blk_idx {
-            let _ = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
+            let data_changed = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
             // no need to change metadata blocks, just update the new file size
             self.inode.set_size(new_size);
             self.inode.update_mtime();
-            debug!("truncate - no bmap change, update file attr only");
-            self.flush_inode(FlushInodeFlag::Update).await?;
+            if data_changed {
+                debug!("truncate - data changed, trigger flush");
+                drop(permit);
+                self.flush().await?;
+            } else {
+                debug!("truncate - no bmap and data changed, update file attr only");
+                self.flush_inode(FlushInodeFlag::Update).await?;
+            }
             return Ok(());
         }
 
