@@ -8,6 +8,8 @@ pub mod hyper;
 pub mod fs;
 #[cfg(feature = "reactor")]
 pub mod fh;
+#[cfg(feature = "reactor")]
+pub mod tokio_wrapper;
 
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
