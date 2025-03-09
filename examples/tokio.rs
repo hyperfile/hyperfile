@@ -89,10 +89,15 @@ async fn read_check(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()
     let start = Instant::now();
     let read_bytes = file.read(&mut buf).await?;
     let nanos = start.elapsed().as_nanos();
-    println!("real data in memory md5: {:?} - read data from file md5: {:?}", md5::compute(&data), md5::compute(&buf));
+    let md5_data = md5::compute(&data);
+    let md5_file = md5::compute(&buf);
+    println!("real data in memory md5: {:?} - read data from file md5: {:?}", md5_data, md5_file);
     assert!(read_bytes == total_bytes);
     let throughput = (read_bytes as u128 * 1000_000_000) / nanos;
     println!("bytes read {} throughput {}/s", human_bytes(read_bytes as f64), human_bytes(throughput as f64));
+    if md5_data != md5_file {
+        panic!("md5 check failed");
+    }
     Ok(())
 }
 
