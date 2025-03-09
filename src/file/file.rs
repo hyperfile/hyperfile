@@ -221,13 +221,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         // bulk update bmap
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         for (blk_idx, _, _) in blk_iter {
-            // don't care if insert failed for exist
-            match self.bmap.try_insert(blk_idx, BlockPtrFormat::dummy_value()).await {
-                Err(e) => {
-                    if e.kind() != ErrorKind::AlreadyExists { return Err(e); }
-                },
-                Ok(_) => {},
-            }
+            // force bmap update for dirty blocks
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
         }
 
         let oldsize = self.inode.size();
@@ -286,13 +281,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             let mut zero = Vec::with_capacity(data_len);
             zero.resize(data_len, 0);
             self.update_cache(blk_idx, start_off, &zero);
-            // don't care if insert failed for exist
-            match self.bmap.try_insert(blk_idx, BlockPtrFormat::dummy_value()).await {
-                Err(e) => {
-                    if e.kind() != ErrorKind::AlreadyExists { return Err(e); }
-                },
-                Ok(_) => {},
-            }
+            // force bmap update for dirty blocks
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
             bytes_write += data_len;
         }
 
