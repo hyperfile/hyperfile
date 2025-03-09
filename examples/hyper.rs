@@ -84,7 +84,7 @@ async fn read_check(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()
     let nanos = start.elapsed().as_nanos();
     println!("real data in memory md5: {:?} - read data from file md5: {:?}", md5::compute(&data), md5::compute(&buf));
     assert!(read_bytes == total_bytes);
-    let throughput = (read_bytes as u128 * 1000_000) / nanos;
+    let throughput = (read_bytes as u128 * 1000_000_000) / nanos;
     println!("bytes read {} throughput {}/s", human_bytes(read_bytes as f64), human_bytes(throughput as f64));
     let _last_cno = hyper.fs_release().await?;
     Ok(())
