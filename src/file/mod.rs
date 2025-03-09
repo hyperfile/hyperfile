@@ -233,7 +233,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
             let blk_ptr = self.blk_ptr_encode(segid, file_off, block_seq);
             let node_size = n.size();
             // use 0 as key, but it's useless
-            debug!("assign block ptr for meta node: block ptr {}", blk_ptr);
+            debug!("assign block ptr for meta node: block ptr {}", self.blk_ptr_decode_display(&blk_ptr));
             self.bmap().assign_meta_node(blk_ptr, n.clone()).await?;
             segwr.inc_metablk();
             file_off += node_size;
@@ -246,7 +246,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         for (blk_idx, n) in dirty_data_blocks.data().iter() {
             let blk_ptr = self.blk_ptr_encode(segid, file_off, block_seq);
             let block_size = n.size();
-            debug!("assign block ptr for data node: block ptr {}, block index {}", blk_ptr, blk_idx);
+            debug!("assign block ptr for data node: block ptr {}, block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
             self.bmap().assign_data_node(blk_idx, blk_ptr).await?;
             segwr.inc_datablk(blk_idx, &blk_ptr);
             file_off += block_size;
