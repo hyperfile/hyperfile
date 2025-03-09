@@ -4,10 +4,10 @@ pub mod inode;
 pub mod ondisk;
 pub mod segment;
 pub mod file;
+pub mod s3uri;
 pub(crate) mod meta_loader;
 pub(crate) mod buffer;
 pub(crate) mod staging;
-pub(crate) mod s3uri;
 pub(crate) mod s3commons;
 
 pub type BlockIndex = u64;
