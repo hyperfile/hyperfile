@@ -332,10 +332,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
     // return: if last block data changed
     async fn truncate_last_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> Result<bool> {
+        debug!("truncate_last_data_block - block index {}, offset_to_discard {}", blk_idx, offset_to_discard);
         if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
             to_clear.fill(0);
+            debug!("truncate_last_data_block - data block in dirty list, data cleared");
             return Ok(true);
         }
 
@@ -345,6 +347,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             Ok(blk_ptr) => {
                 if BlockPtrFormat::is_zero_block(&blk_ptr) {
                     // no need to discard data for a zero block
+                    debug!("truncate_last_data_block - block ptr is zero block, nothing changed");
                     return Ok(false);
                 } else if BlockPtrFormat::is_on_staging(&blk_ptr) {
                     blk_ptr
@@ -357,6 +360,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                     return Err(e);
                 }
                 // no need to discard data for a non exists data block
+                debug!("truncate_last_data_block - block index {} not found in bmap, nothing changed", blk_idx);
                 return Ok(false);
             },
         };
@@ -383,8 +387,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
 
         let data_block_size = self.config.meta.data_block_size;
-        let tgt_blk_idx = ((new_size + data_block_size - 1) / data_block_size) as BlockIndex;
-        let cur_blk_idx = ((size + data_block_size - 1) / data_block_size) as BlockIndex;
+        let tgt_blk_idx = (new_size / data_block_size) as BlockIndex;
+        let cur_blk_idx = (size / data_block_size) as BlockIndex;
         let offset_to_discard = new_size % data_block_size;
 
         if tgt_blk_idx == cur_blk_idx {
@@ -414,6 +418,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
 
         debug!("truncate - shrink bmap to BlockIndex {}", tgt_blk_idx);
+        // re-calc tgt_blk_idx for bmap truncate
+        let tgt_blk_idx = ((new_size + data_block_size - 1) / data_block_size) as BlockIndex;
         // if need to shrink bmap
         if let Err(e) = self.bmap.truncate(&tgt_blk_idx).await {
             if e.kind() != ErrorKind::NotFound {
