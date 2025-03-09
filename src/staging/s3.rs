@@ -1,6 +1,6 @@
 use std::io::{Result, Error, ErrorKind};
 use std::sync::Arc;
-use log::{debug, warn, error};
+use log::{trace, debug, warn, error};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::Object;
 use crate::staging::{Staging, FlushInodeFlag};
@@ -276,7 +276,7 @@ impl S3Staging {
 
 impl segment::SegmentReadWrite for S3Staging {
     fn append(&self, segid: SegmentId, buf: &[u8]) -> Result<()> {
-        debug!("appending to inner buffer {}/{} len {}", self.root_path, Segment::segid_to_staging_file_id(segid), buf.len());
+        trace!("appending to inner buffer {}/{} len {}", self.root_path, Segment::segid_to_staging_file_id(segid), buf.len());
         Ok(())
     }
 
