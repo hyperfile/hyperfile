@@ -28,6 +28,7 @@ async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<
     let mut file = HyperFileTokio::open_or_create(&client, &uri, flags).await?;
     // write content
     let filled_buf = &mut data[rand_data_offset..total_len];
+    rand::fill(filled_buf);
     file.seek(SeekFrom::Start(rand_data_offset as u64)).await?;
     let write_bytes = file.write(filled_buf).await?;
     assert!(write_bytes == rand_data_bytes);

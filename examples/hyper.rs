@@ -25,6 +25,7 @@ async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<
     let mut hyper = Hyper::fs_open_or_create(client, uri, flags).await?;
     // write content
     let filled_buf = &mut data[rand_data_offset..total_len];
+    rand::fill(filled_buf);
     let write_bytes = hyper.fs_write(rand_data_offset, filled_buf).await?;
     assert!(write_bytes == rand_data_bytes);
     let last_cno = hyper.fs_release().await?;
