@@ -373,6 +373,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         to_clear.fill(0);
         // back to dirty list
         self.data_blocks_dirty.insert(*blk_idx, block);
+        let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
         Ok(true)
     }
 
