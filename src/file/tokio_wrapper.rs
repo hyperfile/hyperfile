@@ -113,6 +113,12 @@ impl<'a: 'static> HyperFileTokio<'a> {
         self.inner.send(ctx);
         rx.await.expect("task channel closed")
     }
+
+    pub async fn flush_ext(&self) -> Result<u64> {
+        let (ctx, rx) = FileContext::new_flush();
+        self.inner.send(ctx);
+        rx.await.expect("task channel closed")
+    }
 }
 
 impl AsyncRead for HyperFileTokio<'_> {
