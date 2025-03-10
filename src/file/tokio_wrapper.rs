@@ -29,6 +29,7 @@ enum State {
 enum Operation {
     Read((mpsc::Sender<FileRespRead>, mpsc::Receiver<FileRespRead>)),
     Write((mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>)),
+    WriteZero(()),
     Flush(oneshot::Receiver<FileRespFlush>),
     Release(oneshot::Receiver<FileRespRelease>),
     Seek(oneshot::Receiver<FileRespGetAttr>),
@@ -118,6 +119,25 @@ impl<'a: 'static> HyperFileTokio<'a> {
         let (ctx, rx) = FileContext::new_flush();
         self.inner.send(ctx);
         rx.await.expect("task channel closed")
+    }
+
+    pub async fn write_zero(&mut self, len: usize) -> Result<usize> {
+        loop {
+            match self.state {
+                State::Busy(_) => {
+                    tokio::task::yield_now().await;
+                },
+                State::Idle(_) => {
+                    let (ctx, tx, mut rx) = FileContext::new_write_zero(self.pos as usize, len, self.inner.clone());
+                    self.inner.send(ctx);
+                    self.state = State::Busy(Operation::WriteZero(()));
+                    let res = rx.recv().await.expect("task channel closed");
+                    drop(tx);
+                    self.state = State::Idle(());
+                    return res;
+                },
+            }
+        }
     }
 }
 
