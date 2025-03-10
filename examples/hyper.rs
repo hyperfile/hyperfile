@@ -8,7 +8,7 @@ use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
 use settings::*;
 
-async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()> {
+async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>, write_zero: bool) -> Result<()> {
     let rand_data_offset = rand::random_range(DEFAULT_RANDOM_WRITE_OFFSET);
     let mut rand_data_bytes = rand::random_range(DEFAULT_RANDOM_WRITE_BYTES);
     if rand_data_offset + rand_data_bytes >= DEFAULT_MAX_FILE_SIZE {
@@ -19,14 +19,26 @@ async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<
     if total_len > data.len() {
         data.resize(total_len, 0);
     }
-    print!("random write offset {} bytes {} ..", rand_data_offset, rand_data_bytes);
+    if write_zero {
+        print!("random write zero offset {} bytes {} ..", rand_data_offset, rand_data_bytes);
+    } else {
+        print!("random write offset {} bytes {} ..", rand_data_offset, rand_data_bytes);
+    }
 
     let flags = FileFlags::rdwr();
     let mut hyper = Hyper::fs_open_or_create(client, uri, flags).await?;
     // write content
     let filled_buf = &mut data[rand_data_offset..total_len];
-    rand::fill(filled_buf);
-    let write_bytes = hyper.fs_write(rand_data_offset, filled_buf).await?;
+    if write_zero {
+        filled_buf.fill(0);
+    } else {
+        rand::fill(filled_buf);
+    }
+    let write_bytes = if write_zero {
+        hyper.fs_write_zero(rand_data_offset, rand_data_bytes).await?
+    } else {
+        hyper.fs_write(rand_data_offset, filled_buf).await?
+    };
     assert!(write_bytes == rand_data_bytes);
     let last_cno = hyper.fs_release().await?;
     println!(". Done with last cno {}", last_cno);
@@ -116,8 +128,10 @@ async fn main() -> Result<()> {
     let mut data = Vec::new();
 
     for _ in 0..NUM_ITER {
-        if rand::rng().random_ratio(7, 10) {
-            random_write(&client, &uri, &mut data).await?;
+        if rand::rng().random_ratio(5, 10) {
+            random_write(&client, &uri, &mut data, false).await?;
+        } else if rand::rng().random_ratio(2, 10) {
+            random_write(&client, &uri, &mut data, true).await?;
         } else {
             random_truncate(&client, &uri, &mut data).await?;
         }
