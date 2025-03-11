@@ -399,12 +399,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             self.inode.update_mtime();
             if data_changed {
                 debug!("truncate - data changed, trigger flush");
-                drop(permit);
-                self.flush().await?;
             } else {
                 debug!("truncate - no bmap and data changed, update file attr only");
-                self.flush_inode(FlushInodeFlag::Update).await?;
             }
+            drop(permit);
+            self.flush().await?;
             return Ok(());
         }
 
@@ -414,7 +413,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             self.inode.set_size(new_size);
             self.inode.update_mtime();
             debug!("truncate - extend file size with no bmap change, update file attr only");
-            self.flush_inode(FlushInodeFlag::Update).await?;
+            drop(permit);
+            self.flush().await?;
             return Ok(());
         }
 
