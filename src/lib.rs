@@ -97,18 +97,22 @@ pub(crate) const DEFAULT_FORWARD_ORIGIN_THRESHOLD: usize = 8 * 1024 * 1024;
 pub(crate) const DEFAULT_FORWARD_ORIGIN_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 pub(crate) const DEFAULT_SEGMENT_BUFFER_SIZE: usize = 100 * 1024 * 1024;
+pub(crate) const DEFAULT_LARGE_SEGMENT_BUFFER_SIZE: usize = 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_SEGMENT_MPU_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 // count of data blocks kept by each opened hyper file in LRU
 // CAUTION: this value should be large enough to hold the largest stripe of a single FUSE write
 //   default continues write is 128K, max could be 1M ?
 pub(crate) const DEFAULT_DATA_CACHE_BLOCKS: usize = 1024;
+pub(crate) const DEFAULT_LARGE_DATA_CACHE_BLOCKS: usize = 256000;
 /// Dirty data in bytes threshold to force a flush
 ///
 /// This value combine with `DEFAULT_DIRTY_DATA_BLOCKS_THRESHOLD` will determine max data/blocks
 /// each HyperFile can hold before a force flush
 pub(crate) const DEFAULT_MAX_DIRTY_DATA_BYTES_THRESHOLD: usize = 8_388_608;
+pub(crate) const DEFAULT_LARGE_MAX_DIRTY_DATA_BYTES_THRESHOLD: usize = 1024 * 1024 * 1024;
 /// Dirty data in blocks threshold to force a flush
 pub(crate) const DEFAULT_MAX_DIRTY_DATA_BLOCKS_THRESHOLD: usize = 32;
+pub(crate) const DEFAULT_LARGE_MAX_DIRTY_DATA_BLOCKS_THRESHOLD: usize = 256000;
 /// Max interval threshold in milliseconds to force a flush,
 ///
 /// normally time based force flush should be triggered by external,
