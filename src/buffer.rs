@@ -60,7 +60,7 @@ impl Drop for AlignedDataBlock {
     }
 }
 
-pub(crate) struct DataBlock {
+pub struct DataBlock {
     data: Pin<Box<AlignedDataBlock>>,
     index: BlockIndex,
 }
@@ -128,5 +128,75 @@ impl DataBlock {
     // expose inner data as slice
     pub(crate) fn as_mut_slice(&self) -> &mut [u8] {
         self.data.as_mut_slice()
+    }
+}
+
+pub struct ZeroDataBlock {
+    index: BlockIndex,
+    size: usize,
+}
+
+impl ZeroDataBlock {
+    pub(crate) fn new(index: BlockIndex, size: usize) -> Self {
+        Self { index, size }
+    }
+
+    #[inline]
+    pub(crate) fn index(&self) -> BlockIndex {
+        self.index
+    }
+
+    #[inline]
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+}
+
+pub enum DataBlockWrapper {
+    Data(DataBlock),
+    Zero(ZeroDataBlock),
+}
+
+impl DataBlockWrapper {
+    pub fn new(index: BlockIndex, size: usize, is_zero: bool) -> Self {
+        if is_zero {
+            return Self::Zero(ZeroDataBlock::new(index, size));
+        }
+        Self::Data(DataBlock::new(index, size))
+    }
+
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Self::Data(_) => false,
+            Self::Zero(_) => true,
+        }
+    }
+
+    pub fn index(&self) -> BlockIndex {
+        match self {
+            Self::Data(block) => block.index(),
+            Self::Zero(block) => block.index(),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            Self::Data(block) => block.size(),
+            Self::Zero(block) => block.size(),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Data(block) => block.as_slice(),
+            Self::Zero(_) => panic!("no slice on zero data block"),
+        }
+    }
+
+    pub fn as_mut_slice(&self) -> &mut [u8] {
+        match self {
+            Self::Data(block) => block.as_mut_slice(),
+            Self::Zero(_) => panic!("no slice on zero data block"),
+        }
     }
 }

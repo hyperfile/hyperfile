@@ -3,6 +3,7 @@ use tokio::sync::oneshot;
 use aws_sdk_s3::Client;
 use reactor::{LocalSpawner, TaskHandler};
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
+use crate::buffer::DataBlockWrapper;
 use super::hyper::Hyper;
 use super::flags::FileFlags;
 use super::handler::FileContext;
@@ -104,6 +105,13 @@ impl<'a: 'static> HyperFileHandler<'a> {
         let res = rx.recv().await.expect("task channel closed");
         drop(tx);
         res
+    }
+
+    pub async fn fh_write_aligned_batch(&mut self, blocks: Vec<DataBlockWrapper>) -> Result<usize>
+    {
+        let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks);
+        self.inner.send(ctx);
+        rx.recv().await.expect("task channel closed")
     }
 
     pub async fn fh_flush(&mut self) -> Result<u64>

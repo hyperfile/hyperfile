@@ -8,7 +8,7 @@ use btree_ondisk::{bmap::BMap, BlockLoader};
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
-use crate::buffer::DataBlock;
+use crate::buffer::{DataBlock, DataBlockWrapper};
 use crate::staging::{StagingIntercept, Staging, config::StagingConfig};
 use crate::segment::SegmentReadWrite;
 use crate::ondisk::{InodeRaw, BMapRawType};
@@ -296,6 +296,52 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
         let _flushed = self.try_flush().await?;
         let _ = fn_start;
+        Ok(bytes_write)
+    }
+
+    // input blocks vec should be dedup and sorted
+    pub(crate) async fn write_aligned_batch(&mut self, blocks: Vec<DataBlockWrapper>) -> Result<usize> {
+        if blocks.len() == 0 {
+            return Ok(0);
+        }
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        let data_block_size = self.config.meta.data_block_size;
+        let mut bytes_write = 0;
+        for block_wrapper in blocks.iter() {
+            let blk_idx = block_wrapper.index();
+            let blk_sz = block_wrapper.size();
+            assert!(blk_sz == data_block_size);
+            if block_wrapper.is_zero() {
+                let _ = self.data_blocks_dirty.remove(&blk_idx);
+                bytes_write += blk_sz;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                continue;
+            }
+            if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
+                // found in dirty list, just update it's content
+                block.copy(0, block_wrapper.as_slice());
+                bytes_write += blk_sz;
+            } else {
+                // can't found in dirty list, create a new one
+                let mut block = DataBlock::new(blk_idx, data_block_size);
+                block.copy(0, block_wrapper.as_slice());
+                self.data_blocks_dirty.insert(blk_idx, block);
+                bytes_write += blk_sz;
+            }
+            // force bmap update for dirty blocks
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
+        }
+        // try update file size by offset and len from last block
+        let last_block_wrapper = blocks.last().expect("unable to get last block, input blocks is empty");
+        let oldsize = self.inode.size();
+        let off = (last_block_wrapper.index() as usize) * data_block_size;
+        let len = last_block_wrapper.size();
+        if off + len > oldsize {
+            self.inode.set_size(off + len);
+        }
+        self.inode.update_mtime();
+        drop(permit);
+        let _flushed = self.try_flush().await?;
         Ok(bytes_write)
     }
 

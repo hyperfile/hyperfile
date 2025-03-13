@@ -5,8 +5,8 @@ pub mod ondisk;
 pub mod segment;
 pub mod file;
 pub mod s3uri;
+pub mod buffer;
 pub(crate) mod meta_loader;
-pub(crate) mod buffer;
 pub(crate) mod staging;
 pub(crate) mod s3commons;
 
