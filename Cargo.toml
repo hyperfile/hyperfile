@@ -22,6 +22,7 @@ reactor = { version = "0.1.0", path = "../reactor", optional = true }
 [dev-dependencies]
 rand = "0.9.0"
 md5 = "0.7.0"
+crc64fast = "1.1.0"
 human_bytes = "0.4.3"
 
 [features]
