@@ -122,4 +122,10 @@ impl<'a: 'static> Hyper<'a> {
         debug!("fs_getattr -");
         Ok(self.inner.stat())
     }
+
+    pub fn fs_last_cno(&self) -> u64
+    {
+        debug!("fs_last_cno -");
+        self.inner.last_cno()
+    }
 }
