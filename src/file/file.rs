@@ -515,13 +515,16 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         debug!("start to write prepare for write offset {}, len {}", off, len);
         for (blk_idx, start_off, data_len) in blk_iter {
-            if self.data_blocks_dirty.contains_key(&blk_idx) {
-                continue;
-            }
             // for a complete block, we don't need to retrieve
             if start_off == 0 && data_len == data_block_size {
                 continue;
             }
+            // for incomplete block
+            if self.data_blocks_dirty.contains_key(&blk_idx) {
+                // incomplete block but already in dirty list
+                continue;
+            }
+            // incomplete block and not in dirty list
             output.push(blk_idx);
         }
         debug!("end of write prepare {} of blocks need to be retrieve", output.len());
