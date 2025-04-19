@@ -405,7 +405,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             let _ = actual_bytes;
             let fh = req.absorb_fh.clone();
             let ctx = FileContext::write_absorb(req, resp);
-            fh.send(ctx);
+            fh.send_highprio(ctx);
         });
 
         Ok(())
@@ -447,7 +447,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             let _ = actual_bytes;
             let fh = req.absorb_fh.clone();
             let ctx = FileContext::write_zero_absorb(req, resp);
-            fh.send(ctx);
+            fh.send_highprio(ctx);
         });
 
         Ok(())
