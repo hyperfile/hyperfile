@@ -221,13 +221,28 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         Ok(total_bytes)
     }
 
-    pub(crate) async fn absorb_write(&mut self, off: usize, buf: &[u8]) -> Result<usize> {
+    pub(crate) async fn absorb_write(&mut self, off: usize, buf: &[u8], fetched: Vec<DataBlock>) -> Result<usize> {
         let len = buf.len();
         let mut bytes_write = 0;
 
         // restore spawn_write permit
         let opt_permit = self.spawn_write_permit.take();
         assert!(opt_permit.is_some());
+
+        // insert fetched block back to dirty list,
+        // for the case: block idx exists on dirty
+        // means some other writes success before this write, let's ignore feched data and go ahead
+        // to update the block data
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
+            if !self.data_blocks_dirty.contains_key(&blk_idx) {
+                let None = self.data_blocks_dirty.insert(blk_idx, block) else {
+                    panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+                };
+            } else {
+                debug!("BlockIndex {} already on data_blocks_dirty list, ignore this block", blk_idx);
+            }
+        }
 
         let data_block_size = self.config.meta.data_block_size;
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
@@ -261,12 +276,27 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         Ok(bytes_write)
     }
 
-    pub(crate) async fn absorb_write_zero(&mut self, off: usize, len: usize) -> Result<usize> {
+    pub(crate) async fn absorb_write_zero(&mut self, off: usize, len: usize, fetched: Vec<DataBlock>) -> Result<usize> {
         let mut bytes_write = 0;
 
         // restore spawn_write permit
         let opt_permit = self.spawn_write_permit.take();
         assert!(opt_permit.is_some());
+
+        // insert fetched block back to dirty list,
+        // for the case: block idx exists on dirty
+        // means some other writes success before this write, let's ignore feched data and go ahead
+        // to update the block data
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
+            if !self.data_blocks_dirty.contains_key(&blk_idx) {
+                let None = self.data_blocks_dirty.insert(blk_idx, block) else {
+                    panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+                };
+            } else {
+                debug!("BlockIndex {} already on data_blocks_dirty list, ignore this block", blk_idx);
+            }
+        }
 
         let data_block_size = self.config.meta.data_block_size;
         let oldsize = self.inode.size();
@@ -316,7 +346,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         Ok(bytes_write)
     }
 
-    async fn spawn_write_retrieve(&mut self, req: FileReqWrite<'a>,  resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
+    async fn spawn_write_retrieve(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
         let data_block_size = self.config.meta.data_block_size;
@@ -340,28 +370,25 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
         }
 
-        let mut actual_bytes = 0;
-        while let Some(j) = joins.pop() {
-            let bytes = j.await.unwrap();
-            actual_bytes += bytes;
-        }
-        for block in fetched.into_iter() {
-            let blk_idx = block.index();
-            let None = self.data_blocks_dirty.insert(blk_idx, block) else {
-            panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
-            };
-        }
-        let _ = actual_bytes;
-        let fh = req.absorb_fh.clone();
-        let ctx = FileContext::write_absorb(req, resp);
-        fh.send(ctx);
+        tokio::task::spawn(async move {
+            let mut actual_bytes = 0;
+            while let Some(j) = joins.pop() {
+                let bytes = j.await.unwrap();
+                actual_bytes += bytes;
+            }
+            req.fetched.append(&mut fetched);
+            let _ = actual_bytes;
+            let fh = req.absorb_fh.clone();
+            let ctx = FileContext::write_absorb(req, resp);
+            fh.send(ctx);
+        });
 
         Ok(())
     }
 
     // duplicate logic of spawn_write_retrieve()
     // TODO: can be merge with spawn_write_retrieve
-    async fn spawn_write_zero_retrieve(&mut self, req: FileReqWriteZero<'a>,  resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
+    async fn spawn_write_zero_retrieve(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
         let data_block_size = self.config.meta.data_block_size;
@@ -385,21 +412,18 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
         }
 
-        let mut actual_bytes = 0;
-        while let Some(j) = joins.pop() {
-            let bytes = j.await.unwrap();
-            actual_bytes += bytes;
-        }
-        for block in fetched.into_iter() {
-            let blk_idx = block.index();
-            let None = self.data_blocks_dirty.insert(blk_idx, block) else {
-            panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
-            };
-        }
-        let _ = actual_bytes;
-        let fh = req.absorb_fh.clone();
-        let ctx = FileContext::write_zero_absorb(req, resp);
-        fh.send(ctx);
+        tokio::task::spawn(async move {
+            let mut actual_bytes = 0;
+            while let Some(j) = joins.pop() {
+                let bytes = j.await.unwrap();
+                actual_bytes += bytes;
+            }
+            req.fetched.append(&mut fetched);
+            let _ = actual_bytes;
+            let fh = req.absorb_fh.clone();
+            let ctx = FileContext::write_zero_absorb(req, resp);
+            fh.send(ctx);
+        });
 
         Ok(())
     }
@@ -432,7 +456,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
 
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
-        let actual_bytes = self.absorb_write(off, buf).await?;
+        let actual_bytes = self.absorb_write(off, buf, Vec::new()).await?;
         assert!(len == actual_bytes);
 
         // kick off response
@@ -460,7 +484,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
 
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
-        let actual_bytes = self.absorb_write_zero(off, len).await?;
+        let actual_bytes = self.absorb_write_zero(off, len, Vec::new()).await?;
         assert!(len == actual_bytes);
 
         // kick off response

@@ -4,7 +4,7 @@ use std::io::Result;
 use tokio::sync::{mpsc, oneshot};
 use reactor::{Task, TaskHandler};
 use crate::SegmentId;
-use crate::buffer::DataBlockWrapper;
+use crate::buffer::{DataBlock, DataBlockWrapper};
 use super::hyper::Hyper;
 use super::HyperTrait;
 
@@ -73,12 +73,14 @@ pub struct FileReqRead<'a> {
 pub struct FileReqWrite<'a> {
     pub buf: &'a [u8],
     pub offset: usize,
+    pub fetched: Vec<DataBlock>,
     pub absorb_fh: TaskHandler<FileContext<'a>>,
 }
 
 pub struct FileReqWriteZero<'a> {
     pub offset: usize,
     pub len: usize,
+    pub fetched: Vec<DataBlock>,
     pub absorb_fh: TaskHandler<FileContext<'a>>,
 }
 
@@ -173,7 +175,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let req = FileReq { 
             op: FileReqOp::Write,
-            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, absorb_fh: fh }), },
+            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, absorb_fh: fh, fetched: Vec::new(), }), },
         };
         let resp = FileResp {
             write: ManuallyDrop::new(tx.clone()),
@@ -195,7 +197,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWriteZero>(1);
         let req = FileReq {
             op: FileReqOp::WriteZero,
-            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, absorb_fh: fh }), },
+            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, absorb_fh: fh, fetched: Vec::new(), }), },
         };
         let resp = FileResp {
             write_zero: ManuallyDrop::new(tx.clone()),
@@ -314,10 +316,12 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             },
             FileReqOp::WriteAbsorb => {
                 let md = unsafe { req.body.write };
-                let req = ManuallyDrop::into_inner(md);
+                let mut req = ManuallyDrop::into_inner(md);
                 let off = req.offset;
                 let buf = req.buf;
-                let res = self.inner.absorb_write(off, buf).await;
+                let mut fetched = Vec::new();
+                fetched.append(&mut req.fetched);
+                let res = self.inner.absorb_write(off, buf, fetched).await;
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::WriteZero => {
@@ -336,10 +340,12 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             },
             FileReqOp::WriteZeroAbsorb => {
                 let md = unsafe { req.body.write_zero };
-                let req = ManuallyDrop::into_inner(md);
+                let mut req = ManuallyDrop::into_inner(md);
                 let off = req.offset;
                 let len = req.len;
-                let res = self.inner.absorb_write_zero(off, len).await;
+                let mut fetched = Vec::new();
+                fetched.append(&mut req.fetched);
+                let res = self.inner.absorb_write_zero(off, len, fetched).await;
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::WriteAlignedBatch => {
