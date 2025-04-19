@@ -11,8 +11,22 @@ use crate::buffer::DataBlock;
 use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 
+enum SpawnReadSize {
+    ImmSize(usize),
+    JoinSize(JoinHandle<usize>),
+}
+
+impl SpawnReadSize {
+    fn size(&self) -> usize {
+        match self {
+            Self::ImmSize(sz) => { *sz },
+            Self::JoinSize(_) => { 0 },
+        }
+    }
+}
+
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    fn spawn_load_data_block_read_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<JoinHandle<usize>> {
+    fn spawn_load_data_block_read_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<SpawnReadSize> {
         debug!("load_data_block - block ptr: {}", blk_ptr);
         // in read path we would check dirty cache before do real data load
         // check dirty cache
@@ -25,11 +39,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
-            let join = tokio::task::spawn(async move {
-                data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
-                data_buf.len()
-            });
-            return Ok(join);
+            data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
+            return Ok(SpawnReadSize::ImmSize(data_buf.len()));
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
@@ -42,7 +53,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                 let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
                 data_buf.len()
             });
-            return Ok(join);
+            return Ok(SpawnReadSize::JoinSize(join));
         } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_id);
         } else if BlockPtrFormat::is_zero_block(&blk_ptr) {
@@ -50,11 +61,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
-            let join = tokio::task::spawn(async move {
-                data_buf.fill(0);
-                data_buf.len()
-            });
-            return Ok(join);
+            data_buf.fill(0);
+            return Ok(SpawnReadSize::ImmSize(data_buf.len()));
         } else {
             panic!("incorrect block ptr {} to load", blk_ptr);
         }
@@ -207,16 +215,33 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             joins.push(join)
         }
 
-        let mut actual_bytes = 0;
-        while let Some(j) = joins.pop() {
-            let bytes = j.await?;
-            actual_bytes += bytes;
+        // if nothing need to join, return directly
+        if joins.iter().all(|x| match x { SpawnReadSize::ImmSize(_) => true, SpawnReadSize::JoinSize(_) => false, }) {
+            let actual_bytes = joins.iter().map(|x| x.size()).sum();
+            assert!(total_bytes == actual_bytes);
+            if actual_bytes > 0 {
+                self.inode.update_atime();
+            }
+            let _ = resp.to_read().try_send(Ok(actual_bytes));
+            return Ok(total_bytes);
         }
-        assert!(total_bytes == actual_bytes);
-        if actual_bytes > 0 {
+
+        // no matter load backend data block success or not, update inode atime
+        if total_bytes > 0 {
             self.inode.update_atime();
         }
-        let _ = resp.to_read().try_send(Ok(actual_bytes));
+        tokio::task::spawn(async move {
+            let mut actual_bytes = 0;
+            while let Some(join) = joins.pop() {
+                let bytes = match join {
+                    SpawnReadSize::ImmSize(sz) => { sz },
+                    SpawnReadSize::JoinSize(j) => { j.await.unwrap() },
+                };
+                actual_bytes += bytes;
+            }
+            assert!(total_bytes == actual_bytes);
+            let _ = resp.to_read().try_send(Ok(actual_bytes));
+        });
 
         Ok(total_bytes)
     }
