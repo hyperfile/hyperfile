@@ -250,10 +250,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let len = buf.len();
         let mut bytes_write = 0;
 
-        // restore spawn_write permit
-        let opt_permit = self.spawn_write_permit.take();
-        assert!(opt_permit.is_some());
-
         // insert fetched block back to dirty list,
         // for the case: block idx exists on dirty
         // means some other writes success before this write, let's ignore feched data and go ahead
@@ -292,7 +288,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             self.inode.set_size(off + len);
         }
         self.inode.update_mtime();
-        drop(opt_permit);
 
         let flushed = self.try_flush().await?;
         // TODO: placehold for pref metrics
@@ -303,10 +298,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
 
     pub(crate) async fn absorb_write_zero(&mut self, off: usize, len: usize, fetched: Vec<DataBlock>) -> Result<usize> {
         let mut bytes_write = 0;
-
-        // restore spawn_write permit
-        let opt_permit = self.spawn_write_permit.take();
-        assert!(opt_permit.is_some());
 
         // insert fetched block back to dirty list,
         // for the case: block idx exists on dirty
@@ -362,7 +353,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             self.inode.set_size(off + len);
         }
         self.inode.update_mtime();
-        drop(opt_permit);
 
         let flushed = self.try_flush().await?;
         // TODO: placehold for pref metrics
@@ -465,19 +455,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let buf = req.buf;
         let len = buf.len();
 
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        let _permit = self.sema.clone().acquire_owned().await.unwrap();
 
         debug!("WRITE - off: {}, buf len: {}", off, len);
         let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
             self.spawn_write_retrieve(req, resp, v).await?;
-            self.spawn_write_permit = Some(permit);
             return Ok(len);
         }
-
-        // pass permit through inner fields to next fn
-        self.spawn_write_permit = Some(permit);
 
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
@@ -493,19 +479,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let off = req.offset;
         let len = req.len;
 
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        let _permit = self.sema.clone().acquire_owned().await.unwrap();
 
         debug!("WRITE ZERO - off: {}, len: {}", off, len);
         let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
             self.spawn_write_zero_retrieve(req, resp, v).await?;
-            self.spawn_write_permit = Some(permit);
             return Ok(len);
         }
-
-        // pass permit through inner fields to next fn
-        self.spawn_write_permit = Some(permit);
 
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
