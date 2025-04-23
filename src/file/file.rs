@@ -28,6 +28,8 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) flags: HyperFileFlags,
     pub(crate) last_flush: Instant,
     pub(crate) sema: Arc<Semaphore>,
+    #[cfg(feature = "reactor")]
+    pub(crate) spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
 }
 
 impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
@@ -65,6 +67,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(1)),
+            #[cfg(feature = "reactor")]
+            spawn_write_permit: None,
         };
         // flush inode for hyper file new created
         let _ = file.flush_inode(FlushInodeFlag::Create).await?;
@@ -113,6 +117,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(1)),
+            #[cfg(feature = "reactor")]
+            spawn_write_permit: None,
         };
         // refresh bmap if need to do recovery
         let _ = file.refresh_bmap().await?;
