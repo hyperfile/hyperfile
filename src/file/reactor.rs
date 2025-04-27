@@ -27,7 +27,7 @@ impl SpawnReadSize {
 
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     fn spawn_load_data_block_read_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<SpawnReadSize> {
-        debug!("load_data_block - block ptr: {}", blk_ptr);
+        debug!("spawn_load_data_block_read_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         // in read path we would check dirty cache before do real data load
         // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(&blk_id) {
@@ -64,11 +64,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             data_buf.fill(0);
             return Ok(SpawnReadSize::ImmSize(data_buf.len()));
         } else {
-            panic!("incorrect block ptr {} to load", blk_ptr);
+            panic!("incorrect block ptr {} to load", self.blk_ptr_decode_display(&blk_ptr));
         }
     }
 
     fn spawn_load_data_block_write_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<JoinHandle<usize>> {
+        debug!("spawn_load_data_block_write_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let staging = self.staging.clone();
@@ -152,7 +153,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             // we need to split head bytes if offset is not aligned to block size
             let split_off = data_block_size - head_off;
             let (this, next) = buf.split_at_mut(split_off);
-            debug!("       - read head data block for block ptr {} at offset {} len {}", blk_ptr, head_off, this.len());
+            debug!("       - read head data block for block ptr {} at offset {} len {}", self.blk_ptr_decode_display(&blk_ptr), head_off, this.len());
             let bytes = this.len();
             blocks.push((blk_idx, blk_ptr, head_off, this));
             bytes_read += bytes;
@@ -178,7 +179,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                     }
                 },
             };
-            debug!("       - read data block for block ptr {} at offset {} len {}", blk_ptr, 0, b.len());
+            debug!("       - read data block for block ptr {} at offset {} len {}", self.blk_ptr_decode_display(&blk_ptr), 0, b.len());
             let bytes = b.len();
             blocks.push((next_blk_idx, blk_ptr, 0, b));
             bytes_read += bytes;
