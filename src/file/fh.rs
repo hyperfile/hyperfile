@@ -8,6 +8,7 @@ use super::hyper::Hyper;
 use super::flags::FileFlags;
 use super::handler::FileContext;
 
+#[derive(Clone)]
 pub struct HyperFileHandler<'a> {
     inner: TaskHandler<FileContext<'a>>,
 }
