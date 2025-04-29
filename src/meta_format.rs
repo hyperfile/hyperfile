@@ -32,6 +32,15 @@ pub enum BlockPtrFormat {
 
 impl BlockPtrFormat {
     #[inline]
+    pub fn from_u8(data: u8) -> Self {
+        match data {
+            1 => Self::Flat,
+            2 => Self::MicroGroup,
+            n @ _ => panic!("Unkown block ptr format {}", n),
+        }
+    }
+
+    #[inline]
     pub fn new_zero_block() -> BlockPtr {
         BLOCK_PTR_ZERO_BLOCK
     }

@@ -43,6 +43,32 @@ impl HyperFileMetaConfig {
             block_ptr_format: block_ptr_format,
         }
     }
+
+    // encode as u32
+    // format:
+    //   root_mul (multiple of 8 bytes) | meta block shift | data block shift | block ptr format
+    pub fn as_u32(&self) -> u32 {
+        let root_multiple: u32 = (self.root_size / 8) as u32;
+        assert!(self.root_size % 8 == 0);
+        let meta_block_shift: u32 = self.meta_block_size.checked_ilog2().expect("invalid meta block size");
+        let data_block_shift: u32 = self.data_block_size.checked_ilog2().expect("invalid meta block size");
+        let block_ptr_format: u32 = self.block_ptr_format as u8 as u32;
+        root_multiple << 24 | meta_block_shift << 16 | data_block_shift << 8 | block_ptr_format
+    }
+
+    // decode from u32
+    pub fn from_u32(data: u32) -> Self {
+        let block_ptr_format = BlockPtrFormat::from_u8((data & 0xFF) as u8);
+        let data_block_size = 1 << ((data >> 8) & 0xFF);
+        let meta_block_size = 1 << ((data >> 16) & 0xFF);
+        let root_size = (((data >> 24) & 0xFF) * 8).try_into().unwrap();
+        Self {
+            root_size,
+            meta_block_size,
+            data_block_size,
+            block_ptr_format,
+        }
+    }
 }
 
 impl Default for HyperFileMetaConfig {
