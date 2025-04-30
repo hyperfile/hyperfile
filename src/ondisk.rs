@@ -16,7 +16,7 @@ pub struct InodeRaw {
     pub i_atime_nsec: u32,
     pub i_ctime_nsec: u32,
     pub i_mtime_nsec: u32,
-    pub i_pad: u32,
+    pub i_meta_config: u32,
     pub i_uid: u32,
     pub i_gid: u32,
     pub i_mode: u32,

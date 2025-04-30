@@ -3,6 +3,7 @@ use std::time::SystemTime;
 use chrono::{Utc, TimeZone};
 use crate::SegmentId;
 use crate::ondisk::{InodeRaw, BMapRawType};
+use crate::config::HyperFileMetaConfig;
 
 pub struct Stat(pub libc::stat);
 
@@ -38,7 +39,7 @@ pub struct Inode {
     i_atime_nsec: u32,
     i_ctime_nsec: u32,
     i_mtime_nsec: u32,
-    i_pad: u32,
+    i_meta_config: u32,
     i_uid: u32,
     i_gid: u32,
     i_mode: u32,
@@ -69,6 +70,10 @@ impl fmt::Display for Inode {
         writeln!(f, "  access time: {:?}", dt_atime.unwrap())?;
         writeln!(f, "  change time: {:?}", dt_ctime.unwrap())?;
         writeln!(f, "  modify time: {:?}", dt_mtime.unwrap())?;
+        let meta_config = HyperFileMetaConfig::from_u32(self.i_meta_config);
+        writeln!(f, "  {:?}, root size: {}, meta block size: {}, data block size: {}",
+            meta_config.block_ptr_format, meta_config.root_size,
+            meta_config.meta_block_size, meta_config.data_block_size)?;
         writeln!(f, "  last seq: {}, last cno: {}, last ondisk cno: {}",
             self.i_last_seq, self.i_last_cno, self.i_last_ondisk_cno)
     }
@@ -111,6 +116,7 @@ impl Inode {
 
     pub fn default_dir() -> Self {
         let mut inode = Self::default();
+        inode.i_meta_config = HyperFileMetaConfig::default().as_u32();
         inode.i_mode = libc::S_IFDIR;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
@@ -120,11 +126,17 @@ impl Inode {
 
     pub fn default_file() -> Self {
         let mut inode = Self::default();
+        inode.i_meta_config = HyperFileMetaConfig::default().as_u32();
         inode.i_mode = libc::S_IFREG;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
         inode.update_ctime();
         inode
+    }
+
+    pub fn with_meta_config(mut self, meta_config: &HyperFileMetaConfig) -> Self {
+        self.i_meta_config = meta_config.as_u32();
+        self
     }
 
     pub fn is_attr_dirty(&self) -> bool {
@@ -142,8 +154,9 @@ impl Inode {
         }
     }
 
-    pub fn from_origin(origin_size: usize) -> Self {
+    pub fn from_origin(origin_size: usize, meta_config: &HyperFileMetaConfig) -> Self {
         let mut inode = Self::default_file();
+        inode.i_meta_config = meta_config.as_u32();
         inode.i_blocks = (origin_size / 512) as u64;
         inode.i_size = origin_size as u64;
         inode
@@ -160,7 +173,7 @@ impl Inode {
             i_atime_nsec: raw.i_atime_nsec,
             i_ctime_nsec: raw.i_ctime_nsec,
             i_mtime_nsec: raw.i_mtime_nsec,
-            i_pad: raw.i_pad,
+            i_meta_config: raw.i_meta_config,
             i_uid: raw.i_uid,
             i_gid: raw.i_gid,
             i_mode: raw.i_mode,
@@ -185,7 +198,7 @@ impl Inode {
             i_atime_nsec: self.i_atime_nsec,
             i_ctime_nsec: self.i_ctime_nsec,
             i_mtime_nsec: self.i_mtime_nsec,
-            i_pad: self.i_pad,
+            i_meta_config: self.i_meta_config,
             i_uid: self.i_uid,
             i_gid: self.i_gid,
             i_mode: self.i_mode,
