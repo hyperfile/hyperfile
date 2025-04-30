@@ -56,7 +56,7 @@ impl<'a: 'static> Hyper<'a> {
         return Self::open(client.clone(), file_config, f).await;
     }
 
-    pub async fn fs_open_or_create(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    pub async fn fs_open_or_create_with_default_opt(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
     {
         debug!("fs_open_or_create - uri: {}, flags: {}", uri, flags);
         let staging_config = StagingConfig::new_s3_uri(uri, None);

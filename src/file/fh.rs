@@ -52,9 +52,9 @@ impl<'a: 'static> HyperFileHandler<'a> {
         Ok(Self { inner: fh })
     }
 
-    pub async fn fh_open_or_create(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    pub async fn fh_open_or_create_with_default_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
     {
-        let hyper = Hyper::fs_open_or_create(client, uri, flags).await?;
+        let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags).await?;
         let (tx, rx) = oneshot::channel();
         spawner.spawn(hyper, tx);
         let fh = rx.await.expect("failed to get back file handler");

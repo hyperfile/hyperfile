@@ -89,7 +89,7 @@ impl<'a: 'static> HyperFileTokio<'a> {
 
     pub async fn open_or_create(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
     {
-        let hyper = Hyper::fs_open_or_create(client, uri, flags).await?;
+        let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags).await?;
         let (tx, rx) = oneshot::channel();
         let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
         spawner.spawn(hyper, tx);
