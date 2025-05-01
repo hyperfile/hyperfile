@@ -376,7 +376,9 @@ impl S3Staging {
         Self::do_list(client, bucket, prefix, segid).await
     }
 
-    pub(crate) async fn do_build_block_map(client: &Client, bucket: &str, key: &str) -> Result<Vec<(BlockIndex, BlockPtr)>> {
+    // fetch meta blocks area from segment
+    // return: (meta_block_area_offset, meta_block_size, meta_block count, data chunk)
+    pub(crate) async fn do_fetch_meta_blocks_chunk(client: &Client, bucket: &str, key: &str) -> Result<(usize, usize, usize, Vec<u8>)> {
         let mut buf = Vec::with_capacity(SegmentHeader::size());
         buf.resize(SegmentHeader::size(), 0);
         // read in header
@@ -388,7 +390,7 @@ impl S3Staging {
         let meta_blocks = hdr.s_nmetablk as usize;
         let meta_block_off = hdr.aligned_ss_bytes();
         if meta_blocks == 0 {
-            return Ok(Vec::new());
+            return Ok((meta_block_off, meta_block_size, meta_blocks, Vec::new()));
         }
 
         let meta_blocks_len = (meta_block_size * meta_blocks) as usize;
@@ -398,6 +400,13 @@ impl S3Staging {
         // readin meta blocks
         let range = format!("bytes={}-{}", meta_block_off, meta_block_off + meta_blocks_len - 1);
         let _ = S3Ops::do_get_object(client, bucket, key, &mut buf, Some(&range), false).await?;
+
+        Ok((meta_block_off, meta_block_size, meta_blocks, buf))
+    }
+
+    pub(crate) async fn do_build_block_map(client: &Client, bucket: &str, key: &str) -> Result<Vec<(BlockIndex, BlockPtr)>> {
+
+        let (_meta_block_off, meta_block_size, _meta_blocks, buf) = Self::do_fetch_meta_blocks_chunk(client, bucket, key).await?;
 
         // collect all valid entry from all level 0 node
         let mut v = Vec::new();
