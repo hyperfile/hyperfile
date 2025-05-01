@@ -26,6 +26,7 @@ crc64fast = "1.1.0"
 human_bytes = "0.4.3"
 
 [features]
-default = ["reactor"]
+default = ["reactor", "meta_loader_batch"]
+meta_loader_batch = []
 reactor = ["dep:reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
 blocking = ["btree-ondisk/rc"]
