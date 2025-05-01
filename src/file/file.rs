@@ -30,6 +30,8 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) sema: Arc<Semaphore>,
     #[cfg(feature = "reactor")]
     pub(crate) spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
+    #[cfg(feature = "reactor")]
+    pub(crate) rt: Option<tokio::runtime::Runtime>,
 }
 
 impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
@@ -39,6 +41,15 @@ impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
         writeln!(f, "  max dirty blocks: {}", self.max_dirty_blocks)?;
         writeln!(f, "  data dirty size: {}", self.data_blocks_dirty.len())?;
         writeln!(f, "  {}", self.inode)
+    }
+}
+
+impl<T, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
+    fn drop(&mut self) {
+        #[cfg(feature = "reactor")]
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
     }
 }
 
@@ -69,6 +80,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             sema: Arc::new(Semaphore::new(1)),
             #[cfg(feature = "reactor")]
             spawn_write_permit: None,
+            #[cfg(feature = "reactor")]
+            rt: Some(tokio::runtime::Runtime::new().unwrap()),
         };
         // flush inode for hyper file new created
         let _ = file.flush_inode(FlushInodeFlag::Create).await?;
@@ -128,6 +141,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             sema: Arc::new(Semaphore::new(permits)),
             #[cfg(feature = "reactor")]
             spawn_write_permit: None,
+            #[cfg(feature = "reactor")]
+            rt: Some(tokio::runtime::Runtime::new().unwrap()),
         };
         // refresh bmap if need to do recovery
         let _ = file.refresh_bmap().await?;
@@ -135,6 +150,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     }
 
     pub async fn release(&mut self) -> Result<SegmentId> {
+        #[cfg(feature = "reactor")]
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
         self.flush().await
     }
 

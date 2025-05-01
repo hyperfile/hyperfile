@@ -49,7 +49,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
-            let join = tokio::task::spawn(async move {
+            let join = self.rt.as_ref().unwrap().spawn(async move {
                 let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
                 data_buf.len()
             });
@@ -77,7 +77,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
-            let join = tokio::task::spawn(async move {
+            let join = self.rt.as_ref().unwrap().spawn(async move {
                 let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
                 data_buf.len()
             });
@@ -92,7 +92,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
-                let join = tokio::task::spawn(async move {
+                let join = self.rt.as_ref().unwrap().spawn(async move {
                     data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
                     data_buf.len()
                 });
@@ -104,7 +104,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
-            let join = tokio::task::spawn(async move {
+            let join = self.rt.as_ref().unwrap().spawn(async move {
                 data_buf.fill(0);
                 data_buf.len()
             });
@@ -231,7 +231,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         if total_bytes > 0 {
             self.inode.update_atime();
         }
-        tokio::task::spawn(async move {
+        self.rt.as_ref().unwrap().spawn(async move {
             let mut actual_bytes = 0;
             while let Some(join) = joins.pop() {
                 let bytes = match join {
@@ -396,7 +396,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
         }
 
-        tokio::task::spawn(async move {
+        self.rt.as_ref().unwrap().spawn(async move {
             let mut actual_bytes = 0;
             while let Some(j) = joins.pop() {
                 let bytes = j.await.unwrap();
@@ -438,7 +438,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
         }
 
-        tokio::task::spawn(async move {
+        self.rt.as_ref().unwrap().spawn(async move {
             let mut actual_bytes = 0;
             while let Some(j) = joins.pop() {
                 let bytes = j.await.unwrap();
