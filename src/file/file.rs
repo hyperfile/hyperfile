@@ -106,6 +106,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             config.runtime.data_cache_dirty_max_bytes_threshold,
             config.runtime.data_cache_dirty_max_blocks_threshold);
 
+        let permits = if flags.is_rdonly() {
+            Semaphore::MAX_PERMITS
+        } else {
+            1
+        };
+
         let mut file = Self {
             staging: staging,
             bmap: bmap,
@@ -116,7 +122,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             max_dirty_blocks: max_dirty_blocks,
             flags: flags,
             last_flush: Instant::now(),
-            sema: Arc::new(Semaphore::new(1)),
+            sema: Arc::new(Semaphore::new(permits)),
             #[cfg(feature = "reactor")]
             spawn_write_permit: None,
         };
