@@ -78,7 +78,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     /// open a hyper file
     /// open by loading inode from staging,
     /// if inode is not found in staging, create hyper file from scratch
-    pub async fn open(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn open(staging: T, meta_block_loader: L, mut config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let inode_state;
@@ -111,6 +111,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         } else {
             1
         };
+
+        // overwrite the default meta config with the one we get from inode
+        config.meta = meta_config;
 
         let mut file = Self {
             staging: staging,
