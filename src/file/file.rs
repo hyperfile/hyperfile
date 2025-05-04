@@ -2,7 +2,7 @@ use std::fmt;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use std::io::{ErrorKind, Result};
+use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
 use lru::LruCache;
 use btree_ondisk::{bmap::BMap, BlockLoader};
@@ -111,11 +111,30 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     /// open a hyper file
     /// open by loading inode from staging,
     /// if inode is not found in staging, create hyper file from scratch
-    pub async fn open(staging: T, meta_block_loader: L, mut config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn open(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    {
+        Self::do_open(staging, meta_block_loader, config, flags, 0).await
+    }
+
+    /// open a hyper file with cno for read-only
+    pub async fn open_cno(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
+    {
+        if !flags.is_rdonly() {
+            return Err(Error::new(ErrorKind::ReadOnlyFilesystem, "write access is not allowed for open specific cno"));
+        }
+        Self::do_open(staging, meta_block_loader, config, flags, cno).await
+    }
+
+    async fn do_open(staging: T, meta_block_loader: L, mut config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
     {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let inode_state;
-        match staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await {
+        let res_inode = if cno == 0 {
+            staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await
+        } else {
+            staging.load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), cno as SegmentId).await
+        };
+        match res_inode {
             Ok(od_state) => {
                 /* if we load inode without error, we use inode as truth of metadata */
                 inode_state = od_state;
