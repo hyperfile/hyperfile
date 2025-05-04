@@ -60,9 +60,12 @@ impl Drop for AlignedDataBlock {
     }
 }
 
+const DATA_BLOCK_FLAG_SHOULD_CACHE: u64 = 0x1;
+
 pub struct DataBlock {
     data: Pin<Box<AlignedDataBlock>>,
     index: BlockIndex,
+    flags: u64,
 }
 
 impl DataBlock {
@@ -70,6 +73,7 @@ impl DataBlock {
         Self {
             data: Box::pin(AlignedDataBlock::new(size)),
             index: index,
+            flags: 0,
         }
     }
 
@@ -79,6 +83,7 @@ impl DataBlock {
         let n = Self {
             data: Box::pin(AlignedDataBlock::new(self.size())),
             index: self.index(),
+            flags: self.flags,
         };
         self.copy_out(0, n.as_mut_slice());
         n
@@ -128,6 +133,14 @@ impl DataBlock {
     // expose inner data as slice
     pub(crate) fn as_mut_slice(&self) -> &mut [u8] {
         self.data.as_mut_slice()
+    }
+
+    pub(crate) fn set_should_cache(&mut self) {
+        self.flags &= DATA_BLOCK_FLAG_SHOULD_CACHE;
+    }
+
+    pub(crate) fn is_should_cache(&self) -> bool {
+        self.flags & DATA_BLOCK_FLAG_SHOULD_CACHE == DATA_BLOCK_FLAG_SHOULD_CACHE
     }
 }
 

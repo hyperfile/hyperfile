@@ -26,13 +26,25 @@ impl SpawnReadSize {
 }
 
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    fn spawn_load_data_block_read_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<SpawnReadSize> {
+    fn spawn_load_data_block_read_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<SpawnReadSize> {
         debug!("spawn_load_data_block_read_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         // in read path we would check dirty cache before do real data load
         // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(&blk_id) {
             // cache hit
             debug!("load_data_block - Cache Hit on data blocks dirty for block index: {}", blk_id);
+            let slice = unsafe {
+                std::slice::from_raw_parts(block.as_slice().as_ptr() as *const u8, block.as_slice().len())
+            };
+            let data_buf = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+            };
+            data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
+            return Ok(SpawnReadSize::ImmSize(data_buf.len()));
+        }
+        if let Some(block) = self.data_blocks_cache.get(&blk_id) {
+            // cache hit
+            debug!("load_data_block - Cache Hit on data blocks cache for block index: {}", blk_id);
             let slice = unsafe {
                 std::slice::from_raw_parts(block.as_slice().as_ptr() as *const u8, block.as_slice().len())
             };
@@ -379,7 +391,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
                     joins.push(join);
@@ -390,7 +403,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
                     fetched.push(block);
                 },
             }
@@ -421,7 +435,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
                     joins.push(join);
@@ -432,7 +447,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
                     fetched.push(block);
                 },
             }

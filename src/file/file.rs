@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 use std::io::{ErrorKind, Result};
 use log::{debug, warn};
+use lru::LruCache;
 use btree_ondisk::{bmap::BMap, BlockLoader};
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
@@ -21,6 +22,10 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) staging: T,
     pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, L>,
     pub(crate) bmap_ud: BMapUserData,
+    // NOTE:
+    //   1) dirty list is higher priority than cache list
+    //   2) data cache only intend to cache incomplete block access
+    pub(crate) data_blocks_cache: LruCache<BlockIndex, DataBlock>,
     pub(crate) data_blocks_dirty: BTreeMap<BlockIndex, DataBlock>, // index by block uid
     pub(crate) inode: Inode,
     pub(crate) config: HyperFileConfig,
@@ -39,7 +44,7 @@ impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
         writeln!(f, "==== dump HyperFile ====")?;
         writeln!(f, "  {:?}", self.config)?;
         writeln!(f, "  max dirty blocks: {}", self.max_dirty_blocks)?;
-        writeln!(f, "  data dirty size: {}", self.data_blocks_dirty.len())?;
+        writeln!(f, "  data cache size: {}, data dirty size: {}", self.data_blocks_cache.len(), self.data_blocks_dirty.len())?;
         writeln!(f, "  {}", self.inode)
     }
 }
@@ -66,11 +71,13 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let max_dirty_blocks = Self::calc_max_dirty_blocks(meta_config.data_block_size,
             config.runtime.data_cache_dirty_max_bytes_threshold,
             config.runtime.data_cache_dirty_max_blocks_threshold);
+        let data_cache_blocks = config.runtime.data_cache_blocks;
 
         let mut file = Self {
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
+            data_blocks_cache: LruCache::new(std::num::NonZeroUsize::new(data_cache_blocks).unwrap()),
             data_blocks_dirty: BTreeMap::new(),
             inode: inode,
             config: config,
@@ -118,6 +125,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let max_dirty_blocks = Self::calc_max_dirty_blocks(meta_config.data_block_size,
             config.runtime.data_cache_dirty_max_bytes_threshold,
             config.runtime.data_cache_dirty_max_blocks_threshold);
+        let data_cache_blocks = config.runtime.data_cache_blocks;
 
         let permits = if flags.is_rdonly() {
             Semaphore::MAX_PERMITS
@@ -132,6 +140,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
+            data_blocks_cache: LruCache::new(std::num::NonZeroUsize::new(data_cache_blocks).unwrap()),
             data_blocks_dirty: BTreeMap::new(),
             inode: Inode::from_raw(&raw_inode, inode_state),
             config: config,
@@ -414,8 +423,17 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             debug!("truncate_last_data_block - data block in dirty list, data cleared");
             return Ok(true);
         }
+        if let Some(block) = self.data_blocks_cache.pop(&blk_idx) {
+            let buf = block.as_mut_slice();
+            let (_, to_clear) = buf.split_at_mut(offset_to_discard);
+            to_clear.fill(0);
+            debug!("truncate_last_data_block - data block in cache list, data cleared");
+            // move data block into dirty list
+            self.data_blocks_dirty.insert(*blk_idx, block);
+            return Ok(true);
+        }
 
-        // blk index not in dirty list
+        // blk index not in both dirty and cache list
         // or block ptr is zero block in bmap or not exist in bmap, no need to discard data
         let blk_ptr = match self.bmap.lookup(blk_idx).await {
             Ok(blk_ptr) => {
@@ -552,7 +570,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 // incomplete block but already in dirty list
                 continue;
             }
-            // incomplete block and not in dirty list
+            if let Some(block) = self.data_blocks_cache.pop(&blk_idx) {
+                // incomplete block found in data blocks cache
+                self.data_blocks_dirty.insert(blk_idx, block);
+                continue;
+            }
+            // incomplete block and not in both dirty and cache list
             output.push(blk_idx);
         }
         debug!("end of write prepare {} of blocks need to be retrieve", output.len());
@@ -566,7 +589,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
                     debug!("retrive block ptr {} for block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
-                    let block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
                     let buf = block.as_mut_slice();
                     if !BlockPtrFormat::is_zero_block(&blk_ptr) {
                         let _ = self.load_data_block_write_path(blk_idx, blk_ptr, 0, buf).await?;
@@ -578,7 +602,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
                     output.push(block);
                 },
             }
@@ -599,10 +624,19 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         }
     }
 
-    async fn load_data_block_read_path(&self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
+    async fn load_data_block_read_path(&mut self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
         debug!("load_data_block - block ptr: {}", self.blk_ptr_decode_display(&blk_ptr));
+        // in read path we would check both data and dirty cache before do real data load
         // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(&blk_idx) {
+            // cache hit
+            debug!("load_data_block - Cache Hit for block index: {}", blk_idx);
+            let slice = block.as_slice();
+            buf.copy_from_slice(&slice[offset..offset + buf.len()]);
+            return Ok(());
+        }
+        // check data cache
+        if let Some(block) = self.data_blocks_cache.get(&blk_idx) {
             // cache hit
             debug!("load_data_block - Cache Hit for block index: {}", blk_idx);
             let slice = block.as_slice();
@@ -683,7 +717,7 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
     }
 
     fn clear_data_blocks_cache(&mut self) {
-        // do nothing
+        self.data_blocks_cache.clear();
     }
 
     fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_> {
@@ -694,7 +728,15 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
     }
 
     fn clear_data_blocks_dirty(&mut self) {
-        self.data_blocks_dirty.clear();
+        while let Some((blk_idx, block)) = self.data_blocks_dirty.pop_first() {
+            if !block.is_should_cache() {
+                continue;
+            }
+            // keep block that should cache into cache list
+            if let Some(_) = self.data_blocks_cache.put(blk_idx, block) {
+                panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
+            }
+        }
     }
 
     async fn lock(&self) -> OwnedSemaphorePermit {

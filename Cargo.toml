@@ -14,6 +14,7 @@ tokio = { version = "1", features = ["full"] }
 libc = "0.2.170"
 chrono = "0.4.39"
 bytes = "1.10.0"
+lru = "0.14.0"
 aws-config = { version = "1.5.17", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.77.0"
 btree-ondisk = { version = "0.11.0", path = "../btree-ondisk", default-features = false }
