@@ -87,7 +87,7 @@ impl<'a: 'static> HyperFileTokio<'a> {
         Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
     }
 
-    pub async fn open_or_create(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    pub async fn open_or_create_with_default_opt(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
     {
         let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags).await?;
         let (tx, rx) = oneshot::channel();
