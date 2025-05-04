@@ -136,7 +136,7 @@ impl DataBlock {
     }
 
     pub(crate) fn set_should_cache(&mut self) {
-        self.flags &= DATA_BLOCK_FLAG_SHOULD_CACHE;
+        self.flags |= DATA_BLOCK_FLAG_SHOULD_CACHE;
     }
 
     pub(crate) fn is_should_cache(&self) -> bool {
