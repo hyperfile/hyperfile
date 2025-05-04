@@ -42,7 +42,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
             return Ok(SpawnReadSize::ImmSize(data_buf.len()));
         }
-        if let Some(block) = self.data_blocks_cache.get(&blk_id) {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.get(&blk_id)).unwrap() {
             // cache hit
             debug!("load_data_block - Cache Hit on data blocks cache for block index: {}", blk_id);
             let slice = unsafe {

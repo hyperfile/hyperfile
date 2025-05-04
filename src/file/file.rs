@@ -30,6 +30,7 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) inode: Inode,
     pub(crate) config: HyperFileConfig,
     pub(crate) max_dirty_blocks: usize,
+    pub(crate) data_cache_blocks: usize,
     pub(crate) flags: HyperFileFlags,
     pub(crate) last_flush: Instant,
     pub(crate) sema: Arc<Semaphore>,
@@ -43,8 +44,8 @@ impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "==== dump HyperFile ====")?;
         writeln!(f, "  {:?}", self.config)?;
-        writeln!(f, "  max dirty blocks: {}", self.max_dirty_blocks)?;
-        writeln!(f, "  data cache size: {}, data dirty size: {}", self.data_blocks_cache.len(), self.data_blocks_dirty.len())?;
+        writeln!(f, "  max dirty blocks: {}, data dirty size: {}", self.max_dirty_blocks, self.data_blocks_dirty.len())?;
+        writeln!(f, "  data cache blocks: {}, data cache size: {}", self.data_cache_blocks, self.data_blocks_cache.len())?;
         writeln!(f, "  {}", self.inode)
     }
 }
@@ -71,7 +72,18 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let max_dirty_blocks = Self::calc_max_dirty_blocks(meta_config.data_block_size,
             config.runtime.data_cache_dirty_max_bytes_threshold,
             config.runtime.data_cache_dirty_max_blocks_threshold);
-        let data_cache_blocks = config.runtime.data_cache_blocks;
+
+        let permits = if flags.is_rdonly() {
+            Semaphore::MAX_PERMITS
+        } else {
+            1
+        };
+
+        let data_cache_blocks = if flags.is_direct() {
+            0
+        } else {
+            config.runtime.data_cache_blocks
+        };
 
         let mut file = Self {
             staging: staging,
@@ -82,9 +94,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             inode: inode,
             config: config,
             max_dirty_blocks: max_dirty_blocks,
+            data_cache_blocks: data_cache_blocks,
             flags: flags,
             last_flush: Instant::now(),
-            sema: Arc::new(Semaphore::new(1)),
+            sema: Arc::new(Semaphore::new(permits)),
             #[cfg(feature = "reactor")]
             spawn_write_permit: None,
             #[cfg(feature = "reactor")]
@@ -125,12 +138,17 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let max_dirty_blocks = Self::calc_max_dirty_blocks(meta_config.data_block_size,
             config.runtime.data_cache_dirty_max_bytes_threshold,
             config.runtime.data_cache_dirty_max_blocks_threshold);
-        let data_cache_blocks = config.runtime.data_cache_blocks;
 
         let permits = if flags.is_rdonly() {
             Semaphore::MAX_PERMITS
         } else {
             1
+        };
+
+        let data_cache_blocks = if flags.is_direct() {
+            0
+        } else {
+            config.runtime.data_cache_blocks
         };
 
         // overwrite the default meta config with the one we get from inode
@@ -145,6 +163,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             inode: Inode::from_raw(&raw_inode, inode_state),
             config: config,
             max_dirty_blocks: max_dirty_blocks,
+            data_cache_blocks: data_cache_blocks,
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(permits)),
@@ -423,7 +442,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             debug!("truncate_last_data_block - data block in dirty list, data cleared");
             return Ok(true);
         }
-        if let Some(block) = self.data_blocks_cache.pop(&blk_idx) {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
             to_clear.fill(0);
@@ -570,7 +589,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 // incomplete block but already in dirty list
                 continue;
             }
-            if let Some(block) = self.data_blocks_cache.pop(&blk_idx) {
+            if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
                 // incomplete block found in data blocks cache
                 self.data_blocks_dirty.insert(blk_idx, block);
                 continue;
@@ -636,7 +655,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             return Ok(());
         }
         // check data cache
-        if let Some(block) = self.data_blocks_cache.get(&blk_idx) {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.get(&blk_idx)).unwrap() {
             // cache hit
             debug!("load_data_block - Cache Hit for block index: {}", blk_idx);
             let slice = block.as_slice();
@@ -717,7 +736,9 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
     }
 
     fn clear_data_blocks_cache(&mut self) {
-        self.data_blocks_cache.clear();
+        if self.data_cache_blocks > 0 {
+            self.data_blocks_cache.clear();
+        }
     }
 
     fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_> {
@@ -733,7 +754,7 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
                 continue;
             }
             // keep block that should cache into cache list
-            if let Some(_) = self.data_blocks_cache.put(blk_idx, block) {
+            if let Some(_) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.put(blk_idx, block)).unwrap() {
                 panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
             }
         }
