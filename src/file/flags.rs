@@ -64,6 +64,10 @@ impl HyperFileFlags {
     pub fn is_rdonly(&self) -> bool {
         self.read && !self.write && !self.append
     }
+
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
 }
 
 pub struct FileFlags(libc::c_int);
