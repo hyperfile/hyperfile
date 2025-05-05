@@ -374,11 +374,17 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         Ok(bytes_write)
     }
 
-    // input blocks vec should be dedup and sorted
-    pub(crate) async fn write_aligned_batch(&mut self, blocks: Vec<DataBlockWrapper>) -> Result<usize> {
+    // write in batch style, all blocks in input vec should be full block
+    pub(crate) async fn write_aligned_batch(&mut self, mut blocks: Vec<DataBlockWrapper>) -> Result<usize> {
         if blocks.len() == 0 {
             return Ok(0);
         }
+
+        // sort and dedup
+        blocks.sort_by_key(|b| b.index());
+        blocks.reverse();
+        blocks.dedup_by_key(|b| b.index());
+
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let data_block_size = self.config.meta.data_block_size;
         let mut bytes_write = 0;
