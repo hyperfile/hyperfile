@@ -17,14 +17,14 @@ pub type BlockOffset = usize;
 pub type SegmentId = u64;
 pub type SegmentOffset = usize;
 
-struct BlockIndexIter {
+pub struct BlockIndexIter {
     remain: usize,
     block_size: usize,
     current: usize, // current offset
 }
 
 impl BlockIndexIter {
-    fn new(off: usize, len: usize, block_size: usize) -> Self {
+    pub fn new(off: usize, len: usize, block_size: usize) -> Self {
         Self {
             remain: len,
             block_size: block_size,
