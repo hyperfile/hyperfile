@@ -1,5 +1,5 @@
 use std::fmt;
-use std::collections::BTreeMap;
+use std::collections::{HashMap, BTreeMap};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use std::io::{Error, ErrorKind, Result};
@@ -9,7 +9,7 @@ use btree_ondisk::{bmap::BMap, BlockLoader};
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
-use crate::buffer::{DataBlock, DataBlockWrapper};
+use crate::buffer::{DataBlock, DataBlockWrapper, BatchDataBlockWrapper};
 use crate::staging::{StagingIntercept, Staging, config::StagingConfig};
 use crate::segment::SegmentReadWrite;
 use crate::ondisk::{InodeRaw, BMapRawType};
@@ -626,6 +626,19 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         output
     }
 
+    // test if block of index need to be retrieve
+    #[inline]
+    pub(crate) fn write_prepare_block_index(&mut self, blk_idx: &BlockIndex) -> bool {
+        if self.data_blocks_dirty.contains_key(blk_idx) {
+            return false;
+        }
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
+            self.data_blocks_dirty.insert(*blk_idx, block);
+            return false;
+        }
+        true
+    }
+
     async fn write_retrieve(&mut self, list: Vec<BlockIndex>) -> Result<Vec<DataBlock>> {
         let mut output = Vec::new();
         let data_block_size = self.config.meta.data_block_size;
@@ -728,6 +741,160 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     fn calc_max_dirty_blocks(data_block_size: usize, max_dirty_bytes_threshold: usize, max_dirty_blocks_threshold: usize) -> usize {
         let max_bytes = std::cmp::max(max_dirty_bytes_threshold, max_dirty_blocks_threshold * data_block_size);
         max_bytes / data_block_size
+    }
+}
+
+impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+    // write in batch style, input blocks could be incomplete
+    pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
+        if blocks.len() == 0 {
+            return Ok(0);
+        }
+
+        let data_block_size = self.config.meta.data_block_size;
+        let mut bytes_write = 0;
+
+        // group by block index
+        let mut map: HashMap<BlockIndex, Vec<BatchDataBlockWrapper>> = HashMap::new();
+        for block in blocks.into_iter() {
+            let blk_idx = block.index() as BlockIndex;
+            if let Some(v) = map.get_mut(&blk_idx) {
+                v.push(block);
+            } else {
+                map.insert(blk_idx, vec![block]);
+            }
+        }
+
+        // merge each block index group
+        // (is one full block, vec of partial blocks or vec of one full block)
+        let mut merged: BTreeMap<BlockIndex, (bool, Vec<BatchDataBlockWrapper>)> = BTreeMap::new();
+        for (blk_idx, mut v) in map.into_iter() {
+            // try find a full block from back to head
+            let res = v.iter().rposition(|b| b.is_full_block());
+            let m = if let Some(idx) = res {
+                // if we found a full block
+                let mut rest = v.split_off(idx);
+                rest.reverse();
+                let mut full_block = rest.pop().expect("invalid rest vec by split_off");
+                while let Some(next_block) = rest.pop() {
+                    full_block.merge_partial(&next_block);
+                }
+                (true, vec![full_block])
+            } else {
+                // if all partial blocks, we can't merge
+                (false, v)
+            };
+            merged.insert(blk_idx, m);
+        }
+
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
+
+        // write prepare
+        let mut v_need_retrieve = Vec::new();
+        for blk_idx in merged.keys().into_iter() {
+            if self.write_prepare_block_index(blk_idx) {
+                v_need_retrieve.push(*blk_idx);
+            }
+        }
+
+        #[cfg(not(feature = "reactor"))]
+        let fetched = self.write_retrieve(v_need_retrieve).await?;
+
+        #[cfg(feature = "reactor")]
+        let mut fetched = Vec::new();
+        #[cfg(feature = "reactor")]
+        let mut joins = Vec::new();
+        #[cfg(feature = "reactor")]
+        for blk_idx in v_need_retrieve {
+            match self.bmap.lookup(&blk_idx).await {
+                Ok(blk_ptr) => {
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
+                    let buf = block.as_mut_slice();
+                    let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
+                    joins.push(join);
+                    fetched.push(block);
+                },
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
+                    fetched.push(block);
+                },
+            }
+        }
+        #[cfg(feature = "reactor")]
+        while let Some(j) = joins.pop() {
+            let _ = j.await.unwrap();
+        }
+
+        // insert fetched data blocks into dirty list
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
+            let None = self.data_blocks_dirty.insert(blk_idx, block) else {
+                panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+            };
+        }
+
+        for (blk_idx, (is_full_block, v_blocks)) in merged.iter() {
+            if !is_full_block {
+                // if not a full block, playback all partial data blocks
+                let block = self.data_blocks_dirty.get_mut(&blk_idx).expect("failed to get back data block from dirty list");
+                for part in v_blocks.iter() {
+                    if part.is_zero() {
+                        let mut zero = Vec::new();
+                        zero.resize(part.len(), 0);
+                        block.copy(part.offset(), &zero);
+                    } else {
+                        block.copy(part.offset(), part.as_slice());
+                    }
+                    bytes_write += part.len();
+                }
+                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
+                continue;
+            }
+            // is full block
+            assert!(v_blocks.len() == 1);
+            let block_wrapper = &v_blocks[0];
+            let blk_sz = block_wrapper.size();
+            if block_wrapper.is_zero() {
+                let _ = self.data_blocks_dirty.remove(&blk_idx);
+                bytes_write += blk_sz;
+                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                continue;
+            }
+            if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
+                // found in dirty list, just update it's content
+                block.copy(0, block_wrapper.as_slice());
+                bytes_write += blk_sz;
+            } else {
+                // can't found in dirty list, create a new one
+                let mut block = DataBlock::new(*blk_idx, data_block_size);
+                block.copy(0, block_wrapper.as_slice());
+                self.data_blocks_dirty.insert(*blk_idx, block);
+                bytes_write += blk_sz;
+            }
+            // force bmap update for dirty blocks
+            let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
+        }
+        // try update file size by offset and len from last block
+        let (blk_idx, (is_full_block, v_blocks)) = merged.pop_last().expect("unable to get last block, input blocks is empty");
+        let oldsize = self.inode.size();
+        let off = (blk_idx as usize) * data_block_size;
+        let len = if is_full_block {
+            data_block_size
+        } else {
+            v_blocks.iter().max_by_key(|b| b.len()).expect("invalid vec of partial data block").len()
+        };
+        if off + len > oldsize {
+            self.inode.set_size(off + len);
+        }
+        self.inode.update_mtime();
+        drop(permit);
+        let _flushed = self.try_flush().await?;
+        Ok(bytes_write)
     }
 }
 
