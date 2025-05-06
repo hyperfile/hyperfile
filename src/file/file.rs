@@ -739,8 +739,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
     // return max dirty data blocks can hold
     fn calc_max_dirty_blocks(data_block_size: usize, max_dirty_bytes_threshold: usize, max_dirty_blocks_threshold: usize) -> usize {
-        let max_bytes = std::cmp::max(max_dirty_bytes_threshold, max_dirty_blocks_threshold * data_block_size);
-        max_bytes / data_block_size
+        let max_blocks = max_dirty_bytes_threshold / data_block_size;
+        std::cmp::max(max_blocks, max_dirty_blocks_threshold)
     }
 }
 
