@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::alloc::GlobalAlloc;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use crate::BlockIndex;
+use crate::utils;
 
 const MIN_ALIGNED: usize = 4096;
 
@@ -210,6 +211,206 @@ impl DataBlockWrapper {
         match self {
             Self::Data(block) => block.as_mut_slice(),
             Self::Zero(_) => panic!("no slice on zero data block"),
+        }
+    }
+}
+
+pub struct PartDataBlock {
+    data: Option<Pin<Box<AlignedDataBlock>>>,
+    index: BlockIndex,
+    // offset of data within block
+    offset: usize,
+    // block size
+    size: usize,
+    // real data size
+    len: usize,
+}
+
+impl PartDataBlock {
+    pub(crate) fn new(index: BlockIndex, size: usize, offset: usize, len: usize, is_zero: bool) -> Self {
+        Self {
+            data: if is_zero { None } else { Some(Box::pin(AlignedDataBlock::new(len))) },
+            index,
+            offset,
+            size,
+            len,
+        }
+    }
+
+    // expose inner data as slice
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.data.as_ref().unwrap().as_slice()
+    }
+
+    pub(crate) fn as_mut_slice(&self) -> &mut [u8] {
+        self.data.as_ref().unwrap().as_mut_slice()
+    }
+
+    #[inline]
+    pub(crate) fn index(&self) -> BlockIndex {
+        self.index
+    }
+
+    #[inline]
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
+    #[inline]
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub(crate) fn is_zero(&self) -> bool {
+        self.data.is_none()
+    }
+}
+
+pub enum BatchDataBlockWrapper {
+    Data(DataBlock),
+    Zero(ZeroDataBlock),
+    Part(PartDataBlock),
+}
+
+impl BatchDataBlockWrapper {
+    pub fn new(index: BlockIndex, size: usize, is_zero: bool) -> Self {
+        if is_zero {
+            return Self::Zero(ZeroDataBlock::new(index, size));
+        }
+        Self::Data(DataBlock::new(index, size))
+    }
+
+    pub fn new_partial_block(index: BlockIndex, size: usize, offset: usize, len: usize, is_zero: bool) -> Self {
+        Self::Part(PartDataBlock::new(index, size, offset, len, is_zero))
+    }
+
+    pub fn index(&self) -> BlockIndex {
+        match self {
+            Self::Data(block) => block.index(),
+            Self::Zero(block) => block.index(),
+            Self::Part(block) => block.index(),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            Self::Data(block) => block.size(),
+            Self::Zero(block) => block.size(),
+            Self::Part(block) => block.size(),
+        }
+    }
+
+    pub fn offset(&self) -> usize {
+        match self {
+            Self::Data(_) | Self::Zero(_) => 0,
+            Self::Part(block) => block.offset(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Data(block) => block.size(),
+            Self::Zero(block) => block.size(),
+            Self::Part(block) => block.len(),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Data(block) => block.as_slice(),
+            Self::Zero(_) => panic!("no slice on zero data block"),
+            Self::Part(block) => {
+                if block.is_zero() {
+                    panic!("no slice on zero partial data block");
+                }
+                block.as_slice()
+            },
+        }
+    }
+
+    pub fn as_mut_slice(&self) -> &mut [u8] {
+        match self {
+            Self::Data(block) => block.as_mut_slice(),
+            Self::Zero(_) => panic!("no slice on zero data block"),
+            Self::Part(block) => {
+                if block.is_zero() {
+                    panic!("no slice on zero partial data block");
+                }
+                block.as_mut_slice()
+            },
+        }
+    }
+
+    // full block merge with other block
+    pub(crate) fn merge_partial(&mut self, other: &Self) {
+        assert!(self.is_full_block());
+        assert!(!other.is_full_block());
+        // handle other
+        let (o_offset, o_len, o_is_zero, o_slice) = match other {
+            Self::Data(_) | Self::Zero(_) => panic!("other block is NOT a partial block"),
+            Self::Part(inner) => {
+                if inner.is_zero() {
+                    (inner.offset(), inner.len(), inner.is_zero(), None)
+                } else {
+                    (inner.offset(), inner.len(), inner.is_zero(), Some(inner.as_slice()))
+                }
+            },
+        };
+        // handle myself
+        match self {
+            Self::Data(inner) => {
+                let inner_slice = inner.as_mut_slice();
+                let target_slice = &mut inner_slice[o_offset..o_offset + o_len];
+                if o_is_zero {
+                    let blk_idx = inner.index();
+                    let blk_size = inner.size();
+                    let mut zero = Vec::with_capacity(o_len);
+                    zero.resize(o_len, 0);
+                    target_slice.copy_from_slice(&zero);
+                    if utils::is_all_zeros(self.as_slice()) {
+                        *self = Self::Zero(ZeroDataBlock::new(blk_idx, blk_size));
+                    }
+                } else {
+                    target_slice.copy_from_slice(o_slice.unwrap());
+                }
+            },
+            Self::Zero(inner) => {
+                if o_is_zero {
+                    // keep zero, do nothing
+                    return;
+                }
+                // create a new data block
+                let block = DataBlock::new(inner.index(), inner.size());
+                let block_slice = block.as_mut_slice();
+                let target_slice = &mut block_slice[o_offset..o_offset + o_len];
+                target_slice.copy_from_slice(o_slice.unwrap());
+                *self = Self::Data(block);
+            },
+            Self::Part(_) => panic!("this is not a full block"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_full_block(&self) -> bool {
+        match self {
+            Self::Data(_) => true,
+            Self::Zero(_) => true,
+            Self::Part(_) => false,
+        }
+    }
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Self::Data(_) => false,
+            Self::Zero(_) => true,
+            Self::Part(block) => block.is_zero(),
         }
     }
 }
