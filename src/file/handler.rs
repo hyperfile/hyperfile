@@ -4,7 +4,7 @@ use std::io::Result;
 use tokio::sync::{mpsc, oneshot};
 use reactor::{Task, TaskHandler};
 use crate::SegmentId;
-use crate::buffer::{DataBlock, DataBlockWrapper};
+use crate::buffer::{DataBlock, DataBlockWrapper, BatchDataBlockWrapper};
 use super::hyper::Hyper;
 use super::HyperTrait;
 
@@ -24,6 +24,7 @@ pub union FileResp {
     write: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
     write_zero: ManuallyDrop<mpsc::Sender<FileRespWriteZero>>,
     write_aligned_batch: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
+    write_batch: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
     trunc: ManuallyDrop<oneshot::Sender<FileRespTrunc>>,
     flush: ManuallyDrop<oneshot::Sender<FileRespFlush>>,
     release: ManuallyDrop<oneshot::Sender<FileRespRelease>>,
@@ -88,6 +89,10 @@ pub struct FileReqWriteAlignedBatch {
     pub data_blocks: Vec<DataBlockWrapper>,
 }
 
+pub struct FileReqWriteBatch {
+    pub data_blocks: Vec<BatchDataBlockWrapper>,
+}
+
 pub struct FileReqTrunc {
     pub offset: usize,
 }
@@ -108,6 +113,7 @@ pub enum FileReqOp {
     WriteZero,
     WriteZeroAbsorb,
     WriteAlignedBatch,
+    WriteBatch,
     Trunc,
     Flush,
     Release,
@@ -121,6 +127,7 @@ pub union FileReqBody<'a> {
     write: ManuallyDrop<FileReqWrite<'a>>,
     write_zero: ManuallyDrop<FileReqWriteZero<'a>>,
     write_aligned_batch: ManuallyDrop<FileReqWriteAlignedBatch>,
+    write_batch: ManuallyDrop<FileReqWriteBatch>,
     trunc: ManuallyDrop<FileReqTrunc>,
     flush: ManuallyDrop<FileReqFlush>,
     release: ManuallyDrop<FileReqRelease>,
@@ -222,6 +229,18 @@ impl<'a> FileContext<'a> {
         };
         let resp = FileResp {
             write_aligned_batch: ManuallyDrop::new(tx),
+        };
+        (Self { req: Some(new_req), resp: Some(resp), }, rx)
+    }
+
+    pub fn new_write_batch(v: Vec<BatchDataBlockWrapper>) -> (Self, mpsc::Receiver<FileRespWrite>) {
+        let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
+        let new_req = FileReq {
+            op: FileReqOp::WriteBatch,
+            body: FileReqBody { write_batch: ManuallyDrop::new(FileReqWriteBatch { data_blocks: v }), },
+        };
+        let resp = FileResp {
+            write_batch: ManuallyDrop::new(tx),
         };
         (Self { req: Some(new_req), resp: Some(resp), }, rx)
     }
@@ -353,6 +372,13 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 let blocks = req.data_blocks;
                 let res = self.inner.write_aligned_batch(blocks).await;
+                let _ = resp.to_write().try_send(res);
+            },
+            FileReqOp::WriteBatch => {
+                let md = unsafe { req.body.write_batch };
+                let req = ManuallyDrop::into_inner(md);
+                let blocks = req.data_blocks;
+                let res = self.inner.write_batch(blocks).await;
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::Trunc => {
