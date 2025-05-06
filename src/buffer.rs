@@ -166,12 +166,12 @@ impl ZeroDataBlock {
     }
 }
 
-pub enum DataBlockWrapper {
+pub enum AlignedDataBlockWrapper {
     Data(DataBlock),
     Zero(ZeroDataBlock),
 }
 
-impl DataBlockWrapper {
+impl AlignedDataBlockWrapper {
     pub fn new(index: BlockIndex, size: usize, is_zero: bool) -> Self {
         if is_zero {
             return Self::Zero(ZeroDataBlock::new(index, size));

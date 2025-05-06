@@ -3,7 +3,7 @@ use tokio::sync::oneshot;
 use aws_sdk_s3::Client;
 use reactor::{LocalSpawner, TaskHandler};
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
-use crate::buffer::{DataBlockWrapper, BatchDataBlockWrapper};
+use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::hyper::Hyper;
 use super::flags::FileFlags;
 use super::handler::FileContext;
@@ -108,7 +108,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
         res
     }
 
-    pub async fn fh_write_aligned_batch(&mut self, blocks: Vec<DataBlockWrapper>) -> Result<usize>
+    pub async fn fh_write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize>
     {
         let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks);
         self.inner.send(ctx);

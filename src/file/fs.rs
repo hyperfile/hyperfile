@@ -3,7 +3,7 @@ use log::debug;
 use aws_sdk_s3::Client;
 use crate::staging::{Staging, config::StagingConfig, s3::S3Staging};
 use crate::config::{HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
-use crate::buffer::{DataBlockWrapper, BatchDataBlockWrapper};
+use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::HyperTrait;
 use super::hyper::Hyper;
 use super::flags::{HyperFileFlags, FileFlags};
@@ -99,7 +99,7 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.write_zero(off, len).await
     }
 
-    pub async fn fs_write_aligned_batch(&mut self, blocks: Vec<DataBlockWrapper>) -> Result<usize>
+    pub async fn fs_write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize>
     {
         debug!("fs_write_aligned_batch - batch count: {}", blocks.len());
         self.inner.write_aligned_batch(blocks).await

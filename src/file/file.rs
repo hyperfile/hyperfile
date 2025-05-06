@@ -9,7 +9,7 @@ use btree_ondisk::{bmap::BMap, BlockLoader};
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
-use crate::buffer::{DataBlock, DataBlockWrapper, BatchDataBlockWrapper};
+use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use crate::staging::{StagingIntercept, Staging, config::StagingConfig};
 use crate::segment::SegmentReadWrite;
 use crate::ondisk::{InodeRaw, BMapRawType};
@@ -375,7 +375,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     }
 
     // write in batch style, all blocks in input vec should be full block
-    pub(crate) async fn write_aligned_batch(&mut self, mut blocks: Vec<DataBlockWrapper>) -> Result<usize> {
+    pub(crate) async fn write_aligned_batch(&mut self, mut blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize> {
         if blocks.len() == 0 {
             return Ok(0);
         }

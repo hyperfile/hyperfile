@@ -4,7 +4,7 @@ use std::io::Result;
 use tokio::sync::{mpsc, oneshot};
 use reactor::{Task, TaskHandler};
 use crate::SegmentId;
-use crate::buffer::{DataBlock, DataBlockWrapper, BatchDataBlockWrapper};
+use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::hyper::Hyper;
 use super::HyperTrait;
 
@@ -86,7 +86,7 @@ pub struct FileReqWriteZero<'a> {
 }
 
 pub struct FileReqWriteAlignedBatch {
-    pub data_blocks: Vec<DataBlockWrapper>,
+    pub data_blocks: Vec<AlignedDataBlockWrapper>,
 }
 
 pub struct FileReqWriteBatch {
@@ -221,7 +221,7 @@ impl<'a> FileContext<'a> {
         Self { req: Some(new_req), resp: Some(resp), }
     }
 
-    pub fn new_write_aligned_batch(v: Vec<DataBlockWrapper>) -> (Self, mpsc::Receiver<FileRespWrite>) {
+    pub fn new_write_aligned_batch(v: Vec<AlignedDataBlockWrapper>) -> (Self, mpsc::Receiver<FileRespWrite>) {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let new_req = FileReq {
             op: FileReqOp::WriteAlignedBatch,
