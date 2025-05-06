@@ -11,7 +11,7 @@ use hyperfile::file::fh::HyperFileHandler;
 use hyperfile::file::handler::FileContext;
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
-use hyperfile::buffer::DataBlockWrapper;
+use hyperfile::buffer::AlignedDataBlockWrapper;
 
 // 10 GiB
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024;
@@ -82,12 +82,12 @@ async fn main() -> Result<()> {
     for _ in 0..SCATTER_BLOCKS_COUNT {
         let blk_idx = blkidxs.pop().unwrap();
         let block = if rand::rng().random_ratio(8, 10) {
-            let b = DataBlockWrapper::new(blk_idx, BLOCK_SIZE as usize, false);
+            let b = AlignedDataBlockWrapper::new(blk_idx, BLOCK_SIZE as usize, false);
             let buf = b.as_mut_slice();
             rand::fill(buf);
             b
         } else {
-            DataBlockWrapper::new(blk_idx, BLOCK_SIZE as usize, true)
+            AlignedDataBlockWrapper::new(blk_idx, BLOCK_SIZE as usize, true)
         };
         blocks.insert(blk_idx, block);
     }
@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
     verify(hyper).await?;
 
     // get sorted vec for batch
-    let v: Vec<DataBlockWrapper> = blocks.into_values().collect();
+    let v: Vec<AlignedDataBlockWrapper> = blocks.into_values().collect();
 
     let spawner = LocalSpawner::new_current();
     let mut hyper = prepare_hyper(&spawner, &client, &uri).await?;
