@@ -436,9 +436,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             || (ndatadirty * data_block_size) > self.config.runtime.segment_buffer_size;
         // trigger flush if file opened in O_SYNC
         let sync_flush = self.flags.is_sync();
+        // trigger flush if file opened in O_DIRECT
+        let direct_flush = self.flags.is_direct();
         let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
         let last_flush_expired = self.last_flush.elapsed() >= Duration::from_millis(max_flush_interval);
-        if last_flush_expired || threshold_flush || sync_flush {
+        if last_flush_expired || threshold_flush || sync_flush || direct_flush {
             let _ = self.flush().await?;
             return Ok(true);
         }
