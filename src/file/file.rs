@@ -20,7 +20,7 @@ use super::{HyperTrait, DirtyDataBlocks};
 
 pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) staging: T,
-    pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, L>,
+    pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>,
     pub(crate) bmap_ud: BMapUserData,
     // NOTE:
     //   1) dirty list is higher priority than cache list
@@ -64,7 +64,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     {
         let meta_config = config.meta.clone();
 
-        let bmap = BMap::<BlockIndex, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
         let bmap_ud = BMapUserData::new(BlockPtrFormat::MicroGroup);
         bmap.set_userdata(bmap_ud.as_u32());
 
@@ -149,7 +149,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         // get back meta config from inode raw
         let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
         let b = raw_inode.i_bmap;
-        let bmap = BMap::<BlockIndex, BlockPtr, L>::read(&b, meta_config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L>::read(&b, meta_config.meta_block_size, meta_block_loader);
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());
 
         // if inode exists, we trust it
@@ -963,11 +963,11 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
         drop(permit);
     }
 
-    fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, L> {
+    fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, BlockPtr, L> {
         &self.bmap
     }
 
-    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, L> {
+    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, BlockPtr, L> {
         &mut self.bmap
     }
 

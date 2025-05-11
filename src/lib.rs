@@ -7,8 +7,8 @@ pub mod file;
 pub mod s3uri;
 pub mod buffer;
 pub mod utils;
-pub(crate) mod meta_loader;
-pub(crate) mod staging;
+pub mod staging;
+pub mod meta_loader;
 pub(crate) mod s3commons;
 
 pub type BlockIndex = u64;
@@ -59,15 +59,15 @@ impl Iterator for BlockIndexIter {
 }
 
 #[repr(C)]
-pub(crate) struct BMapUserData {
-    pub(crate) blk_ptr_format: meta_format::BlockPtrFormat,
-    pub(crate) pad1: u8,
-    pub(crate) pad2: u8,
-    pub(crate) pad3: u8,
+pub struct BMapUserData {
+    pub blk_ptr_format: meta_format::BlockPtrFormat,
+    pad1: u8,
+    pad2: u8,
+    pad3: u8,
 }
 
 impl BMapUserData {
-    pub(crate) fn new(blk_ptr_format: meta_format::BlockPtrFormat) -> Self {
+    pub fn new(blk_ptr_format: meta_format::BlockPtrFormat) -> Self {
         Self {
             blk_ptr_format,
             pad1: 0,
@@ -76,7 +76,7 @@ impl BMapUserData {
         }
     }
 
-    pub(crate) fn from_u32(user_data: u32) -> Self {
+    pub fn from_u32(user_data: u32) -> Self {
         let mut bmap_user_data = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let ptr = std::ptr::addr_of_mut!(bmap_user_data) as *mut u32;
         unsafe {
@@ -85,7 +85,7 @@ impl BMapUserData {
         bmap_user_data
     }
 
-    pub(crate) fn as_u32(&self) -> u32 {
+    pub fn as_u32(&self) -> u32 {
         let ptr = std::ptr::addr_of!(*self) as *const u32;
         unsafe {
             *ptr
@@ -122,7 +122,7 @@ pub(crate) const DEFAULT_LARGE_MAX_DIRTY_DATA_BLOCKS_THRESHOLD: usize = 256000;
 /// this value CAN NOT guarantee all dirty blocks been flushed when no incoming write op.
 pub(crate) const DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL: u64 = 5000;
 
-pub(crate) const DEFAULT_FLUSH_RETRIES: usize = 3;
-pub(crate) const DEFAULT_FLUSH_BACKOFF_SECS: u64 = 1;
-pub(crate) const DEFAULT_PARTIAL_FLUSH_TIMEOUT: u64 = 5;
-pub(crate) const DEFAULT_PARTIAL_FLUSH_CHECK_INTERVAL_SECS: u64 = 1;
+pub(crate)  const DEFAULT_FLUSH_RETRIES: usize = 3;
+pub(crate)  const DEFAULT_FLUSH_BACKOFF_SECS: u64 = 1;
+pub(crate)  const DEFAULT_PARTIAL_FLUSH_TIMEOUT: u64 = 5;
+pub(crate)  const DEFAULT_PARTIAL_FLUSH_CHECK_INTERVAL_SECS: u64 = 1;

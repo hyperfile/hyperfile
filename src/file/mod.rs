@@ -27,14 +27,14 @@ use crate::inode::{Inode, OnDiskState, FlushInodeFlag};
 use crate::staging::Staging;
 use crate::meta_format::BlockPtrFormat;
 
-pub(crate) struct DirtyDataBlocks<'a> {
-    pub(crate) inner: Option<BTreeMap<BlockIndex, &'a DataBlock>>,
+pub struct DirtyDataBlocks<'a> {
+    pub inner: Option<BTreeMap<BlockIndex, &'a DataBlock>>,
     // if we need to owned (clone) the data
-    pub(crate) owned: Option<BTreeMap<BlockIndex, DataBlock>>,
+    pub owned: Option<BTreeMap<BlockIndex, DataBlock>>,
 }
 
 impl<'a> DirtyDataBlocks<'a> {
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         if let Some(inner) = &self.inner {
             return inner.len();
         } else if let Some(owned) = &self.owned {
@@ -43,7 +43,7 @@ impl<'a> DirtyDataBlocks<'a> {
         panic!("invalid DirtyDataBlocks");
     }
 
-    fn data(&'a self) -> BTreeMap<BlockIndex, &'a DataBlock> {
+    pub fn data(&'a self) -> BTreeMap<BlockIndex, &'a DataBlock> {
         if let Some(inner) = &self.inner {
             return inner.clone();
         } else if let Some(owned) = &self.owned {
@@ -57,7 +57,7 @@ impl<'a> DirtyDataBlocks<'a> {
     }
 }
 
-pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone> {
+pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone> {
     // block ptr
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr;
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset);
@@ -71,8 +71,8 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
     fn lock(&self) -> impl Future<Output = OwnedSemaphorePermit>;
     fn unlock(&self, permit: OwnedSemaphorePermit);
     // bmap
-    fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, L>;
-    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, L>;
+    fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>;
+    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>;
     // inode
     fn inode(&self) -> &Inode;
     fn inode_mut(&mut self) -> &mut Inode;
@@ -90,7 +90,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
     }
 
     // recover inode from segment
-    async fn recover_partial_flush(&mut self, segid: u64, od_state: &Option<OnDiskState>) -> Result<()> {
+    fn recover_partial_flush(&mut self, segid: u64, od_state: &Option<OnDiskState>) -> impl Future<Output = Result<()>> {async move {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let _ = self.staging().load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), segid).await?;
         let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), od_state, FlushInodeFlag::Update).await?;
@@ -99,10 +99,10 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let last_cno = self.inode().get_last_cno();
         self.inode_mut().set_last_ondisk_cno(last_cno);
         Ok(())
-    }
+    }}
 
     /// try recover partial flush (inode ahead segment)
-    async fn try_recover_partial_flush(&mut self) -> Result<(InodeRaw, Option<OnDiskState>)> {
+    fn try_recover_partial_flush(&mut self) -> impl Future<Output = Result<(InodeRaw, Option<OnDiskState>)>> {async {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let mut inode_state;
         loop {
@@ -134,11 +134,11 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         }
 
         Ok((raw_inode, inode_state))
-    }
+    }}
 
     /// refresh bmap by starting from reload inode
     /// and detect potential dead flush
-    async fn refresh_bmap(&mut self) -> Result<SegmentId> {
+    fn refresh_bmap(&mut self) -> impl Future<Output = Result<SegmentId>> {async {
         // save current in memory state
         let curr_segid = self.inode().get_last_seq();
         let (raw_inode, inode_state) = self.try_recover_partial_flush().await?;
@@ -156,7 +156,7 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let meta_block_loader = self.bmap().get_block_loader();
 
         let b = raw_inode.i_bmap;
-        let mut bmap = BMap::<BlockIndex, BlockPtr, L>::read(&b, self.config().meta.meta_block_size, meta_block_loader);
+        let mut bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L>::read(&b, self.config().meta.meta_block_size, meta_block_loader);
 
         let _permit = self.lock().await;
 
@@ -185,10 +185,10 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         (*self.inode_mut()).i_ondisk_state = inode_state;
 
         Ok(self.inode().get_last_seq())
-    }
+    }}
 
     // flush out dirty data
-    async fn flush_process(&mut self) -> Result<SegmentId> {
+    fn flush_process(&mut self) -> impl Future<Output = Result<SegmentId>> {async {
 
         let fn_start = Instant::now();
         debug!("flush started");
@@ -310,9 +310,9 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         let _ = _start.elapsed();
         let _ = fn_start.elapsed();
         Ok(self.inode().get_last_ondisk_cno())
-    }
+    }}
 
-    async fn flush(&mut self) -> Result<SegmentId> {
+    fn flush(&mut self) -> impl Future<Output = Result<SegmentId>> {async {
         let mut retries = 0;
         let mut backoff = DEFAULT_FLUSH_BACKOFF_SECS;
         while retries < DEFAULT_FLUSH_RETRIES {
@@ -335,5 +335,5 @@ pub(crate) trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L:
         }
         let err_str = format!("FLUSH - reached max retries {}", retries);
         return Err(Error::new(ErrorKind::ResourceBusy, err_str));
-    }
+    }}
 }

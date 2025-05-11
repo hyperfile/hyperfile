@@ -411,7 +411,7 @@ impl S3Staging {
         // collect all valid entry from all level 0 node
         let mut v = Vec::new();
         for meta_block_slice in buf.chunks(meta_block_size) {
-            let node = BtreeNode::<BlockIndex, BlockPtr>::from_slice(meta_block_slice);
+            let node = BtreeNode::<BlockIndex, BlockPtr, BlockPtr>::from_slice(meta_block_slice);
             if node.get_level() == BTREE_NODE_LEVEL_DATA + 1 {
                 for idx in 0..node.get_nchild() {
                     v.push((*node.get_key(idx), *node.get_val(idx)));
