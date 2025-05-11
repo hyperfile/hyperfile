@@ -384,6 +384,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         blocks.sort_by_key(|b| b.index());
         blocks.reverse();
         blocks.dedup_by_key(|b| b.index());
+        blocks.reverse();
 
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let data_block_size = self.config.meta.data_block_size;
