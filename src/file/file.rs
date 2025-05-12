@@ -399,17 +399,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 continue;
             }
-            if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
-                // found in dirty list, just update it's content
-                block.copy(0, block_wrapper.as_slice());
-                bytes_write += blk_sz;
-            } else {
-                // can't found in dirty list, create a new one
-                let mut block = DataBlock::new(blk_idx, data_block_size);
-                block.copy(0, block_wrapper.as_slice());
-                self.data_blocks_dirty.insert(blk_idx, block);
-                bytes_write += blk_sz;
-            }
+            self.update_cache(blk_idx, 0, block_wrapper.as_slice());
+            bytes_write += blk_sz;
             // force bmap update for dirty blocks
             let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
         }
@@ -870,17 +861,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                 let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::new_zero_block()).await?;
                 continue;
             }
-            if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
-                // found in dirty list, just update it's content
-                block.copy(0, block_wrapper.as_slice());
-                bytes_write += blk_sz;
-            } else {
-                // can't found in dirty list, create a new one
-                let mut block = DataBlock::new(*blk_idx, data_block_size);
-                block.copy(0, block_wrapper.as_slice());
-                self.data_blocks_dirty.insert(*blk_idx, block);
-                bytes_write += blk_sz;
-            }
+            self.update_cache(*blk_idx, 0, block_wrapper.as_slice());
+            bytes_write += blk_sz;
             // force bmap update for dirty blocks
             let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
         }
