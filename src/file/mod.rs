@@ -16,7 +16,7 @@ use std::time::{Instant, Duration};
 use std::collections::BTreeMap;
 use log::{debug, warn};
 use tokio::sync::OwnedSemaphorePermit;
-use btree_ondisk::{bmap::BMap, BlockLoader};
+use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
 use crate::*;
 use crate::buffer::DataBlock;
 use crate::{BlockIndex, BlockPtr};
@@ -25,7 +25,6 @@ use crate::config::HyperFileConfig;
 use crate::ondisk::{BMapRawType, InodeRaw};
 use crate::inode::{Inode, OnDiskState, FlushInodeFlag};
 use crate::staging::Staging;
-use crate::meta_format::BlockPtrFormat;
 
 pub struct DirtyDataBlocks<'a> {
     pub inner: Option<BTreeMap<BlockIndex, &'a DataBlock>>,
@@ -57,7 +56,7 @@ impl<'a> DirtyDataBlocks<'a> {
     }
 }
 
-pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone> {
+pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone, V: Copy + Default + std::fmt::Display + NodeValue + 'a + 'static> {
     // block ptr
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr;
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset);
@@ -71,8 +70,9 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
     fn lock(&self) -> impl Future<Output = OwnedSemaphorePermit>;
     fn unlock(&self, permit: OwnedSemaphorePermit);
     // bmap
-    fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>;
-    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>;
+    fn bmap(&self) -> &BMap<'a, BlockIndex, V, BlockPtr, L>;
+    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, V, BlockPtr, L>;
+    fn bmap_insert_dummy_value(bmap: &mut BMap<'a, BlockIndex, V, BlockPtr, L>, blk_idx: &BlockIndex) -> impl Future<Output = Result<Option<V>>>;
     // inode
     fn inode(&self) -> &Inode;
     fn inode_mut(&mut self) -> &mut Inode;
@@ -156,7 +156,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
         let meta_block_loader = self.bmap().get_block_loader();
 
         let b = raw_inode.i_bmap;
-        let mut bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L>::read(&b, self.config().meta.meta_block_size, meta_block_loader);
+        let mut bmap = BMap::<BlockIndex, V, BlockPtr, L>::read(&b, self.config().meta.meta_block_size, meta_block_loader);
 
         let _permit = self.lock().await;
 
@@ -173,7 +173,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
         // rebuild dirty bmap
         for (blk_idx, _) in dirty_data_blocks.data().iter() {
             // if blk index is already exists, overwrite it
-            let _ = bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
+            let _ = Self::bmap_insert_dummy_value(&mut bmap, blk_idx).await;
         }
         assert!(bmap.dirty() == true);
 

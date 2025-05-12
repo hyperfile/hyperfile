@@ -901,7 +901,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     }
 }
 
-impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
+impl<'a, T, L> HyperTrait<'a, T, L, BlockPtr> for HyperFile<'a, T, L>
     where
         T: Staging<T, L> + SegmentReadWrite,
         L: BlockLoader<BlockPtr> + Clone,
@@ -970,6 +970,10 @@ impl<'a, T, L> HyperTrait<'a, T, L> for HyperFile<'a, T, L>
 
     fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, BlockPtr, L> {
         &mut self.bmap
+    }
+
+    async fn bmap_insert_dummy_value(bmap: &mut BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<BlockPtr>> {
+        bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await
     }
 
     fn staging(&self) -> &T {
