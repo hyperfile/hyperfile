@@ -77,7 +77,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             data_buf.fill(0);
             return Ok(SpawnReadSize::ImmSize(data_buf.len()));
         } else {
-            //println!("{}", self.bmap);
             panic!("spawn_load_data_block_read_path - offset: {}, bytes: {}, incorrect block ptr {} to load", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         }
     }
