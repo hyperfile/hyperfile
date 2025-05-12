@@ -610,6 +610,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         for (blk_idx, start_off, data_len) in blk_iter {
             // for a complete block, we don't need to retrieve
             if start_off == 0 && data_len == data_block_size {
+                // discard data blocks cached if we have
+                let _ = self.data_blocks_cache.pop(&blk_idx);
                 continue;
             }
             // for incomplete block
