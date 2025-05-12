@@ -27,6 +27,31 @@ pub struct InodeRaw {
     pub i_bmap: BMapRawType,
 }
 
+impl Default for InodeRaw {
+    fn default() -> Self {
+        Self {
+            i_ino: 0,
+            i_blocks: 0,
+            i_size: 0,
+            i_atime: 0,
+            i_ctime: 0,
+            i_mtime: 0,
+            i_atime_nsec: 0,
+            i_ctime_nsec: 0,
+            i_mtime_nsec: 0,
+            i_meta_config: 0,
+            i_uid: 0,
+            i_gid: 0,
+            i_mode: 0,
+            i_flags: 0,
+            i_nlink: 0,
+            i_last_seq: 0,
+            i_last_cno: 0,
+            i_bmap: [0u8; DEFAULT_INODE_BMAP_SIZE],
+        }
+    }
+}
+
 impl InodeRaw {
     pub fn as_mut_u8_slice(&mut self) -> &mut [u8] {
         unsafe {
