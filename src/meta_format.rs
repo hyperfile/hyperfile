@@ -26,6 +26,7 @@ const BLOCK_PTR_STAGING: u64 = 0x4000_0000_0000_0000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[repr(u8)]
 pub enum BlockPtrFormat {
+    Nop = 0,
     Flat = 1,
     MicroGroup = 2,
 }
@@ -77,6 +78,7 @@ impl BlockPtrFormat {
 
     pub fn encode(segid: SegmentId, offset: SegmentOffset, seq: usize, fmt: &BlockPtrFormat) -> BlockPtr {
         match fmt {
+            Self::Nop => 0,
             Self::Flat => Self::encode_flat(segid, offset, seq),
             Self::MicroGroup => Self::encode_micro_group(segid, offset, seq),
         }
@@ -84,6 +86,7 @@ impl BlockPtrFormat {
 
     pub fn decode(blk_ptr: &BlockPtr, fmt: &BlockPtrFormat) -> (SegmentId, SegmentOffset) {
         match fmt {
+            Self::Nop => (0, 0),
             Self::Flat => Self::decode_flat(blk_ptr),
             Self::MicroGroup => Self::decode_micro_group(blk_ptr),
         }
