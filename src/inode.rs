@@ -120,6 +120,7 @@ impl Inode {
         inode.i_mode = libc::S_IFDIR;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
+        inode.i_nlink = 1;
         inode.update_ctime();
         inode
     }
@@ -130,6 +131,7 @@ impl Inode {
         inode.i_mode = libc::S_IFREG;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
+        inode.i_nlink = 1;
         inode.update_ctime();
         inode
     }
