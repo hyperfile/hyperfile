@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use log::{debug, warn};
 use tokio::sync::OwnedSemaphorePermit;
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
+use btree_ondisk::btree::BtreeNodeDirty;
 use crate::*;
 use crate::buffer::DataBlock;
 use crate::{BlockIndex, BlockPtr};
@@ -56,7 +57,7 @@ impl<'a> DirtyDataBlocks<'a> {
     }
 }
 
-pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone, V: Copy + Default + std::fmt::Display + NodeValue + 'a + 'static> {
+pub trait HyperTrait<T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone, V: Copy + Default + std::fmt::Display + NodeValue + 'static> {
     // block ptr
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr;
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset);
@@ -70,12 +71,18 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
     fn lock(&self) -> impl Future<Output = OwnedSemaphorePermit>;
     fn unlock(&self, permit: OwnedSemaphorePermit);
     // bmap
-    fn bmap(&self) -> &BMap<'a, BlockIndex, V, BlockPtr, L>;
-    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, V, BlockPtr, L>;
-    fn bmap_insert_dummy_value(bmap: &mut BMap<'a, BlockIndex, V, BlockPtr, L>, blk_idx: &BlockIndex) -> impl Future<Output = Result<Option<V>>>;
+    fn bmap_as_slice(&self) -> &[u8];
+    fn bmap_get_block_loader(&self) -> L;
+    fn bmap_dirty(&self) -> bool;
+    fn bmap_lookup_dirty(&self) -> Vec<BtreeNodeDirty<'_, BlockIndex, V, BlockPtr>>;
+    fn bmap_assign_meta_node(&self, blk_ptr: BlockPtr, node: BtreeNodeDirty<'_, BlockIndex, V, BlockPtr>) -> impl Future<Output = Result<()>>;
+    fn bmap_assign_data_node(&self, blk_idx: &BlockIndex, blk_ptr: BlockPtr) -> impl Future<Output = Result<()>>;
+    fn bmap_clear_dirty(&mut self);
+    fn bmap_update<'a>(&mut self, bmap: BMap<'a, BlockIndex, V, BlockPtr, L>);
+    fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, V, BlockPtr, L>, blk_idx: &BlockIndex) -> impl Future<Output = Result<Option<V>>>;
     // inode
     fn inode(&self) -> &Inode;
-    fn inode_mut(&mut self) -> &mut Inode;
+    fn inode_mut(&self) -> &mut Inode;
     // others
     fn staging(&self) -> &T;
     fn config(&self) -> &HyperFileConfig;
@@ -85,7 +92,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
     // provided method
     fn bmap_get_raw(&self) -> BMapRawType {
         let mut b: BMapRawType = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        b.copy_from_slice(self.bmap().as_slice());
+        b.copy_from_slice(self.bmap_as_slice());
         b
     }
 
@@ -153,7 +160,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
         }
 
         // get back block loader
-        let meta_block_loader = self.bmap().get_block_loader();
+        let meta_block_loader = self.bmap_get_block_loader();
 
         let b = raw_inode.i_bmap;
         let mut bmap = BMap::<BlockIndex, V, BlockPtr, L>::read(&b, self.config().meta.meta_block_size, meta_block_loader);
@@ -178,7 +185,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
         assert!(bmap.dirty() == true);
 
         // refresh inner bmap and inode but don't touch inode attr
-        *self.bmap_mut() = bmap;
+        self.bmap_update(bmap);
         (*self.inode_mut()).i_last_seq = raw_inode.i_last_seq;
         (*self.inode_mut()).i_last_cno = raw_inode.i_last_cno;
         (*self.inode_mut()).i_last_ondisk_cno = raw_inode.i_last_cno;
@@ -195,7 +202,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
 
         let dirty_data_blocks = self.get_data_blocks_dirty();
 
-        if dirty_data_blocks.len() == 0 && !self.bmap().dirty() {
+        if dirty_data_blocks.len() == 0 && !self.bmap_dirty() {
             if self.inode().is_attr_dirty() {
                 debug!("inode attr is dirty, flush inode ONLY");
                 let b = self.bmap_get_raw();
@@ -215,7 +222,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
         let _start = Instant::now();
 
         // 1. collect all dirty meta data
-        let dirty_meta_vec = self.bmap().lookup_dirty();
+        let dirty_meta_vec = self.bmap_lookup_dirty();
         debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
             dirty_meta_vec.len(), dirty_data_blocks.len());
 
@@ -234,7 +241,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
             let node_size = n.size();
             // use 0 as key, but it's useless
             debug!("assign block ptr for meta node: block ptr {}", self.blk_ptr_decode_display(&blk_ptr));
-            self.bmap().assign_meta_node(blk_ptr, n.clone()).await?;
+            self.bmap_assign_meta_node(blk_ptr, n.clone()).await?;
             segwr.inc_metablk();
             file_off += node_size;
             block_seq += 1;
@@ -247,7 +254,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
             let blk_ptr = self.blk_ptr_encode(segid, file_off, block_seq);
             let block_size = n.size();
             debug!("assign block ptr for data node: block ptr {}, block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
-            self.bmap().assign_data_node(blk_idx, blk_ptr).await?;
+            self.bmap_assign_data_node(blk_idx, blk_ptr).await?;
             segwr.inc_datablk(blk_idx, &blk_ptr);
             file_off += block_size;
             block_seq += 1;
@@ -303,7 +310,7 @@ pub trait HyperTrait<'a, T: Staging<T, L> + segment::SegmentReadWrite, L: BlockL
         self.clear_data_blocks_dirty();
 
         // clear dirty for bmap
-        self.bmap_mut().clear_dirty();
+        self.bmap_clear_dirty();
         // reset last flush
         self.set_last_flush();
 

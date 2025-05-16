@@ -6,6 +6,7 @@ use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
 use lru::LruCache;
 use btree_ondisk::{bmap::BMap, BlockLoader};
+use btree_ondisk::btree::BtreeNodeDirty;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
@@ -892,7 +893,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     }
 }
 
-impl<'a, T, L> HyperTrait<'a, T, L, BlockPtr> for HyperFile<'a, T, L>
+impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
     where
         T: Staging<T, L> + SegmentReadWrite,
         L: BlockLoader<BlockPtr> + Clone,
@@ -955,15 +956,41 @@ impl<'a, T, L> HyperTrait<'a, T, L, BlockPtr> for HyperFile<'a, T, L>
         drop(permit);
     }
 
-    fn bmap(&self) -> &BMap<'a, BlockIndex, BlockPtr, BlockPtr, L> {
-        &self.bmap
+    fn bmap_as_slice(&self) -> &[u8] {
+        self.bmap.as_slice()
     }
 
-    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, BlockPtr, BlockPtr, L> {
-        &mut self.bmap
+    fn bmap_get_block_loader(&self) -> L {
+        self.bmap.get_block_loader()
     }
 
-    async fn bmap_insert_dummy_value(bmap: &mut BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<BlockPtr>> {
+    fn bmap_dirty(&self) -> bool {
+        self.bmap.dirty()
+    }
+
+    fn bmap_lookup_dirty(&self) -> Vec<BtreeNodeDirty<'_, BlockIndex, BlockPtr, BlockPtr>> {
+        self.bmap.lookup_dirty()
+    }
+
+    async fn bmap_assign_meta_node(&self, blk_ptr: BlockPtr, node: BtreeNodeDirty<'_, BlockIndex, BlockPtr, BlockPtr>) -> Result<()> {
+        self.bmap.assign_meta_node(blk_ptr, node).await
+    }
+
+    async fn bmap_assign_data_node(&self, blk_idx: &BlockIndex, blk_ptr: BlockPtr) -> Result<()> {
+        self.bmap.assign_data_node(blk_idx, blk_ptr).await
+    }
+
+    fn bmap_clear_dirty(&mut self) {
+        self.bmap.clear_dirty()
+    }
+
+    fn bmap_update(&mut self, bmap: BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>) {
+        *&mut self.bmap = unsafe {
+            std::mem::transmute::<BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>, BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>>(bmap)
+        };
+    }
+
+    async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<BlockPtr>> {
         bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await
     }
 
@@ -983,8 +1010,11 @@ impl<'a, T, L> HyperTrait<'a, T, L, BlockPtr> for HyperFile<'a, T, L>
         &self.inode
     }
 
-    fn inode_mut(&mut self) -> &mut Inode {
-        &mut self.inode
+    #[allow(mutable_transmutes)]
+    fn inode_mut(&self) -> &mut Inode {
+        unsafe {
+            std::mem::transmute::<&Inode, &mut Inode>(&self.inode)
+        }
     }
 
     async fn sleep(dur: Duration) {
