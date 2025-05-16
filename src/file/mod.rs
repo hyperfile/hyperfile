@@ -14,7 +14,7 @@ pub mod tokio_wrapper;
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
 use std::collections::BTreeMap;
-use log::{debug, warn};
+use log::{info, debug, warn};
 use tokio::sync::OwnedSemaphorePermit;
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
 use btree_ondisk::btree::BtreeNodeDirty;
@@ -184,6 +184,7 @@ pub trait HyperTrait<T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoade
         }
         assert!(bmap.dirty() == true);
 
+        info!("REFRESH_BMAP - update in-memory bmap with inode from ondisk");
         // refresh inner bmap and inode but don't touch inode attr
         self.bmap_update(bmap);
         (*self.inode_mut()).i_last_seq = raw_inode.i_last_seq;
