@@ -55,7 +55,7 @@ pub struct Inode {
 
 impl fmt::Display for Inode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "==== dump Inode ino: {} attr dirty: {}====", self.i_ino, self.i_attr_dirty)?;
+        writeln!(f, "==== dump Inode ino: {} attr dirty: {} ====", self.i_ino, self.i_attr_dirty)?;
         if let Some(od_state) = &self.i_ondisk_state {
             writeln!(f, "  ondisk checksum: {}, ondisk timestamp: {}", od_state.checksum, od_state.timestamp)?;
         } else {
