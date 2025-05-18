@@ -1,5 +1,6 @@
 pub mod file;
 pub mod flags;
+pub mod mode;
 #[cfg(feature = "reactor")]
 pub mod handler;
 #[cfg(feature = "reactor")]
