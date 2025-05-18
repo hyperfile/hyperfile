@@ -117,7 +117,8 @@ impl Inode {
     pub fn default_dir() -> Self {
         let mut inode = Self::default();
         inode.i_meta_config = HyperFileMetaConfig::default().as_u32();
-        inode.i_mode = libc::S_IFDIR;
+        // o755
+        inode.i_mode = libc::S_IFDIR | libc::S_IRWXU | libc::S_IWUSR | libc::S_IRGRP | libc::S_IXGRP | libc::S_IROTH | libc::S_IXOTH;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
         inode.i_nlink = 1;
@@ -128,7 +129,8 @@ impl Inode {
     pub fn default_file() -> Self {
         let mut inode = Self::default();
         inode.i_meta_config = HyperFileMetaConfig::default().as_u32();
-        inode.i_mode = libc::S_IFREG;
+        // o644
+        inode.i_mode = libc::S_IFREG | libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IROTH;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
         inode.i_nlink = 1;
