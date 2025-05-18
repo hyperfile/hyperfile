@@ -4,6 +4,7 @@ use chrono::{Utc, TimeZone};
 use crate::SegmentId;
 use crate::ondisk::{InodeRaw, BMapRawType};
 use crate::config::HyperFileMetaConfig;
+use crate::file::mode::HyperFileMode;
 
 pub struct Stat(pub libc::stat);
 
@@ -140,6 +141,11 @@ impl Inode {
 
     pub fn with_meta_config(mut self, meta_config: &HyperFileMetaConfig) -> Self {
         self.i_meta_config = meta_config.as_u32();
+        self
+    }
+
+    pub fn with_mode(mut self, mode: &HyperFileMode) -> Self {
+        self.i_mode = mode.to_u32();
         self
     }
 
