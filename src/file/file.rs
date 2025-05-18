@@ -17,6 +17,7 @@ use crate::ondisk::{InodeRaw, BMapRawType};
 use crate::inode::{Inode, FlushInodeFlag};
 use crate::config::{HyperFileConfig, HyperFileMetaConfig};
 use super::flags::HyperFileFlags;
+use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
 
 pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
@@ -61,7 +62,7 @@ impl<T, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
 }
 
 impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
     {
         let meta_config = config.meta.clone();
 
@@ -69,7 +70,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let bmap_ud = BMapUserData::new(BlockPtrFormat::MicroGroup);
         bmap.set_userdata(bmap_ud.as_u32());
 
-        let inode = Inode::default_file().with_meta_config(&meta_config);
+        let inode = Inode::default_file()
+            .with_mode(&mode)
+            .with_meta_config(&meta_config);
         let max_dirty_blocks = Self::calc_max_dirty_blocks(meta_config.data_block_size,
             config.runtime.data_cache_dirty_max_bytes_threshold,
             config.runtime.data_cache_dirty_max_blocks_threshold);
@@ -141,9 +144,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 inode_state = od_state;
             },
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
-                    return Self::new(staging, meta_block_loader, config, flags).await;
-                }
                 return Err(e);
             },
         }

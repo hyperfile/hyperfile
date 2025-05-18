@@ -6,6 +6,7 @@ use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::hyper::Hyper;
 use super::flags::FileFlags;
+use super::mode::FileMode;
 use super::handler::FileContext;
 
 #[derive(Clone)]
@@ -14,19 +15,19 @@ pub struct HyperFileHandler<'a> {
 }
 
 impl<'a: 'static> HyperFileHandler<'a> {
-    pub async fn fh_create(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    pub async fn fh_create(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
-        let hyper = Hyper::fs_create(client, uri, flags).await?;
+        let hyper = Hyper::fs_create(client, uri, flags, mode).await?;
         let (tx, rx) = oneshot::channel();
         spawner.spawn(hyper, tx);
         let fh = rx.await.expect("failed to get back file handler");
         Ok(Self { inner: fh })
     }
 
-    pub async fn fh_create_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags,
+    pub async fn fh_create_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
             meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
-        let hyper = Hyper::fs_create_opt(client, uri, flags, meta_config, runtime_config).await?;
+        let hyper = Hyper::fs_create_opt(client, uri, flags, mode, meta_config, runtime_config).await?;
         let (tx, rx) = oneshot::channel();
         spawner.spawn(hyper, tx);
         let fh = rx.await.expect("failed to get back file handler");
@@ -52,9 +53,9 @@ impl<'a: 'static> HyperFileHandler<'a> {
         Ok(Self { inner: fh })
     }
 
-    pub async fn fh_open_or_create_with_default_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    pub async fn fh_open_or_create_with_default_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
-        let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags).await?;
+        let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags, mode).await?;
         let (tx, rx) = oneshot::channel();
         spawner.spawn(hyper, tx);
         let fh = rx.await.expect("failed to get back file handler");
