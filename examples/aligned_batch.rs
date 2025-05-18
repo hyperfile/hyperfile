@@ -11,6 +11,7 @@ use hyperfile::file::fh::HyperFileHandler;
 use hyperfile::file::handler::FileContext;
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
+use hyperfile::file::mode::FileMode;
 use hyperfile::buffer::AlignedDataBlockWrapper;
 
 // 10 GiB
@@ -29,13 +30,14 @@ async fn prepare_hyper(spawner: &LocalSpawner<FileContext<'static>, Hyper<'stati
                             Err(e)
                         })?;
     let flags = FileFlags::rdwr();
+    let mode = FileMode::default_file();
     let meta_config = HyperFileMetaConfig::default();
     let mut runtime_config = HyperFileRuntimeConfig::default_large();
     runtime_config.segment_buffer_size = usize::MAX;
     runtime_config.data_cache_dirty_max_flush_interval = u64::MAX;
     runtime_config.data_cache_dirty_max_bytes_threshold = usize::MAX;
     runtime_config.data_cache_dirty_max_blocks_threshold = usize::MAX;
-    let hyper = HyperFileHandler::fh_create_opt(spawner, client, uri, flags, &meta_config, &runtime_config).await?;
+    let hyper = HyperFileHandler::fh_create_opt(spawner, client, uri, flags, mode, &meta_config, &runtime_config).await?;
     Ok(hyper)
 }
 

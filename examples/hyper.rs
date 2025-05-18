@@ -6,6 +6,7 @@ use aws_sdk_s3::Client;
 use human_bytes::human_bytes;
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
+use hyperfile::file::mode::FileMode;
 use settings::*;
 
 async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>, write_zero: bool) -> Result<()> {
@@ -26,7 +27,8 @@ async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>, write_zero
     }
 
     let flags = FileFlags::rdwr();
-    let mut hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags).await?;
+    let mode = FileMode::default_file();
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags, mode).await?;
     // write content
     let filled_buf = &mut data[rand_data_offset..total_len];
     if write_zero {
@@ -60,7 +62,8 @@ async fn random_truncate(client: &Client, uri: &str, data: &mut Vec<u8>) -> Resu
     print!("random truncate file to new size {} ..", new_file_len);
     // open file for read
     let flags = FileFlags::rdwr();
-    let mut hyper = Hyper::fs_open_or_create_with_default_opt(&client, &uri, flags).await?;
+    let mode = FileMode::default_file();
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(&client, &uri, flags, mode).await?;
     // get stat
     let stat = hyper.fs_getattr()?;
     assert!(stat.st_size == data.len() as i64);
@@ -84,7 +87,8 @@ async fn read_check(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()
     let total_bytes = data.len();
     // open file for read
     let flags = FileFlags::rdonly();
-    let mut hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags).await?;
+    let mode = FileMode::default_file();
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags, mode).await?;
     // get stat
     let stat = hyper.fs_getattr()?;
     assert!(stat.st_size == total_bytes as i64);
