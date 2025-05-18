@@ -129,6 +129,16 @@ impl<'a: 'static> Hyper<'a> {
         Ok(self.inner.stat())
     }
 
+    pub async fn fs_getattr_fast(client: &Client, uri: &str) -> Result<libc::stat>
+    {
+        debug!("fs_getattr_fast - uri: {}", uri);
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let file_config = HyperFileConfigBuilder::new()
+                            .with_staging_config(&staging_config)
+                            .build();
+        return Self::stat_fast(client.clone(), file_config).await;
+    }
+
     pub fn fs_last_cno(&self) -> u64
     {
         debug!("fs_last_cno -");

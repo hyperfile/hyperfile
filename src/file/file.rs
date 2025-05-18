@@ -213,6 +213,14 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         self.inode.to_stat(dev, rdev, blksize)
     }
 
+    // fast stat by read inode without open file
+    pub async fn stat_fast(staging: T) -> Result<libc::stat> {
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
+        let inode = Inode::from_raw(&raw_inode, None);
+        Ok(inode.to_stat(0, 0, 0))
+    }
+
     pub async fn read(&mut self, off: usize, mut buf: &mut [u8]) -> Result<usize> {
         let _permit = self.sema.clone().acquire_owned().await.unwrap();
         let fn_start = Instant::now();
