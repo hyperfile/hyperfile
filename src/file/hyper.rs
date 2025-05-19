@@ -47,6 +47,17 @@ impl<'a: 'static> Hyper<'a> {
         })
     }
 
+    pub async fn create_with_interceptor(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode, interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
+    {
+        let mut staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
+        staging.interceptor(interceptor);
+        let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
+        let file = HyperFile::<S3Staging, S3BlockLoader>::new(staging, loader, file_config, flags, mode).await?;
+        Ok(Self {
+            inner: file,
+        })
+    }
+
     pub async fn stat_fast(client: Client, file_config: HyperFileConfig) -> Result<libc::stat>
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;

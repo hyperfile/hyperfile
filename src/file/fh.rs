@@ -4,6 +4,7 @@ use aws_sdk_s3::Client;
 use reactor::{LocalSpawner, TaskHandler};
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
+use crate::staging::{s3::S3Staging, StagingIntercept};
 use super::hyper::Hyper;
 use super::flags::FileFlags;
 use super::mode::FileMode;
@@ -24,10 +25,31 @@ impl<'a: 'static> HyperFileHandler<'a> {
         Ok(Self { inner: fh })
     }
 
+    pub async fn fh_create_with(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode, interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
+    {
+        let hyper = Hyper::fs_create_with_interceptor(client, uri, flags, mode, interceptor).await?;
+        let (tx, rx) = oneshot::channel();
+        spawner.spawn(hyper, tx);
+        let fh = rx.await.expect("failed to get back file handler");
+        Ok(Self { inner: fh })
+    }
+
     pub async fn fh_create_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
             meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
         let hyper = Hyper::fs_create_opt(client, uri, flags, mode, meta_config, runtime_config).await?;
+        let (tx, rx) = oneshot::channel();
+        spawner.spawn(hyper, tx);
+        let fh = rx.await.expect("failed to get back file handler");
+        Ok(Self { inner: fh })
+    }
+
+    pub async fn fh_create_opt_with_interceptor(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>,
+            client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
+            meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig,
+            interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
+    {
+        let hyper = Hyper::fs_create_opt_with_interceptor(client, uri, flags, mode, meta_config, runtime_config, interceptor).await?;
         let (tx, rx) = oneshot::channel();
         spawner.spawn(hyper, tx);
         let fh = rx.await.expect("failed to get back file handler");

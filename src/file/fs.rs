@@ -1,7 +1,7 @@
 use std::io::Result;
 use log::debug;
 use aws_sdk_s3::Client;
-use crate::staging::{Staging, config::StagingConfig, s3::S3Staging};
+use crate::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
 use crate::config::{HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::HyperTrait;
@@ -22,6 +22,18 @@ impl<'a: 'static> Hyper<'a> {
         return Self::create(client.clone(), file_config, f, m).await;
     }
 
+    pub async fn fs_create_with_interceptor(client: &Client, uri: &str, flags: FileFlags, mode: FileMode, interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
+    {
+        debug!("fs_create_with_interceptor - uri: {}, flags: {}", uri, flags);
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let file_config = HyperFileConfigBuilder::new()
+                            .with_staging_config(&staging_config)
+                            .build();
+        let f = HyperFileFlags::from_flags(flags);
+        let m = HyperFileMode::from_mode(mode);
+        return Self::create_with_interceptor(client.clone(), file_config, f, m, interceptor).await;
+    }
+
     pub async fn fs_create_opt(client: &Client, uri: &str, flags: FileFlags, mode: FileMode, meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
         debug!("fs_create_opt - uri: {}, flags: {}", uri, flags);
@@ -34,6 +46,22 @@ impl<'a: 'static> Hyper<'a> {
         let f = HyperFileFlags::from_flags(flags);
         let m = HyperFileMode::from_mode(mode);
         return Self::create(client.clone(), file_config, f, m).await;
+    }
+
+    pub async fn fs_create_opt_with_interceptor(client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
+            meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig,
+            interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
+    {
+        debug!("fs_create_opt_with_interceptor - uri: {}, flags: {}", uri, flags);
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let file_config = HyperFileConfigBuilder::new()
+                            .with_meta_config(meta_config)
+                            .with_staging_config(&staging_config)
+                            .with_runtime_config(runtime_config)
+                            .build();
+        let f = HyperFileFlags::from_flags(flags);
+        let m = HyperFileMode::from_mode(mode);
+        return Self::create_with_interceptor(client.clone(), file_config, f, m, interceptor).await;
     }
 
     pub async fn fs_open(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
