@@ -137,7 +137,7 @@ impl BlockPtrFormat {
     }
 
     #[inline]
-    pub(crate) fn decode_micro_group_id(blk_ptr: &BlockPtr) -> u64 {
+    pub fn decode_micro_group_id(blk_ptr: &BlockPtr) -> u64 {
         blk_ptr & BLOCK_PTR_SEGMENT_MG_GROUP_INDEX_MASK
     }
 }
