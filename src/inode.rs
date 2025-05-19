@@ -145,7 +145,15 @@ impl Inode {
     }
 
     pub fn with_mode(mut self, mode: &HyperFileMode) -> Self {
-        self.i_mode = mode.to_u32();
+        let mode_value = mode.to_u32();
+        let file_type =  mode_value & libc::S_IFMT;
+        if file_type > 0 {
+            // use mode's filetype if it is set
+            self.i_mode = file_type | (mode_value & !libc::S_IFMT);
+        } else {
+            // failback to default file type
+            self.i_mode = (self.i_mode & libc::S_IFMT) | (mode_value & !libc::S_IFMT);
+        }
         self
     }
 
