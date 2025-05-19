@@ -96,7 +96,7 @@ impl BlockPtrFormat {
     #[inline]
     fn encode_flat(segid: SegmentId, offset: SegmentOffset, _seq: usize) -> BlockPtr {
         BLOCK_PTR_STAGING |
-        (segid as u64 & BLOCK_PTR_SEGMENT_ID_MASK) << BLOCK_PTR_SEGMENT_ID_BIT_SHIFT |
+        (segid << BLOCK_PTR_SEGMENT_ID_BIT_SHIFT) & BLOCK_PTR_SEGMENT_ID_MASK |
         (offset as u64 & BLOCK_PTR_SEGMENT_FLAT_OFFSET_MASK)
     }
 
