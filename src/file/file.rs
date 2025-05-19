@@ -681,10 +681,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         } else if let Some(mut block) = self.data_blocks_cache.pop(&blk_idx) {
             // not found in dirty list but on cache list,
             // let's update block content and move it to dirty list
-            // NOTE: this should not happen in currently design, kick panic
+            // NOTE: this not intend to happen in currently design, kick warning
             block.copy(off, buf);
             self.data_blocks_dirty.insert(blk_idx, block);
-            panic!("update_cache - block index: {blk_idx} not in dirty list but in cache list, this is not by design");
+            warn!("update_cache - block index: {blk_idx} not in dirty list but in cache list, this is not by design");
         } else {
             // can't found in dirty list, create a new one
             let mut block = DataBlock::new(blk_idx, data_block_size);
