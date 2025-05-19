@@ -28,7 +28,8 @@ impl fmt::Display for FileMode {
         if self.is_dir() {
             write!(f, "S_IFDIR")?;
         }
-        write!(f, "")
+        let perm = self.0 & !libc::S_IFMT;
+        write!(f, " | {:#o}", perm)
     }
 }
 
