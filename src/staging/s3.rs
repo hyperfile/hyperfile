@@ -159,7 +159,7 @@ impl Staging<S3Staging, S3BlockLoader> for S3Staging {
     }
 
     fn dir_filename(&self) -> (&str, &str) {
-        if let Some((dir, filename)) = self.root_path.split_once('/') {
+        if let Some((dir, filename)) = self.root_path.rsplit_once('/') {
             return (dir, filename);
         }
         return ("", &self.root_path);
