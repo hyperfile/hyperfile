@@ -72,7 +72,7 @@ impl fmt::Display for Inode {
         writeln!(f, "  change time: {:?}", dt_ctime.unwrap())?;
         writeln!(f, "  modify time: {:?}", dt_mtime.unwrap())?;
         let meta_config = HyperFileMetaConfig::from_u32(self.i_meta_config);
-        writeln!(f, "  {:?}, root size: {}, meta block size: {}, data block size: {}",
+        writeln!(f, "  format: {:?}, root size: {}, meta block size: {}, data block size: {}",
             meta_config.block_ptr_format, meta_config.root_size,
             meta_config.meta_block_size, meta_config.data_block_size)?;
         writeln!(f, "  last seq: {}, last cno: {}, last ondisk cno: {}",
