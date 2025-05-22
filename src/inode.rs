@@ -4,7 +4,7 @@ use chrono::{Utc, TimeZone};
 use crate::SegmentId;
 use crate::ondisk::{InodeRaw, BMapRawType};
 use crate::config::HyperFileMetaConfig;
-use crate::file::mode::HyperFileMode;
+use crate::file::mode::{HyperFileMode, FileMode};
 
 pub struct Stat(pub libc::stat);
 
@@ -155,6 +155,14 @@ impl Inode {
             self.i_mode = (self.i_mode & libc::S_IFMT) | (mode_value & !libc::S_IFMT);
         }
         self
+    }
+
+    pub fn meta_config(&self) -> HyperFileMetaConfig {
+        HyperFileMetaConfig::from_u32(self.i_meta_config)
+    }
+
+    pub fn mode(&self) -> HyperFileMode {
+        HyperFileMode::from_mode(FileMode::from(self.i_mode))
     }
 
     pub fn is_attr_dirty(&self) -> bool {
