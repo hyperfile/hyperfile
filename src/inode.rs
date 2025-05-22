@@ -12,7 +12,7 @@ impl fmt::Display for Stat {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "==== dump Stat ino: {} ====", self.0.st_ino)?;
         writeln!(f, "  file size: {}, blocks: {}", self.0.st_size, self.0.st_blocks)?;
-        writeln!(f, "  uid: {}, gid: {}, mode: {}, nlink: {}, dev: {}, rdev: {}",
+        writeln!(f, "  uid: {}, gid: {}, mode: {:#o}, nlink: {}, dev: {}, rdev: {}",
             self.0.st_uid, self.0.st_gid, self.0.st_mode, self.0.st_nlink, self.0.st_dev, self.0.st_rdev)?;
         let dt_atime = Utc.timestamp_opt(self.0.st_atime as i64, self.0.st_atime_nsec as u32);
         let dt_ctime = Utc.timestamp_opt(self.0.st_ctime as i64, self.0.st_ctime_nsec as u32);
@@ -63,7 +63,7 @@ impl fmt::Display for Inode {
             writeln!(f, "  ondisk checksum: -, ondisk timestamp: -")?;
         }
         writeln!(f, "  file size: {}, blocks: {}", self.i_size, self.i_blocks)?;
-        writeln!(f, "  uid: {}, gid: {}, mode: {}, flags: {}, nlink: {}",
+        writeln!(f, "  uid: {}, gid: {}, mode: {:#o}, flags: {}, nlink: {}",
             self.i_uid, self.i_gid, self.i_mode, self.i_flags, self.i_nlink)?;
         let dt_atime = Utc.timestamp_opt(self.i_atime as i64, self.i_atime_nsec);
         let dt_ctime = Utc.timestamp_opt(self.i_ctime as i64, self.i_ctime_nsec);
