@@ -228,7 +228,8 @@ impl Inode {
         }
     }
 
-    pub fn to_stat(&self, dev: u64, rdev: u64, blksize: usize) -> libc::stat {
+    pub fn to_stat(&self, dev: u64, rdev: u64) -> libc::stat {
+        let meta_config = HyperFileMetaConfig::from_u32(self.i_meta_config);
         let mut stat: libc::stat = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         stat.st_dev = dev;
         stat.st_ino = self.i_ino;
@@ -238,7 +239,7 @@ impl Inode {
         stat.st_gid = self.i_gid;
         stat.st_rdev = rdev;
         stat.st_size = self.i_size as i64;
-        stat.st_blksize = blksize as i64;
+        stat.st_blksize = meta_config.data_block_size as i64;
         stat.st_blocks = self.i_blocks as i64;
         stat.st_atime = self.i_atime as i64;
         stat.st_atime_nsec = self.i_atime_nsec as i64;
@@ -247,6 +248,24 @@ impl Inode {
         stat.st_ctime = self.i_ctime as i64;
         stat.st_ctime_nsec = self.i_ctime_nsec as i64;
         stat
+    }
+
+    pub fn update_stat(&mut self, stat: &libc::stat) -> libc::stat {
+        self.i_ino = stat.st_ino;
+        self.i_nlink = stat.st_nlink;
+        self.i_mode = stat.st_mode;
+        self.i_uid = stat.st_uid;
+        self.i_gid = stat.st_gid;
+        self.i_size = stat.st_size as u64;
+        self.i_blocks = stat.st_blocks as u64;
+        self.i_atime = stat.st_atime as u64;
+        self.i_atime_nsec = stat.st_atime_nsec as u32;
+        self.i_mtime = stat.st_mtime as u64;
+        self.i_mtime_nsec = stat.st_mtime_nsec as u32;
+        self.i_ctime = stat.st_ctime as u64;
+        self.i_ctime_nsec = stat.st_ctime_nsec as u32;
+        self.i_attr_dirty = true;
+        *stat
     }
 
     pub fn size(&self) -> usize {
