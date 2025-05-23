@@ -15,6 +15,7 @@ libc = "0.2.170"
 chrono = "0.4.39"
 bytes = "1.10.0"
 lru = "0.14.0"
+rand = { version = "0.9.0", optional = true }
 aws-config = { version = "1.5.17", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.77.0"
 btree-ondisk = { version = "0.14.0", path = "../btree-ondisk", default-features = false }
@@ -31,3 +32,4 @@ default = ["reactor", "meta_loader_batch"]
 meta_loader_batch = []
 reactor = ["dep:reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
 blocking = ["btree-ondisk/rc"]
+bench = ["dep:rand"]

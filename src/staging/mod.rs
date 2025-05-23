@@ -28,3 +28,5 @@ pub trait Staging<T, L> {
 
 pub mod config;
 pub mod s3;
+#[cfg(feature="bench")]
+pub mod bench;
