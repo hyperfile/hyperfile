@@ -89,11 +89,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             config.runtime.data_cache_blocks
         };
 
+        use std::num::NonZeroUsize;
         let mut file = Self {
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
-            data_blocks_cache: LruCache::new(std::num::NonZeroUsize::new(data_cache_blocks).unwrap()),
+            data_blocks_cache: LruCache::new(
+                // fail back to 1 if data_cache_blocks is set to zero
+                NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
+            ),
             data_blocks_dirty: BTreeMap::new(),
             inode: inode,
             config: config,
@@ -174,11 +178,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         // overwrite the default meta config with the one we get from inode
         config.meta = meta_config;
 
+        use std::num::NonZeroUsize;
         let mut file = Self {
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
-            data_blocks_cache: LruCache::new(std::num::NonZeroUsize::new(data_cache_blocks).unwrap()),
+            data_blocks_cache: LruCache::new(
+                // fail back to 1 if data_cache_blocks is set to zero
+                NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
+            ),
             data_blocks_dirty: BTreeMap::new(),
             inode: Inode::from_raw(&raw_inode, inode_state),
             config: config,
