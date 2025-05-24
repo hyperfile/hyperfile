@@ -70,7 +70,7 @@ pub struct DataBlock {
 }
 
 impl DataBlock {
-    pub(crate) fn new(index: BlockIndex, size: usize) -> Self {
+    pub fn new(index: BlockIndex, size: usize) -> Self {
         Self {
             data: Box::pin(AlignedDataBlock::new(size)),
             index: index,
@@ -79,8 +79,7 @@ impl DataBlock {
     }
 
     // duplicate a data block by copy
-    #[allow(dead_code)]
-    pub(crate) fn dup(&self) -> Self {
+    pub fn dup(&self) -> Self {
         let n = Self {
             data: Box::pin(AlignedDataBlock::new(self.size())),
             index: self.index(),
@@ -91,25 +90,24 @@ impl DataBlock {
     }
 
     #[inline]
-    pub(crate) fn index(&self) -> BlockIndex {
+    pub fn index(&self) -> BlockIndex {
         self.index
     }
 
     // unique id from value of inner buffer pointer
     #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn uid(&self) -> u64 {
+    pub fn uid(&self) -> u64 {
         self.data.ptr as u64
     }
 
     // get buffer size
     #[inline]
-    pub(crate) fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         self.data.layout.size()
     }
 
     /// copy all data from slice into block buffer start with offset
-    pub(crate) fn copy(&mut self, offset: usize, data: &[u8]) {
+    pub fn copy(&mut self, offset: usize, data: &[u8]) {
         let s = unsafe {
             let ptr = self.data.ptr.add(offset);
             std::slice::from_raw_parts_mut(ptr, data.len())
@@ -118,7 +116,7 @@ impl DataBlock {
     }
 
     /// copy data from block into supplied buffer
-    pub(crate) fn copy_out(&self, offset: usize, buf: &mut [u8]) {
+    pub fn copy_out(&self, offset: usize, buf: &mut [u8]) {
         let s = unsafe {
             let ptr = self.data.ptr.add(offset);
             std::slice::from_raw_parts_mut(ptr, buf.len())
@@ -127,20 +125,20 @@ impl DataBlock {
     }
 
     // expose inner data as slice
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         self.data.as_slice()
     }
 
     // expose inner data as slice
-    pub(crate) fn as_mut_slice(&self) -> &mut [u8] {
+    pub fn as_mut_slice(&self) -> &mut [u8] {
         self.data.as_mut_slice()
     }
 
-    pub(crate) fn set_should_cache(&mut self) {
+    pub fn set_should_cache(&mut self) {
         self.flags |= DATA_BLOCK_FLAG_SHOULD_CACHE;
     }
 
-    pub(crate) fn is_should_cache(&self) -> bool {
+    pub fn is_should_cache(&self) -> bool {
         self.flags & DATA_BLOCK_FLAG_SHOULD_CACHE == DATA_BLOCK_FLAG_SHOULD_CACHE
     }
 }
