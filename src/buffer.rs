@@ -23,7 +23,7 @@ unsafe impl GlobalAlloc for AlignedAlloc {
     }
 }
 
-struct AlignedDataBlock {
+pub struct AlignedDataBlock {
     ptr: *mut u8,
     layout: Layout,
 }
