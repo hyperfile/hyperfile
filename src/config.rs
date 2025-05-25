@@ -1,4 +1,5 @@
 use std::fmt;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use crate::meta_format::BlockPtrFormat;
 use crate::staging::config::StagingConfig;
@@ -8,7 +9,7 @@ const MIN_ROOT_SIZE: usize = 56;
 const MIN_META_BLOCK_SIZE: usize = 4096;
 const MIN_DATA_BLOCK_SIZE: usize = 4096;
 
-const DEFAULT_ROOT_SIZE: usize = MIN_ROOT_SIZE;
+pub(crate) const DEFAULT_ROOT_SIZE: usize = MIN_ROOT_SIZE;
 const DEFAULT_META_BLOCK_SIZE: usize = MIN_META_BLOCK_SIZE;
 const DEFAULT_DATA_BLOCK_SIZE: usize = MIN_DATA_BLOCK_SIZE;
 const DEFAULT_BLOCK_PTR_FORMAT: BlockPtrFormat = BlockPtrFormat::Flat;
@@ -30,6 +31,12 @@ impl fmt::Display for HyperFileMetaConfig {
 
 impl HyperFileMetaConfig {
     pub fn new(root_size: usize, meta_block_size: usize, data_block_size: usize, block_ptr_format: BlockPtrFormat) -> Self {
+        let root_size = if root_size != DEFAULT_ROOT_SIZE {
+            warn!("only support fixed root size == {} at this moment", DEFAULT_ROOT_SIZE);
+            DEFAULT_ROOT_SIZE
+        } else {
+            root_size
+        };
         // enforce input min size and log2 aligned
         let root_size = std::cmp::max(root_size, DEFAULT_ROOT_SIZE);
         let meta_block_size = std::cmp::max(meta_block_size, DEFAULT_META_BLOCK_SIZE);

@@ -1,6 +1,7 @@
+use crate::config::DEFAULT_ROOT_SIZE;
 // "HFSS"
 const DEFAULT_SS_MAGIC: u32 = 0x48465353;
-const DEFAULT_INODE_BMAP_SIZE: usize = 56;
+const DEFAULT_INODE_BMAP_SIZE: usize = DEFAULT_ROOT_SIZE;
 
 pub type BMapRawType = [u8; DEFAULT_INODE_BMAP_SIZE];
 
