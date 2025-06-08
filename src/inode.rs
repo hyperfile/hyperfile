@@ -241,13 +241,27 @@ impl Inode {
         let mut stat: libc::stat = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         stat.st_dev = dev;
         stat.st_ino = self.i_ino;
-        stat.st_nlink = self.i_nlink;
+        #[cfg(target_arch = "x86_64")]
+        {
+            stat.st_nlink = self.i_nlink;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            stat.st_nlink = self.i_nlink as u32;
+        }
         stat.st_mode = self.i_mode;
         stat.st_uid = self.i_uid;
         stat.st_gid = self.i_gid;
         stat.st_rdev = rdev;
         stat.st_size = self.i_size as i64;
-        stat.st_blksize = meta_config.data_block_size as i64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            stat.st_blksize = meta_config.data_block_size as i64;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            stat.st_blksize = meta_config.data_block_size as i32;
+        }
         stat.st_blocks = self.i_blocks as i64;
         stat.st_atime = self.i_atime as i64;
         stat.st_atime_nsec = self.i_atime_nsec as i64;
@@ -260,7 +274,14 @@ impl Inode {
 
     pub fn update_stat(&mut self, stat: &libc::stat) -> libc::stat {
         self.i_ino = stat.st_ino;
-        self.i_nlink = stat.st_nlink;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.i_nlink = stat.st_nlink;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.i_nlink = stat.st_nlink as u64;
+        }
         self.i_mode = stat.st_mode;
         self.i_uid = stat.st_uid;
         self.i_gid = stat.st_gid;
