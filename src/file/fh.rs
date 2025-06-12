@@ -166,6 +166,13 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.expect("task channel closed")
     }
 
+    pub async fn fh_setattr(&self, stat: libc::stat) -> Result<libc::stat>
+    {
+        let (ctx, rx) = FileContext::new_setattr(stat);
+        self.inner.send(ctx);
+        rx.await.expect("task channel closed")
+    }
+
     pub async fn fh_last_cno(&self) -> u64
     {
         let (ctx, rx) = FileContext::new_last_cno();

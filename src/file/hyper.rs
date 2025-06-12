@@ -63,6 +63,12 @@ impl<'a: 'static> Hyper<'a> {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         HyperFile::stat_fast(staging).await
     }
+
+    pub async fn update_stat_fast(client: Client, file_config: HyperFileConfig, stat: &libc::stat) -> Result<libc::stat>
+    {
+        let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
+        HyperFile::update_stat_fast(staging, stat).await
+    }
 }
 
 /// expose helper fn

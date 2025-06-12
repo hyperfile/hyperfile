@@ -9,6 +9,7 @@ use super::hyper::Hyper;
 use super::HyperTrait;
 
 pub type FileRespGetAttr = Result<libc::stat>;
+pub type FileRespSetAttr = Result<libc::stat>;
 pub type FileRespRead = Result<usize>;
 pub type FileRespWrite = Result<usize>;
 pub type FileRespWriteZero = Result<usize>;
@@ -20,6 +21,7 @@ pub type FileRespLastCno = u64;
 #[repr(C)]
 pub union FileResp {
     getattr: ManuallyDrop<oneshot::Sender<FileRespGetAttr>>,
+    setattr: ManuallyDrop<oneshot::Sender<FileRespSetAttr>>,
     read: ManuallyDrop<mpsc::Sender<FileRespRead>>,
     write: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
     write_zero: ManuallyDrop<mpsc::Sender<FileRespWriteZero>>,
@@ -34,6 +36,10 @@ pub union FileResp {
 impl FileResp {
     pub fn to_getattr(self) -> oneshot::Sender<FileRespGetAttr> {
         ManuallyDrop::into_inner(unsafe { self.getattr })
+    }
+
+    pub fn to_setattr(self) -> oneshot::Sender<FileRespSetAttr> {
+        ManuallyDrop::into_inner(unsafe { self.setattr })
     }
 
     pub fn to_read(self) -> mpsc::Sender<FileRespRead> {
@@ -99,6 +105,10 @@ pub struct FileReqTrunc {
 
 pub struct FileReqGetAttr {}
 
+pub struct FileReqSetAttr {
+    pub stat: libc::stat,
+}
+
 pub struct FileReqFlush {}
 
 pub struct FileReqRelease {}
@@ -107,6 +117,7 @@ pub struct FileReqLastCno {}
 
 pub enum FileReqOp {
     GetAttr,
+    SetAttr,
     Read,
     Write,
     WriteAbsorb,
@@ -123,6 +134,7 @@ pub enum FileReqOp {
 #[repr(C)]
 pub union FileReqBody<'a> {
     getattr: ManuallyDrop<FileReqGetAttr>,
+    setattr: ManuallyDrop<FileReqSetAttr>,
     read: ManuallyDrop<FileReqRead<'a>>,
     write: ManuallyDrop<FileReqWrite<'a>>,
     write_zero: ManuallyDrop<FileReqWriteZero<'a>>,
@@ -160,6 +172,18 @@ impl<'a> FileContext<'a> {
         };
         let resp = FileResp {
             getattr: ManuallyDrop::new(tx),
+        };
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    pub fn new_setattr(stat: libc::stat) -> (Self, oneshot::Receiver<FileRespSetAttr>) {
+        let (tx, rx) = oneshot::channel::<FileRespSetAttr>();
+        let req = FileReq {
+            op: FileReqOp::SetAttr,
+            body: FileReqBody { setattr: ManuallyDrop::new(FileReqSetAttr { stat: stat }), },
+        };
+        let resp = FileResp {
+            setattr: ManuallyDrop::new(tx),
         };
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
@@ -304,6 +328,12 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let stat = self.inner.stat();
                 let resp = resp.to_getattr();
                 let _ = resp.send(Ok(stat));
+            },
+            FileReqOp::SetAttr => {
+                let body = unsafe { req.body.setattr };
+                let stat = body.stat;
+                let res = self.inner.update_stat(&stat).await;
+                let _ = resp.to_setattr().send(res);
             },
             FileReqOp::Read => {
                 let md = unsafe { req.body.read };
