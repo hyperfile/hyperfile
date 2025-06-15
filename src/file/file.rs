@@ -16,6 +16,8 @@ use crate::segment::SegmentReadWrite;
 use crate::ondisk::{InodeRaw, BMapRawType};
 use crate::inode::{Inode, FlushInodeFlag};
 use crate::config::{HyperFileConfig, HyperFileMetaConfig};
+#[cfg(feature = "wal")]
+use crate::wal::WalReadWrite;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
@@ -40,6 +42,8 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
     #[cfg(feature = "reactor")]
     pub(crate) rt: Option<tokio::runtime::Runtime>,
+    #[cfg(feature = "wal")]
+    pub(crate) wal: Option<Box<dyn WalReadWrite + Send>>,
 }
 
 impl<T, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
@@ -89,6 +93,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             config.runtime.data_cache_blocks
         };
 
+        #[cfg(feature = "wal")]
+        let wal = config.wal.to_wal(config.meta.data_block_size, inode.get_last_seq())?;
+
         use std::num::NonZeroUsize;
         let mut file = Self {
             staging: staging,
@@ -110,6 +117,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             spawn_write_permit: None,
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
+            #[cfg(feature = "wal")]
+            wal: wal,
         };
         // flush inode for hyper file new created
         let _ = file.flush_inode(FlushInodeFlag::Create).await?;
@@ -178,6 +187,10 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         // overwrite the default meta config with the one we get from inode
         config.meta = meta_config;
 
+        let inode = Inode::from_raw(&raw_inode, inode_state);
+        #[cfg(feature = "wal")]
+        let wal = config.wal.to_wal(config.meta.data_block_size, inode.get_last_seq())?;
+
         use std::num::NonZeroUsize;
         let mut file = Self {
             staging: staging,
@@ -188,7 +201,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
             ),
             data_blocks_dirty: BTreeMap::new(),
-            inode: Inode::from_raw(&raw_inode, inode_state),
+            inode: inode,
             config: config,
             max_dirty_blocks: max_dirty_blocks,
             data_cache_blocks: data_cache_blocks,
@@ -199,6 +212,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             spawn_write_permit: None,
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
+            #[cfg(feature = "wal")]
+            wal: wal,
         };
         // refresh bmap if need to do recovery
         let _ = file.refresh_bmap().await?;
@@ -314,6 +329,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
         }
+
+        #[cfg(feature = "wal")]
+        if let Some(wal) = &mut self.wal {
+            let _ = wal.write(self.inode.get_last_seq(), off, buf).await?;
+        }
+
         let mut bytes_write = 0;
 
         let data_block_size = self.config.meta.data_block_size;
@@ -359,6 +380,12 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
         }
+
+        #[cfg(feature = "wal")]
+        if let Some(wal) = &mut self.wal {
+            let _ = wal.write_zero(self.inode.get_last_seq(), off, len).await?;
+        }
+
         let mut bytes_write = 0;
 
         let data_block_size = self.config.meta.data_block_size;

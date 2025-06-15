@@ -283,6 +283,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
         }
 
+        #[cfg(feature = "wal")]
+        if let Some(wal) = &mut self.wal {
+            let _ = wal.write(self.inode.get_last_seq(), off, buf).await?;
+        }
+
         let data_block_size = self.config.meta.data_block_size;
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         let mut next_slice = buf;
@@ -335,6 +340,11 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             } else {
                 debug!("BlockIndex {} already on data_blocks_dirty list, ignore this block", blk_idx);
             }
+        }
+
+        #[cfg(feature = "wal")]
+        if let Some(wal) = &mut self.wal {
+            let _ = wal.write_zero(self.inode.get_last_seq(), off, len).await?;
         }
 
         let data_block_size = self.config.meta.data_block_size;

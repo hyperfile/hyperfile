@@ -3,6 +3,8 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use crate::meta_format::BlockPtrFormat;
 use crate::staging::config::StagingConfig;
+#[cfg(feature = "wal")]
+use crate::wal::config::HyperFileWalConfig;
 use crate::*;
 
 const MIN_ROOT_SIZE: usize = 56;
@@ -147,6 +149,9 @@ pub struct HyperFileConfig {
 	/// hyper file runtime tunables
 	#[serde(default)]
 	pub runtime: HyperFileRuntimeConfig,
+    #[cfg(feature = "wal")]
+	/// wal config for hyper file
+	pub wal: HyperFileWalConfig,
 }
 
 pub struct HyperFileConfigBuilder {
@@ -181,6 +186,12 @@ impl HyperFileConfigBuilder {
 
 	pub fn with_runtime_config(mut self, runtime: &HyperFileRuntimeConfig) -> Self {
 		self.config.runtime = runtime.to_owned();
+		self
+	}
+
+    #[cfg(feature = "wal")]
+	pub fn with_wal_config(mut self, wal: &HyperFileWalConfig) -> Self {
+		self.config.wal = wal.to_owned();
 		self
 	}
 

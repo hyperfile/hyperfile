@@ -30,6 +30,7 @@ human_bytes = "0.4.3"
 [features]
 default = ["reactor", "meta_loader_batch"]
 meta_loader_batch = []
+wal = []
 reactor = ["dep:reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
 blocking = ["btree-ondisk/rc"]
 bench = ["dep:rand"]
