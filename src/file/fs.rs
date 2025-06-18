@@ -2,7 +2,7 @@ use std::io::Result;
 use log::debug;
 use aws_sdk_s3::Client;
 use crate::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
-use crate::config::{HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
+use crate::config::{HyperFileConfig, HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::HyperTrait;
 use super::hyper::Hyper;
@@ -97,6 +97,14 @@ impl<'a: 'static> Hyper<'a> {
         let f = HyperFileFlags::from_flags(flags);
         let m = HyperFileMode::from_mode(mode);
         return Self::do_open_or_create(client.clone(), file_config, f, m, true).await;
+    }
+
+    pub async fn fs_open_or_create_with_config(client: &Client, config: HyperFileConfig, flags: FileFlags, mode: FileMode) -> Result<Self>
+    {
+        debug!("fs_open_or_create_with_config - flags: {}, mode: {}", flags, mode);
+        let f = HyperFileFlags::from_flags(flags);
+        let m = HyperFileMode::from_mode(mode);
+        return Self::do_open_or_create(client.clone(), config, f, m, true).await;
     }
 
     pub async fn fs_unlink(client: &Client, uri: &str) -> Result<()>

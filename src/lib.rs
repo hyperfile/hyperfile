@@ -11,7 +11,7 @@ pub mod staging;
 pub mod meta_loader;
 pub(crate) mod s3commons;
 #[cfg(feature = "wal")]
-pub(crate) mod wal;
+pub mod wal;
 
 pub type BlockIndex = u64;
 pub type BlockPtr = u64;

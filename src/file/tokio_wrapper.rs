@@ -9,7 +9,7 @@ use tokio::sync::mpsc::error::TryRecvError as MpscTryRecvError;
 use tokio::sync::oneshot::error::TryRecvError as OneshotTryRecvError;
 use aws_sdk_s3::Client;
 use reactor::{LocalSpawner, TaskHandler};
-use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
+use crate::config::{HyperFileConfig, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use super::hyper::Hyper;
 use super::flags::FileFlags;
 use super::mode::FileMode;
@@ -91,6 +91,16 @@ impl<'a: 'static> HyperFileTokio<'a> {
     pub async fn open_or_create_with_default_opt(client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags, mode).await?;
+        let (tx, rx) = oneshot::channel();
+        let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
+        spawner.spawn(hyper, tx);
+        let fh = rx.await.expect("failed to get back file handler");
+        Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
+    }
+
+    pub async fn open_or_create_with_config(client: &Client, config: HyperFileConfig, flags: FileFlags, mode: FileMode) -> Result<Self>
+    {
+        let hyper = Hyper::fs_open_or_create_with_config(client, config, flags, mode).await?;
         let (tx, rx) = oneshot::channel();
         let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
         spawner.spawn(hyper, tx);

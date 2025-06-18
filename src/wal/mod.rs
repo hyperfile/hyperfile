@@ -3,7 +3,7 @@ use std::io::Result;
 use crate::SegmentId;
 use crate::buffer::BatchDataBlockWrapper;
 
-pub(crate) mod config;
+pub mod config;
 pub(crate) mod s3;
 
 pub(crate) trait WalReadWrite {
