@@ -493,8 +493,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         Ok(bytes_write)
     }
 
-    // try flush out dirty data if all threshold condition meet
-    pub(crate) async fn try_flush(&mut self) -> Result<bool> {
+    pub(crate) fn need_flush(&self) -> bool {
         // check if dirty data bytes exceed segment buffer threshold
         let ndatadirty = self.data_blocks_dirty.len();
         let data_block_size = self.config.meta.data_block_size;
@@ -508,10 +507,25 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
         let last_flush_expired = self.last_flush.elapsed() >= Duration::from_millis(max_flush_interval);
         if last_flush_expired || threshold_flush || sync_flush || direct_flush {
+            return true;
+        }
+        false
+    }
+
+    // try flush out dirty data if all threshold condition meet
+    pub(crate) async fn try_flush(&mut self) -> Result<bool> {
+        if self.need_flush() {
             let _ = self.flush().await?;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    #[cfg(feature = "wal")]
+    pub(crate) async fn wal_flush(&mut self) -> Result<()> {
+        // TODO: replace flush() with wal_protected_flush()
+        let _ = self.flush().await?;
+        Ok(())
     }
 
     pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {

@@ -32,6 +32,8 @@ pub union FileResp {
     write_batch: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
     trunc: ManuallyDrop<oneshot::Sender<FileRespTrunc>>,
     flush: ManuallyDrop<oneshot::Sender<FileRespFlush>>,
+    #[cfg(feature = "wal")]
+    wal_flush: ManuallyDrop<()>,
     release: ManuallyDrop<oneshot::Sender<FileRespRelease>>,
     last_cno: ManuallyDrop<oneshot::Sender<FileRespLastCno>>,
 }
@@ -63,6 +65,11 @@ impl FileResp {
 
     pub fn to_flush(self) -> oneshot::Sender<FileRespFlush> {
         ManuallyDrop::into_inner(unsafe { self.flush })
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn to_wal_flush(self) {
+        ManuallyDrop::into_inner(unsafe { self.wal_flush })
     }
 
     pub fn to_release(self) -> oneshot::Sender<FileRespRelease> {
@@ -129,6 +136,9 @@ pub struct FileReqSetAttr {
 
 pub struct FileReqFlush {}
 
+#[cfg(feature = "wal")]
+pub struct FileReqWalFlush {}
+
 pub struct FileReqRelease {}
 
 pub struct FileReqLastCno {}
@@ -147,6 +157,8 @@ pub enum FileReqOp {
     WriteBatch,
     Trunc,
     Flush,
+    #[cfg(feature = "wal")]
+    WalFlush,
     Release,
     LastCno,
     #[cfg(feature = "wal")]
@@ -165,6 +177,8 @@ pub union FileReqBody<'a> {
     write_aligned_batch: ManuallyDrop<FileReqWriteAlignedBatch>,
     write_batch: ManuallyDrop<FileReqWriteBatch>,
     trunc: ManuallyDrop<FileReqTrunc>,
+    #[cfg(feature = "wal")]
+    wal_flush: ManuallyDrop<FileReqWalFlush>,
     flush: ManuallyDrop<FileReqFlush>,
     release: ManuallyDrop<FileReqRelease>,
     last_cno: ManuallyDrop<FileReqLastCno>,
@@ -190,7 +204,7 @@ impl<'a> FileContext<'a> {
 
     pub fn new_getattr() -> (Self, oneshot::Receiver<FileRespGetAttr>) {
         let (tx, rx) = oneshot::channel::<FileRespGetAttr>();
-        let req = FileReq { 
+        let req = FileReq {
             op: FileReqOp::GetAttr,
             body: FileReqBody { getattr: ManuallyDrop::new(FileReqGetAttr {}), },
         };
@@ -215,7 +229,7 @@ impl<'a> FileContext<'a> {
     // return both tx and rx, for mpsc channel we need to keep tx until we receved response
     pub fn new_read(buf: &'a mut [u8], offset: usize, fh: TaskHandler<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespRead>, mpsc::Receiver<FileRespRead>) {
         let (tx, rx) = mpsc::channel::<FileRespRead>(1);
-        let req = FileReq { 
+        let req = FileReq {
             op: FileReqOp::Read,
             body: FileReqBody { read: ManuallyDrop::new(FileReqRead { buf: buf, offset: offset, fh: fh }), },
         };
@@ -228,7 +242,7 @@ impl<'a> FileContext<'a> {
     // return both tx and rx, for mpsc channel we need to keep tx until we receved response
     pub fn new_write(buf: &'a [u8], offset: usize, fh: TaskHandler<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>) {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
-        let req = FileReq { 
+        let req = FileReq {
             op: FileReqOp::Write,
             body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, spawn_write_permit: None, fh: fh, fetched: Vec::new(), }), },
         };
@@ -329,7 +343,7 @@ impl<'a> FileContext<'a> {
 
     pub fn new_trunc(offset: usize) -> (Self, oneshot::Receiver<FileRespTrunc>) {
         let (tx, rx) = oneshot::channel::<FileRespTrunc>();
-        let req = FileReq { 
+        let req = FileReq {
             op: FileReqOp::Trunc,
             body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset: offset }), },
         };
@@ -341,7 +355,7 @@ impl<'a> FileContext<'a> {
 
     pub fn new_flush() -> (Self, oneshot::Receiver<FileRespFlush>) {
         let (tx, rx) = oneshot::channel::<FileRespFlush>();
-        let req = FileReq { 
+        let req = FileReq {
             op: FileReqOp::Flush,
             body: FileReqBody { flush: ManuallyDrop::new(FileReqFlush {}), },
         };
@@ -351,9 +365,22 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
+    // only used by internal driven process when wal enabled
+    #[cfg(feature = "wal")]
+    pub fn new_wal_flush() -> Self {
+        let req = FileReq {
+            op: FileReqOp::WalFlush,
+            body: FileReqBody { wal_flush: ManuallyDrop::new(FileReqWalFlush {}), },
+        };
+        let resp = FileResp {
+            wal_flush: ManuallyDrop::new(()),
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
     pub fn new_release() -> (Self, oneshot::Receiver<FileRespRelease>) {
         let (tx, rx) = oneshot::channel::<FileRespRelease>();
-        let req = FileReq { 
+        let req = FileReq {
             op: FileReqOp::Release,
             body: FileReqBody { release: ManuallyDrop::new(FileReqRelease {}), },
         };
@@ -365,7 +392,7 @@ impl<'a> FileContext<'a> {
 
     pub fn new_last_cno() -> (Self, oneshot::Receiver<FileRespLastCno>) {
         let (tx, rx) = oneshot::channel::<FileRespLastCno>();
-        let req = FileReq { 
+        let req = FileReq {
             op: FileReqOp::LastCno,
             body: FileReqBody { last_cno: ManuallyDrop::new(FileReqLastCno {}), },
         };
@@ -635,6 +662,16 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::Flush => {
                 let res = self.inner.flush().await;
                 let _ = resp.to_flush().send(res);
+            },
+            #[cfg(feature = "wal")]
+            FileReqOp::WalFlush => {
+                let md = unsafe { req.body.wal_flush };
+                let req = ManuallyDrop::into_inner(md);
+                let res = self.inner.wal_flush().await;
+                if res.is_err() {
+                    panic!("wal flush failed {:?}", res);
+                }
+                let _ = resp.to_wal_flush();
             },
             FileReqOp::Release => {
                 let res = self.inner.release().await;

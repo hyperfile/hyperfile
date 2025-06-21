@@ -359,11 +359,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         #[cfg(feature = "range-lock")]
         self.range_lock.try_unlock(range);
 
-        /*
-        let flushed = self.try_flush().await?;
-        // TODO: placehold for pref metrics
-        let _ = flushed;
-        */
+        if self.need_flush() {
+            if cfg!(feature = "wal") {
+                let fh = req.fh.clone();
+                let ctx = FileContext::new_wal_flush();
+                fh.send_highprio(ctx);
+            } else {
+                self.flush().await?;
+            }
+        }
 
         Ok(bytes_write)
     }
@@ -454,11 +458,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         #[cfg(feature = "range-lock")]
         self.range_lock.try_unlock(range);
 
-        /*
-        let flushed = self.try_flush().await?;
-        // TODO: placehold for pref metrics
-        let _ = flushed;
-        */
+        if self.need_flush() {
+            if cfg!(feature = "wal") {
+                let fh = req.fh.clone();
+                let ctx = FileContext::new_wal_flush();
+                fh.send_highprio(ctx);
+            } else {
+                self.flush().await?;
+            }
+        }
 
         Ok(bytes_write)
     }
