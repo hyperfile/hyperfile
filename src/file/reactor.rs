@@ -13,6 +13,8 @@ use crate::segment::SegmentReadWrite;
 use crate::file::HyperTrait;
 use crate::meta_format::BlockPtrFormat;
 use crate::buffer::DataBlock;
+#[cfg(feature = "wal")]
+use crate::wal::WalReadWrite;
 use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 #[cfg(feature = "range-lock")]
@@ -286,13 +288,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         Ok(total_bytes)
     }
 
-    pub(crate) async fn absorb_write(&mut self, off: usize, buf: &[u8], fetched: Vec<DataBlock>) -> Result<usize> {
-        let len = buf.len();
-        let mut bytes_write = 0;
-
-        // restore spawn_write permit
-        let opt_permit = self.spawn_write_permit.take();
-        assert!(opt_permit.is_some());
+    pub(crate) async fn absorb_write(&mut self, req: FileReqWrite<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
+        let off = req.offset;
+        let len = req.buf.len();
 
         // insert fetched block back to dirty list,
         // for the case: block idx exists on dirty
@@ -310,9 +308,26 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         }
 
         #[cfg(feature = "wal")]
-        if let Some(wal) = &mut self.wal {
-            let _ = wal.write(self.inode.get_last_seq(), off, buf).await?;
+        if let Some(_) = &mut self.wal {
+            let fh = req.fh.clone();
+            let ctx = FileContext::write_wal(req, resp);
+            fh.send_highprio(ctx);
+            // TODO: change to ErrorKind::InProgress when it's stable
+            return Err(Error::new(ErrorKind::ResourceBusy, "op resubmit to exec write wal"));
         }
+
+        self.absorb_write_bh(req, resp).await
+    }
+
+    pub(crate) async fn absorb_write_bh(&mut self, mut req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
+        let off = req.offset;
+        let len = req.buf.len();
+        let buf = req.buf;
+        let mut bytes_write = 0;
+
+        // restore spawn_write permit
+        let opt_permit = req.spawn_write_permit.take();
+        assert!(opt_permit.is_some());
 
         let data_block_size = self.config.meta.data_block_size;
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
@@ -339,19 +354,23 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         self.inode.update_mtime();
         drop(opt_permit);
 
+        #[cfg(feature = "range-lock")]
+        let range = off as u64..(off + len) as u64;
+        #[cfg(feature = "range-lock")]
+        self.range_lock.try_unlock(range);
+
+        /*
         let flushed = self.try_flush().await?;
         // TODO: placehold for pref metrics
         let _ = flushed;
+        */
 
         Ok(bytes_write)
     }
 
-    pub(crate) async fn absorb_write_zero(&mut self, off: usize, len: usize, fetched: Vec<DataBlock>) -> Result<usize> {
-        let mut bytes_write = 0;
-
-        // restore spawn_write permit
-        let opt_permit = self.spawn_write_permit.take();
-        assert!(opt_permit.is_some());
+    pub(crate) async fn absorb_write_zero(&mut self, req: FileReqWriteZero<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
+        let off = req.offset;
+        let len = req.len;
 
         // insert fetched block back to dirty list,
         // for the case: block idx exists on dirty
@@ -369,9 +388,25 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         }
 
         #[cfg(feature = "wal")]
-        if let Some(wal) = &mut self.wal {
-            let _ = wal.write_zero(self.inode.get_last_seq(), off, len).await?;
+        if let Some(_) = &mut self.wal {
+            let fh = req.fh.clone();
+            let ctx = FileContext::write_zero_wal(req, resp);
+            fh.send_highprio(ctx);
+            // TODO: change to ErrorKind::InProgress when it's stable
+            return Err(Error::new(ErrorKind::ResourceBusy, "op resubmit to exec write zero wal"));
         }
+
+        self.absorb_write_zero_bh(req, resp).await
+    }
+
+    pub(crate) async fn absorb_write_zero_bh(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
+        let off = req.offset;
+        let len = req.len;
+        let mut bytes_write = 0;
+
+        // restore spawn_write permit
+        let opt_permit = req.spawn_write_permit.take();
+        assert!(opt_permit.is_some());
 
         let data_block_size = self.config.meta.data_block_size;
         let oldsize = self.inode.size();
@@ -414,9 +449,16 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         self.inode.update_mtime();
         drop(opt_permit);
 
+        #[cfg(feature = "range-lock")]
+        let range = off as u64..(off + len) as u64;
+        #[cfg(feature = "range-lock")]
+        self.range_lock.try_unlock(range);
+
+        /*
         let flushed = self.try_flush().await?;
         // TODO: placehold for pref metrics
         let _ = flushed;
+        */
 
         Ok(bytes_write)
     }
@@ -456,6 +498,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
             let fh = req.fh.clone();
+            #[cfg(feature = "wal")]
+            let ctx = FileContext::write_wal(req, resp);
+            #[cfg(not(feature = "wal"))]
             let ctx = FileContext::write_absorb(req, resp);
             fh.send_highprio(ctx);
         });
@@ -500,6 +545,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
             let fh = req.fh.clone();
+            #[cfg(feature = "wal")]
+            let ctx = FileContext::write_zero_wal(req, resp);
+            #[cfg(not(feature = "wal"))]
             let ctx = FileContext::write_zero_absorb(req, resp);
             fh.send_highprio(ctx);
         });
@@ -514,15 +562,15 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     //
     // for spawn_read/spawn_write resp is based on mpsc channel
     // so use try_send() instead send()
-    pub async fn spawn_write(&mut self, req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
+    pub async fn spawn_write(&mut self, mut req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
         let off = req.offset;
         let buf = req.buf;
         let len = buf.len();
 
         #[cfg(feature = "range-lock")]
-        let range = off as u64..(off + buf.len()) as u64;
+        let range = off as u64..(off + len) as u64;
         #[cfg(feature = "range-lock")]
-        if self.range_lock.try_lock(range.clone()) == false {
+        if self.range_lock.try_lock(range) == false {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write(req, resp);
             fh.send_highprio(ctx);
@@ -530,40 +578,35 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         }
 
         let permit = self.sema.clone().acquire_owned().await.unwrap();
+        req.spawn_write_permit = Some(permit);
 
         debug!("WRITE - off: {}, buf len: {}", off, len);
         let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
             self.spawn_write_retrieve(req, resp, v).await?;
-            self.spawn_write_permit = Some(permit);
             return Ok(len);
         }
 
-        // pass permit through inner fields to next fn
-        self.spawn_write_permit = Some(permit);
-
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
-        let actual_bytes = self.absorb_write(off, buf, Vec::new()).await?;
+        let resp_write = resp.clone_write_resp();
+        let actual_bytes = self.absorb_write(req, resp, Vec::new()).await?;
         assert!(len == actual_bytes);
 
-        #[cfg(feature = "range-lock")]
-        self.range_lock.try_unlock(range);
-
         // kick off response
-        let _ = resp.to_write().try_send(Ok(actual_bytes));
+        let _ = resp_write.try_send(Ok(actual_bytes));
         Ok(len)
     }
 
-    pub async fn spawn_write_zero(&mut self, req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
+    pub async fn spawn_write_zero(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
         let off = req.offset;
         let len = req.len;
 
         #[cfg(feature = "range-lock")]
         let range = off as u64..(off + len) as u64;
         #[cfg(feature = "range-lock")]
-        if self.range_lock.try_lock(range.clone()) == false {
+        if self.range_lock.try_lock(range) == false {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write_zero(req, resp);
             fh.send_highprio(ctx);
@@ -571,29 +614,69 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         }
 
         let permit = self.sema.clone().acquire_owned().await.unwrap();
+        req.spawn_write_permit = Some(permit);
 
         debug!("WRITE ZERO - off: {}, len: {}", off, len);
         let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
             self.spawn_write_zero_retrieve(req, resp, v).await?;
-            self.spawn_write_permit = Some(permit);
             return Ok(len);
         }
 
-        // pass permit through inner fields to next fn
-        self.spawn_write_permit = Some(permit);
-
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
-        let actual_bytes = self.absorb_write_zero(off, len, Vec::new()).await?;
+        let resp_write = resp.clone_write_zero_resp();
+        let actual_bytes = self.absorb_write_zero(req, resp, Vec::new()).await?;
         assert!(len == actual_bytes);
 
-        #[cfg(feature = "range-lock")]
-        self.range_lock.try_unlock(range);
-
         // kick off response
-        let _ = resp.to_write().try_send(Ok(actual_bytes));
+        let _ = resp_write.try_send(Ok(actual_bytes));
+        Ok(len)
+    }
+
+    #[cfg(feature = "wal")]
+    pub async fn spawn_write_wal(&mut self, req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
+        let off = req.offset;
+        let len = req.buf.len();
+        let last_seq = self.inode.get_last_seq();
+        let wal_fut_opt = if let Some(wal) = &mut self.wal {
+            let buf = req.buf;
+            let fut = wal.write(last_seq, off, buf);
+            Some(fut)
+        } else {
+            None
+        };
+        self.rt.as_ref().unwrap().spawn(async move {
+            if let Some(wal_fut) = wal_fut_opt {
+                let _ = wal_fut.await;
+            }
+            let fh = req.fh.clone();
+            let ctx = FileContext::write_absorb_bh(req, resp);
+            fh.send_highprio(ctx);
+        });
+        Ok(len)
+    }
+
+    #[cfg(feature = "wal")]
+    pub async fn spawn_write_zero_wal(&mut self, req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
+        let len = req.len;
+        let off = req.offset;
+        let last_seq = self.inode.get_last_seq();
+        let wal_fut_opt = if let Some(wal) = &mut self.wal {
+            let fut = wal.write_zero(last_seq, off, len);
+            Some(fut)
+        } else {
+            None
+        };
+        self.rt.as_ref().unwrap().spawn(async move {
+            if let Some(wal_fut) = wal_fut_opt {
+                let _ = wal_fut.await;
+            }
+            let fh = req.fh.clone();
+            let ctx = FileContext::write_zero_absorb_bh(req, resp);
+            fh.send_highprio(ctx);
+        });
         Ok(len)
     }
 }

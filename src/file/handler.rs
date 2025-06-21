@@ -1,9 +1,10 @@
 //! impl request handler style IO process
 use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::io::Result;
 #[cfg(feature = "range-lock")]
 use std::io::{Error, ErrorKind};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 use reactor::{Task, TaskHandler};
 use crate::SegmentId;
 use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
@@ -71,6 +72,18 @@ impl FileResp {
     pub fn to_last_cno(self) -> oneshot::Sender<FileRespLastCno> {
         ManuallyDrop::into_inner(unsafe { self.last_cno })
     }
+
+    pub fn clone_write_resp(&self) -> mpsc::Sender<FileRespWrite> {
+        unsafe {
+            self.write.deref().clone()
+        }
+    }
+
+    pub fn clone_write_zero_resp(&self) -> mpsc::Sender<FileRespWriteZero> {
+        unsafe {
+            self.write_zero.deref().clone()
+        }
+    }
 }
 
 // define request params
@@ -84,6 +97,7 @@ pub struct FileReqWrite<'a> {
     pub buf: &'a [u8],
     pub offset: usize,
     pub fetched: Vec<DataBlock>,
+    pub spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
     pub fh: TaskHandler<FileContext<'a>>,
 }
 
@@ -91,6 +105,7 @@ pub struct FileReqWriteZero<'a> {
     pub offset: usize,
     pub len: usize,
     pub fetched: Vec<DataBlock>,
+    pub spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
     pub fh: TaskHandler<FileContext<'a>>,
 }
 
@@ -124,14 +139,20 @@ pub enum FileReqOp {
     Read,
     Write,
     WriteAbsorb,
+    WriteAbsorbBh,
     WriteZero,
     WriteZeroAbsorb,
+    WriteZeroAbsorbBh,
     WriteAlignedBatch,
     WriteBatch,
     Trunc,
     Flush,
     Release,
     LastCno,
+    #[cfg(feature = "wal")]
+    WriteWal,
+    #[cfg(feature = "wal")]
+    WriteZeroWal,
 }
 
 #[repr(C)]
@@ -209,12 +230,21 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let req = FileReq { 
             op: FileReqOp::Write,
-            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, fh: fh, fetched: Vec::new(), }), },
+            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, spawn_write_permit: None, fh: fh, fetched: Vec::new(), }), },
         };
         let resp = FileResp {
             write: ManuallyDrop::new(tx.clone()),
         };
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn write_wal(req: FileReqWrite<'a>, resp: FileResp) -> Self {
+        let new_req = FileReq {
+            op: FileReqOp::WriteWal,
+            body: FileReqBody { write: ManuallyDrop::new(req), },
+        };
+        Self { req: Some(new_req), resp: Some(resp), }
     }
 
     // convert context from op Write to op WriteAbsorb
@@ -226,12 +256,20 @@ impl<'a> FileContext<'a> {
         Self { req: Some(new_req), resp: Some(resp), }
     }
 
+    pub fn write_absorb_bh(req: FileReqWrite<'a>, resp: FileResp) -> Self {
+        let new_req = FileReq {
+            op: FileReqOp::WriteAbsorbBh,
+            body: FileReqBody { write: ManuallyDrop::new(req), },
+        };
+        Self { req: Some(new_req), resp: Some(resp), }
+    }
+
     // return both tx and rx, for mpsc channel we need to keep tx until we receved response
     pub fn new_write_zero(offset: usize, len: usize, fh: TaskHandler<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>) {
         let (tx, rx) = mpsc::channel::<FileRespWriteZero>(1);
         let req = FileReq {
             op: FileReqOp::WriteZero,
-            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, fh: fh, fetched: Vec::new(), }), },
+            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, spawn_write_permit: None, fh: fh, fetched: Vec::new(), }), },
         };
         let resp = FileResp {
             write_zero: ManuallyDrop::new(tx.clone()),
@@ -239,10 +277,27 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
     }
 
+    #[cfg(feature = "wal")]
+    pub fn write_zero_wal(req: FileReqWriteZero<'a>, resp: FileResp) -> Self {
+        let new_req = FileReq {
+            op: FileReqOp::WriteZeroWal,
+            body: FileReqBody { write_zero: ManuallyDrop::new(req), },
+        };
+        Self { req: Some(new_req), resp: Some(resp), }
+    }
+
     // convert context from op Write to op WriteAbsorb
     pub fn write_zero_absorb(req: FileReqWriteZero<'a>, resp: FileResp) -> Self {
         let new_req = FileReq {
             op: FileReqOp::WriteZeroAbsorb,
+            body: FileReqBody { write_zero: ManuallyDrop::new(req), },
+        };
+        Self { req: Some(new_req), resp: Some(resp), }
+    }
+
+    pub fn write_zero_absorb_bh(req: FileReqWriteZero<'a>, resp: FileResp) -> Self {
+        let new_req = FileReq {
+            op: FileReqOp::WriteZeroAbsorbBh,
             body: FileReqBody { write_zero: ManuallyDrop::new(req), },
         };
         Self { req: Some(new_req), resp: Some(resp), }
@@ -398,6 +453,32 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 };
                 let res = self.inner.spawn_write(req, resp).await;
                 match res {
+                    Ok(bytes) => {
+                        let _ = resp_write.try_send(Ok(bytes));
+                    },
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            #[cfg(feature = "range-lock")]
+                            self.inner.range_lock.try_unlock(range);
+                            let _ = resp_write.try_send(res);
+                        }
+                    },
+                }
+            },
+            #[cfg(feature = "wal")]
+            FileReqOp::WriteWal => {
+                let md = unsafe { req.body.write };
+                let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                let range = req.offset as u64..(req.offset + req.buf.len()) as u64;
+                // prepare error response handler
+                let _resp_write = resp.to_write();
+                let resp_write = _resp_write.clone();
+                let resp = FileResp {
+                    write: ManuallyDrop::new(_resp_write),
+                };
+                let res = self.inner.spawn_write_wal(req, resp).await;
+                match res {
                     Ok(_) => {},
                     Err(ref e) => {
                         if e.kind() != ErrorKind::ResourceBusy {
@@ -412,15 +493,38 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let md = unsafe { req.body.write };
                 let mut req = ManuallyDrop::into_inner(md);
                 let off = req.offset;
-                let buf = req.buf;
+                let len = req.buf.len();
+                let _resp_write = resp.to_write();
+                let resp_write = _resp_write.clone();
+                let resp = FileResp {
+                    write: ManuallyDrop::new(_resp_write),
+                };
                 let mut fetched = Vec::new();
                 fetched.append(&mut req.fetched);
-                let res = self.inner.absorb_write(off, buf, fetched).await;
-                #[cfg(feature = "range-lock")]
-                let range = off as u64..(off + buf.len()) as u64;
-                #[cfg(feature = "range-lock")]
-                self.inner.range_lock.try_unlock(range);
-                let _ = resp.to_write().try_send(res);
+                let res = self.inner.absorb_write(req, resp, fetched).await;
+                match res {
+                    Ok(_) => {},
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            #[cfg(feature = "range-lock")]
+                            let range = off as u64..(off + len) as u64;
+                            #[cfg(feature = "range-lock")]
+                            self.inner.range_lock.try_unlock(range);
+                            let _ = resp_write.try_send(res);
+                        }
+                    },
+                }
+            },
+            FileReqOp::WriteAbsorbBh => {
+                let md = unsafe { req.body.write };
+                let mut req = ManuallyDrop::into_inner(md);
+                let _resp_write = resp.to_write();
+                let resp_write = _resp_write.clone();
+                let resp = FileResp {
+                    write: ManuallyDrop::new(_resp_write),
+                };
+                let res = self.inner.absorb_write_bh(req, resp).await;
+                let _ = resp_write.try_send(res);
             },
             FileReqOp::WriteZero => {
                 let md = unsafe { req.body.write_zero };
@@ -428,12 +532,38 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 #[cfg(feature = "range-lock")]
                 let range = req.offset as u64..(req.offset + req.len) as u64;
                 // prepare error response handler
-                let _resp_write = resp.to_write();
+                let _resp_write = resp.to_write_zero();
                 let resp_write = _resp_write.clone();
                 let resp = FileResp {
-                    write: ManuallyDrop::new(_resp_write),
+                    write_zero: ManuallyDrop::new(_resp_write),
                 };
                 let res = self.inner.spawn_write_zero(req, resp).await;
+                match res {
+                    Ok(bytes) => {
+                        let _ = resp_write.try_send(Ok(bytes));
+                    },
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            #[cfg(feature = "range-lock")]
+                            self.inner.range_lock.try_unlock(range);
+                            let _ = resp_write.try_send(res);
+                        }
+                    },
+                }
+            },
+            #[cfg(feature = "wal")]
+            FileReqOp::WriteZeroWal => {
+                let md = unsafe { req.body.write_zero };
+                let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                let range = req.offset as u64..(req.offset + req.len) as u64;
+                // prepare error response handler
+                let _resp_write = resp.to_write_zero();
+                let resp_write = _resp_write.clone();
+                let resp = FileResp {
+                    write_zero: ManuallyDrop::new(_resp_write),
+                };
+                let res = self.inner.spawn_write_zero_wal(req, resp).await;
                 match res {
                     Ok(_) => {},
                     Err(ref e) => {
@@ -450,14 +580,37 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let mut req = ManuallyDrop::into_inner(md);
                 let off = req.offset;
                 let len = req.len;
+                let _resp_write = resp.to_write_zero();
+                let resp_write = _resp_write.clone();
+                let resp = FileResp {
+                    write_zero: ManuallyDrop::new(_resp_write),
+                };
                 let mut fetched = Vec::new();
                 fetched.append(&mut req.fetched);
-                let res = self.inner.absorb_write_zero(off, len, fetched).await;
-                #[cfg(feature = "range-lock")]
-                let range = off as u64..(off + len) as u64;
-                #[cfg(feature = "range-lock")]
-                self.inner.range_lock.try_unlock(range);
-                let _ = resp.to_write().try_send(res);
+                let res = self.inner.absorb_write_zero(req, resp, fetched).await;
+                match res {
+                    Ok(_) => {},
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            #[cfg(feature = "range-lock")]
+                            let range = off as u64..(off + len) as u64;
+                            #[cfg(feature = "range-lock")]
+                            self.inner.range_lock.try_unlock(range);
+                            let _ = resp_write.try_send(res);
+                        }
+                    },
+                }
+            },
+            FileReqOp::WriteZeroAbsorbBh => {
+                let md = unsafe { req.body.write_zero };
+                let mut req = ManuallyDrop::into_inner(md);
+                let _resp_write = resp.to_write_zero();
+                let resp_write = _resp_write.clone();
+                let resp = FileResp {
+                    write_zero: ManuallyDrop::new(_resp_write),
+                };
+                let res = self.inner.absorb_write_zero_bh(req, resp).await;
+                let _ = resp_write.try_send(res);
             },
             FileReqOp::WriteAlignedBatch => {
                 let md = unsafe { req.body.write_aligned_batch };

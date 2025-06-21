@@ -90,18 +90,25 @@ impl S3Wal {
 }
 
 impl WalReadWrite for S3Wal {
-    fn write<'a>(&'a mut self, segid: SegmentId, offset: usize, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    fn write(&mut self, segid: SegmentId, offset: usize, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
         let key = self.encode(segid, offset, buf.len());
+        let buf_dup = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len())
+        };
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
         Box::pin(async move {
-            S3Ops::do_put_object(&self.client, &self.bucket, &key, buf, &None).await.and(Ok(()))
+            S3Ops::do_put_object(&client, &bucket, &key, buf_dup, &None).await.and(Ok(()))
         })
     }
 
-    fn write_zero(&mut self, segid: SegmentId, offset: usize, len: usize) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn write_zero(&mut self, segid: SegmentId, offset: usize, len: usize) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
         let key = self.encode(segid, offset, len);
-        let zero: Vec<u8> = Vec::new();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
         Box::pin(async move {
-            S3Ops::do_put_object(&self.client, &self.bucket, &key, &zero, &None).await.and(Ok(()))
+            let zero: Vec<u8> = Vec::new();
+            S3Ops::do_put_object(&client, &bucket, &key, &zero, &None).await.and(Ok(()))
         })
     }
 

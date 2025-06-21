@@ -43,8 +43,6 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     #[cfg(feature = "range-lock")]
     pub(crate) range_lock: RangeLock,
     #[cfg(feature = "reactor")]
-    pub(crate) spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
-    #[cfg(feature = "reactor")]
     pub(crate) rt: Option<tokio::runtime::Runtime>,
     #[cfg(feature = "wal")]
     pub(crate) wal: Option<Box<dyn WalReadWrite + Send>>,
@@ -89,9 +87,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             Semaphore::MAX_PERMITS
         } else {
             #[cfg(feature = "range-lock")]
-            Semaphore::MAX_PERMITS
+            { Semaphore::MAX_PERMITS }
             #[cfg(not(feature = "range-lock"))]
-            1
+            { 1 }
         };
 
         let data_cache_blocks = if flags.is_direct() {
@@ -123,8 +121,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(permits)),
-            #[cfg(feature = "reactor")]
-            spawn_write_permit: None,
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
@@ -188,9 +184,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             Semaphore::MAX_PERMITS
         } else {
             #[cfg(feature = "range-lock")]
-            Semaphore::MAX_PERMITS
+            { Semaphore::MAX_PERMITS }
             #[cfg(not(feature = "range-lock"))]
-            1
+            { 1 }
         };
 
         let data_cache_blocks = if flags.is_direct() {
@@ -226,8 +222,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(permits)),
-            #[cfg(feature = "reactor")]
-            spawn_write_permit: None,
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
