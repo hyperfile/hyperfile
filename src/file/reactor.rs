@@ -1,9 +1,7 @@
 //! IO function used by LocalSpawner reactor
 use std::io::{Result, ErrorKind};
-#[cfg(feature = "range-lock")]
+#[cfg(any(feature = "wal", feature = "range-lock"))]
 use std::io::Error;
-#[cfg(feature = "range-lock")]
-use std::mem::ManuallyDrop;
 use log::{debug, warn};
 use btree_ondisk::BlockLoader;
 use tokio::task::JoinHandle;
@@ -13,12 +11,8 @@ use crate::segment::SegmentReadWrite;
 use crate::file::HyperTrait;
 use crate::meta_format::BlockPtrFormat;
 use crate::buffer::DataBlock;
-#[cfg(feature = "wal")]
-use crate::wal::WalReadWrite;
 use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
-#[cfg(feature = "range-lock")]
-use super::handler::{FileReqOp, FileReq, FileReqBody};
 
 enum SpawnReadSize {
     ImmSize(usize),
@@ -289,9 +283,6 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     }
 
     pub(crate) async fn absorb_write(&mut self, req: FileReqWrite<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
-        let off = req.offset;
-        let len = req.buf.len();
-
         // insert fetched block back to dirty list,
         // for the case: block idx exists on dirty
         // means some other writes success before this write, let's ignore feched data and go ahead
@@ -360,22 +351,22 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         self.range_lock.try_unlock(range);
 
         if self.need_flush() {
-            if cfg!(feature = "wal") {
+            #[cfg(feature = "wal")]
+            {
                 let fh = req.fh.clone();
                 let ctx = FileContext::new_wal_flush();
                 fh.send_highprio(ctx);
-            } else {
-                self.flush().await?;
             }
+            #[cfg(not(feature = "wal"))]
+            self.flush().await?;
         }
+        // consume resp
+        let _ = resp.to_write();
 
         Ok(bytes_write)
     }
 
     pub(crate) async fn absorb_write_zero(&mut self, req: FileReqWriteZero<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
-        let off = req.offset;
-        let len = req.len;
-
         // insert fetched block back to dirty list,
         // for the case: block idx exists on dirty
         // means some other writes success before this write, let's ignore feched data and go ahead
@@ -459,14 +450,17 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         self.range_lock.try_unlock(range);
 
         if self.need_flush() {
-            if cfg!(feature = "wal") {
+            #[cfg(feature = "wal")]
+            {
                 let fh = req.fh.clone();
                 let ctx = FileContext::new_wal_flush();
                 fh.send_highprio(ctx);
-            } else {
-                self.flush().await?;
             }
+            #[cfg(not(feature = "wal"))]
+            self.flush().await?;
         }
+        // consume resp
+        let _ = resp.to_write_zero();
 
         Ok(bytes_write)
     }

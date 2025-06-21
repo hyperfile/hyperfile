@@ -3,9 +3,7 @@ use std::pin::Pin;
 use std::io::{Result, Error, ErrorKind};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use bytes::BytesMut;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::types::Object;
 use crate::buffer::BatchDataBlockWrapper;
 use crate::{segment::Segment, SegmentId};
 use crate::s3commons::S3Ops;
@@ -16,7 +14,9 @@ pub(crate) struct S3Wal {
     pub(crate) client: Client,
     pub(crate) bucket: String,
     pub(crate) root_path: String,
+    #[allow(dead_code)]
     pub(crate) root_path_slash: String,  // root path with tail slash
+    #[allow(dead_code)]
     pub(crate) data_block_size: usize,
     pub(crate) last_segid: SegmentId,
     pub(crate) seq: Arc<AtomicU64>,
@@ -71,6 +71,7 @@ impl S3Wal {
 
     // return: (seq, offset, len)
     #[inline]
+    #[allow(dead_code)]
     fn decode(&self, objname: &str) -> Option<(usize, usize, usize)> {
         let parts: Vec<&str> = objname.split('_').collect();
         if parts.len() != 3 {
@@ -112,7 +113,8 @@ impl WalReadWrite for S3Wal {
         })
     }
 
-    fn collect(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Vec<BatchDataBlockWrapper>>> + Send + '_>> {
+    #[allow(dead_code)]
+    fn collect(&self, _segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Vec<BatchDataBlockWrapper>>> + Send + '_>> {
         todo!();
     }
 }
