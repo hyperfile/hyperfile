@@ -1,6 +1,8 @@
 //! impl request handler style IO process
 use std::mem::ManuallyDrop;
 use std::io::Result;
+#[cfg(feature = "range-lock")]
+use std::io::{Error, ErrorKind};
 use tokio::sync::{mpsc, oneshot};
 use reactor::{Task, TaskHandler};
 use crate::SegmentId;
@@ -75,20 +77,21 @@ impl FileResp {
 pub struct FileReqRead<'a> {
     pub buf: &'a mut [u8],
     pub offset: usize,
+    pub fh: TaskHandler<FileContext<'a>>,
 }
 
 pub struct FileReqWrite<'a> {
     pub buf: &'a [u8],
     pub offset: usize,
     pub fetched: Vec<DataBlock>,
-    pub absorb_fh: TaskHandler<FileContext<'a>>,
+    pub fh: TaskHandler<FileContext<'a>>,
 }
 
 pub struct FileReqWriteZero<'a> {
     pub offset: usize,
     pub len: usize,
     pub fetched: Vec<DataBlock>,
-    pub absorb_fh: TaskHandler<FileContext<'a>>,
+    pub fh: TaskHandler<FileContext<'a>>,
 }
 
 pub struct FileReqWriteAlignedBatch {
@@ -189,11 +192,11 @@ impl<'a> FileContext<'a> {
     }
 
     // return both tx and rx, for mpsc channel we need to keep tx until we receved response
-    pub fn new_read(buf: &'a mut [u8], offset: usize) -> (Self, mpsc::Sender<FileRespRead>, mpsc::Receiver<FileRespRead>) {
+    pub fn new_read(buf: &'a mut [u8], offset: usize, fh: TaskHandler<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespRead>, mpsc::Receiver<FileRespRead>) {
         let (tx, rx) = mpsc::channel::<FileRespRead>(1);
         let req = FileReq { 
             op: FileReqOp::Read,
-            body: FileReqBody { read: ManuallyDrop::new(FileReqRead { buf: buf, offset: offset }), },
+            body: FileReqBody { read: ManuallyDrop::new(FileReqRead { buf: buf, offset: offset, fh: fh }), },
         };
         let resp = FileResp {
             read: ManuallyDrop::new(tx.clone()),
@@ -206,7 +209,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let req = FileReq { 
             op: FileReqOp::Write,
-            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, absorb_fh: fh, fetched: Vec::new(), }), },
+            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, fh: fh, fetched: Vec::new(), }), },
         };
         let resp = FileResp {
             write: ManuallyDrop::new(tx.clone()),
@@ -228,7 +231,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWriteZero>(1);
         let req = FileReq {
             op: FileReqOp::WriteZero,
-            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, absorb_fh: fh, fetched: Vec::new(), }), },
+            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, fh: fh, fetched: Vec::new(), }), },
         };
         let resp = FileResp {
             write_zero: ManuallyDrop::new(tx.clone()),
@@ -316,6 +319,30 @@ impl<'a> FileContext<'a> {
         };
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
+
+    pub fn reform_read(req: FileReqRead<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::Read,
+            body: FileReqBody { read: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    pub fn reform_write(req: FileReqWrite<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::Write,
+            body: FileReqBody { write: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    pub fn reform_write_zero(req: FileReqWriteZero<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::WriteZero,
+            body: FileReqBody { write_zero: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
 }
 
 impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
@@ -338,6 +365,8 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::Read => {
                 let md = unsafe { req.body.read };
                 let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                let range = req.offset as u64..(req.offset + req.buf.len()) as u64;
                 // prepare error response handler
                 let _resp_read = resp.to_read();
                 let resp_read = _resp_read.clone();
@@ -345,13 +374,22 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     read: ManuallyDrop::new(_resp_read),
                 };
                 let res = self.inner.spawn_read(req, resp).await;
-                if res.is_err() {
-                    let _ = resp_read.try_send(res);
+                match res {
+                    Ok(_) => {}
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            #[cfg(feature = "range-lock")]
+                            self.inner.range_lock.try_unlock(range);
+                            let _ = resp_read.try_send(res);
+                        }
+                    },
                 }
             },
             FileReqOp::Write => {
                 let md = unsafe { req.body.write };
                 let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                let range = req.offset as u64..(req.offset + req.buf.len()) as u64;
                 // prepare error response handler
                 let _resp_write = resp.to_write();
                 let resp_write = _resp_write.clone();
@@ -359,8 +397,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     write: ManuallyDrop::new(_resp_write),
                 };
                 let res = self.inner.spawn_write(req, resp).await;
-                if res.is_err() {
-                    let _ = resp_write.try_send(res);
+                match res {
+                    Ok(_) => {},
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            #[cfg(feature = "range-lock")]
+                            self.inner.range_lock.try_unlock(range);
+                            let _ = resp_write.try_send(res);
+                        }
+                    },
                 }
             },
             FileReqOp::WriteAbsorb => {
@@ -371,11 +416,17 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let mut fetched = Vec::new();
                 fetched.append(&mut req.fetched);
                 let res = self.inner.absorb_write(off, buf, fetched).await;
+                #[cfg(feature = "range-lock")]
+                let range = off as u64..(off + buf.len()) as u64;
+                #[cfg(feature = "range-lock")]
+                self.inner.range_lock.try_unlock(range);
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::WriteZero => {
                 let md = unsafe { req.body.write_zero };
                 let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                let range = req.offset as u64..(req.offset + req.len) as u64;
                 // prepare error response handler
                 let _resp_write = resp.to_write();
                 let resp_write = _resp_write.clone();
@@ -383,8 +434,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     write: ManuallyDrop::new(_resp_write),
                 };
                 let res = self.inner.spawn_write_zero(req, resp).await;
-                if res.is_err() {
-                    let _ = resp_write.try_send(res);
+                match res {
+                    Ok(_) => {},
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            #[cfg(feature = "range-lock")]
+                            self.inner.range_lock.try_unlock(range);
+                            let _ = resp_write.try_send(res);
+                        }
+                    },
                 }
             },
             FileReqOp::WriteZeroAbsorb => {
@@ -395,6 +453,10 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let mut fetched = Vec::new();
                 fetched.append(&mut req.fetched);
                 let res = self.inner.absorb_write_zero(off, len, fetched).await;
+                #[cfg(feature = "range-lock")]
+                let range = off as u64..(off + len) as u64;
+                #[cfg(feature = "range-lock")]
+                self.inner.range_lock.try_unlock(range);
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::WriteAlignedBatch => {

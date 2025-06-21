@@ -101,7 +101,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
         let b = unsafe {
             std::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
         };
-        let (ctx, tx, mut rx) = FileContext::new_read(b, off);
+        let (ctx, tx, mut rx) = FileContext::new_read(b, off, self.inner.clone());
         self.inner.send(ctx);
         let res = rx.recv().await.expect("task channel closed");
         drop(tx);

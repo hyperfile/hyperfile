@@ -21,6 +21,8 @@ use crate::wal::WalReadWrite;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
+#[cfg(feature = "range-lock")]
+use super::lock::RangeLock;
 
 pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) staging: T,
@@ -38,6 +40,8 @@ pub struct HyperFile<'a, T, L: BlockLoader<BlockPtr>> {
     pub(crate) flags: HyperFileFlags,
     pub(crate) last_flush: Instant,
     pub(crate) sema: Arc<Semaphore>,
+    #[cfg(feature = "range-lock")]
+    pub(crate) range_lock: RangeLock,
     #[cfg(feature = "reactor")]
     pub(crate) spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
     #[cfg(feature = "reactor")]
@@ -84,6 +88,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let permits = if flags.is_rdonly() {
             Semaphore::MAX_PERMITS
         } else {
+            #[cfg(feature = "range-lock")]
+            Semaphore::MAX_PERMITS
+            #[cfg(not(feature = "range-lock"))]
             1
         };
 
@@ -95,6 +102,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
 
         #[cfg(feature = "wal")]
         let wal = config.wal.to_wal(config.meta.data_block_size, inode.get_last_seq())?;
+
+        #[cfg(feature = "range-lock")]
+        let range_lock = RangeLock::new();
 
         use std::num::NonZeroUsize;
         let mut file = Self {
@@ -119,6 +129,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
             wal: wal,
+            #[cfg(feature = "range-lock")]
+            range_lock: range_lock,
         };
         // flush inode for hyper file new created
         let _ = file.flush_inode(FlushInodeFlag::Create).await?;
@@ -175,6 +187,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let permits = if flags.is_rdonly() {
             Semaphore::MAX_PERMITS
         } else {
+            #[cfg(feature = "range-lock")]
+            Semaphore::MAX_PERMITS
+            #[cfg(not(feature = "range-lock"))]
             1
         };
 
@@ -190,6 +205,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
         let inode = Inode::from_raw(&raw_inode, inode_state);
         #[cfg(feature = "wal")]
         let wal = config.wal.to_wal(config.meta.data_block_size, inode.get_last_seq())?;
+
+        #[cfg(feature = "range-lock")]
+        let range_lock = RangeLock::new();
 
         use std::num::NonZeroUsize;
         let mut file = Self {
@@ -214,6 +232,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
             wal: wal,
+            #[cfg(feature = "range-lock")]
+            range_lock: range_lock,
         };
         // refresh bmap if need to do recovery
         let _ = file.refresh_bmap().await?;

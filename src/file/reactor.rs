@@ -1,5 +1,9 @@
 //! IO function used by LocalSpawner reactor
 use std::io::{Result, ErrorKind};
+#[cfg(feature = "range-lock")]
+use std::io::Error;
+#[cfg(feature = "range-lock")]
+use std::mem::ManuallyDrop;
 use log::{debug, warn};
 use btree_ondisk::BlockLoader;
 use tokio::task::JoinHandle;
@@ -11,6 +15,8 @@ use crate::meta_format::BlockPtrFormat;
 use crate::buffer::DataBlock;
 use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
+#[cfg(feature = "range-lock")]
+use super::handler::{FileReqOp, FileReq, FileReqBody};
 
 enum SpawnReadSize {
     ImmSize(usize),
@@ -205,19 +211,32 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     // so use try_send() instead send()
     pub async fn spawn_read(&mut self, req: FileReqRead<'a>, resp: FileResp) -> Result<usize> {
         let off = req.offset;
+        let len = req.buf.len();
+
+        #[cfg(feature = "range-lock")]
+        let range = off as u64..(off + len) as u64;
+        #[cfg(feature = "range-lock")]
+        if self.range_lock.try_lock(range.clone()) == false {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_read(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
+        }
         let mut buf = req.buf;
 
         let _permit = self.sema.clone().acquire_owned().await.unwrap();
 
-        debug!("READ - off: {}, buf len: {}", off, buf.len());
+        debug!("READ - off: {}, buf len: {}", off, len);
         if off >= self.inode.size() {
+            #[cfg(feature = "range-lock")]
+            self.range_lock.try_unlock(range);
             let _ = resp.to_read().try_send(Ok(0));
             return Ok(0);
         }
         // if requested buffer exceed file size, cut off tailing buffer
-        if off + buf.len() > self.inode.size() {
-            let exceeded_len = off + buf.len() - self.inode.size();
-            let mid = buf.len() - exceeded_len;
+        if off + len > self.inode.size() {
+            let exceeded_len = off + len - self.inode.size();
+            let mid = len - exceeded_len;
             debug!("READ - buf len shrink to: {}, due to file size {}", mid, self.inode.size());
             (buf, _) = buf.split_at_mut(mid);
         }
@@ -236,6 +255,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             if actual_bytes > 0 {
                 self.inode.update_atime();
             }
+            #[cfg(feature = "range-lock")]
+            self.range_lock.try_unlock(range);
             let _ = resp.to_read().try_send(Ok(actual_bytes));
             return Ok(total_bytes);
         }
@@ -244,6 +265,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         if total_bytes > 0 {
             self.inode.update_atime();
         }
+
+        #[cfg(feature = "range-lock")]
+        let mut range_lock = self.range_lock.clone();
         self.rt.as_ref().unwrap().spawn(async move {
             let mut actual_bytes = 0;
             while let Some(join) = joins.pop() {
@@ -254,6 +278,8 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
                 actual_bytes += bytes;
             }
             assert!(total_bytes == actual_bytes);
+            #[cfg(feature = "range-lock")]
+            range_lock.unlock(range).await;
             let _ = resp.to_read().try_send(Ok(actual_bytes));
         });
 
@@ -429,7 +455,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
-            let fh = req.absorb_fh.clone();
+            let fh = req.fh.clone();
             let ctx = FileContext::write_absorb(req, resp);
             fh.send_highprio(ctx);
         });
@@ -473,7 +499,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
             }
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
-            let fh = req.absorb_fh.clone();
+            let fh = req.fh.clone();
             let ctx = FileContext::write_zero_absorb(req, resp);
             fh.send_highprio(ctx);
         });
@@ -492,6 +518,16 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let off = req.offset;
         let buf = req.buf;
         let len = buf.len();
+
+        #[cfg(feature = "range-lock")]
+        let range = off as u64..(off + buf.len()) as u64;
+        #[cfg(feature = "range-lock")]
+        if self.range_lock.try_lock(range.clone()) == false {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
+        }
 
         let permit = self.sema.clone().acquire_owned().await.unwrap();
 
@@ -512,6 +548,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         let actual_bytes = self.absorb_write(off, buf, Vec::new()).await?;
         assert!(len == actual_bytes);
 
+        #[cfg(feature = "range-lock")]
+        self.range_lock.try_unlock(range);
+
         // kick off response
         let _ = resp.to_write().try_send(Ok(actual_bytes));
         Ok(len)
@@ -520,6 +559,16 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
     pub async fn spawn_write_zero(&mut self, req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
         let off = req.offset;
         let len = req.len;
+
+        #[cfg(feature = "range-lock")]
+        let range = off as u64..(off + len) as u64;
+        #[cfg(feature = "range-lock")]
+        if self.range_lock.try_lock(range.clone()) == false {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write_zero(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
+        }
 
         let permit = self.sema.clone().acquire_owned().await.unwrap();
 
@@ -539,6 +588,9 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
         // this is HAPPY PATH, continue on this runtime
         let actual_bytes = self.absorb_write_zero(off, len, Vec::new()).await?;
         assert!(len == actual_bytes);
+
+        #[cfg(feature = "range-lock")]
+        self.range_lock.try_unlock(range);
 
         // kick off response
         let _ = resp.to_write().try_send(Ok(actual_bytes));

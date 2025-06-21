@@ -164,7 +164,7 @@ impl AsyncRead for HyperFileTokio<'_> {
                 let buf_mut_ref = unsafe {
                     std::slice::from_raw_parts_mut(me.read_buf.as_ptr() as *mut u8, me.read_buf.len())
                 };
-                let (ctx, tx, rx) = FileContext::new_read(buf_mut_ref, me.pos as usize);
+                let (ctx, tx, rx) = FileContext::new_read(buf_mut_ref, me.pos as usize, me.inner.clone());
                 me.inner.send(ctx);
                 me.state = State::Busy(Operation::Read((tx, rx)));
                 cx.waker().wake_by_ref();

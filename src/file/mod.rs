@@ -11,6 +11,8 @@ pub mod fs;
 pub mod fh;
 #[cfg(feature = "reactor")]
 pub mod tokio_wrapper;
+#[cfg(feature = "range-lock")]
+pub mod lock;
 
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
