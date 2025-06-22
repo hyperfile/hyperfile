@@ -67,7 +67,7 @@ impl<T, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
     }
 }
 
-impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
     {
         let meta_config = config.meta.clone();
@@ -678,7 +678,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     }
 }
 
-impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<L> + SegmentReadWrite + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     // we only care about incomplete blocks and not in dirty list
     // return:
     //   - vec of data block ptr we need to retrieve
@@ -836,7 +836,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + 'static, L: BlockLoader<
     }
 }
 
-impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     // write in batch style, input blocks could be incomplete
     pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
         if blocks.len() == 0 {
@@ -983,7 +983,7 @@ impl<'a: 'static, T: Staging<T, L> + SegmentReadWrite + Send + Clone + 'static, 
 
 impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
     where
-        T: Staging<T, L> + SegmentReadWrite,
+        T: Staging<L> + SegmentReadWrite,
         L: BlockLoader<BlockPtr> + Clone,
 {
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {

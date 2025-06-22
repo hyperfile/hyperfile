@@ -60,7 +60,7 @@ impl<'a> DirtyDataBlocks<'a> {
     }
 }
 
-pub trait HyperTrait<T: Staging<T, L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone, V: Copy + Default + std::fmt::Display + NodeValue + 'static> {
+pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite, L: BlockLoader<BlockPtr> + Clone, V: Copy + Default + std::fmt::Display + NodeValue + 'static> {
     // block ptr
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr;
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset);

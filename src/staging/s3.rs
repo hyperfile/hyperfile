@@ -31,7 +31,7 @@ pub struct S3Staging {
     pub interceptor: Option<Arc<dyn StagingIntercept<Self>>>,
 }
 
-impl Staging<S3Staging, S3BlockLoader> for S3Staging {
+impl Staging<S3BlockLoader> for S3Staging {
     fn to_block_loader(&self) -> S3BlockLoader {
         S3BlockLoader::new(&self.client, &self.bucket, &self.root_path)
     }

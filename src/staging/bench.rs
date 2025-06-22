@@ -7,7 +7,7 @@ use crate::segment::SegmentReadWrite;
 use crate::config::HyperFileMetaConfig;
 use btree_ondisk::BlockLoader;
 
-pub async fn do_staging_benchmark_write<T: Staging<T, L> + SegmentReadWrite, L: BlockLoader<BlockPtr>>(staging: &T, segid: &mut SegmentId, buf: &[u8], iter: u64) -> Result<()> {
+pub async fn do_staging_benchmark_write<T: Staging<L> + SegmentReadWrite, L: BlockLoader<BlockPtr>>(staging: &T, segid: &mut SegmentId, buf: &[u8], iter: u64) -> Result<()> {
     let mut total = Duration::new(0, 0);
     for _ in 0..iter {
         let hyper_file_config = HyperFileMetaConfig::default();
@@ -23,7 +23,7 @@ pub async fn do_staging_benchmark_write<T: Staging<T, L> + SegmentReadWrite, L: 
     Ok(())
 }
 
-pub async fn do_staging_benchmark_read<T: Staging<T, L> + SegmentReadWrite, L: BlockLoader<BlockPtr>>(staging: &T, segid: &mut SegmentId, buf: &mut [u8], iter: u64) -> Result<()> {
+pub async fn do_staging_benchmark_read<T: Staging<L> + SegmentReadWrite, L: BlockLoader<BlockPtr>>(staging: &T, segid: &mut SegmentId, buf: &mut [u8], iter: u64) -> Result<()> {
     let mut total = Duration::new(0, 0);
     for _ in 0..iter {
         let start = Instant::now();
@@ -36,7 +36,7 @@ pub async fn do_staging_benchmark_read<T: Staging<T, L> + SegmentReadWrite, L: B
     Ok(())
 }
 
-pub async fn do_staging_benchmark<T: Staging<T, L> + SegmentReadWrite, L: BlockLoader<BlockPtr>>(staging: T, iter: u64, bit_shift: Range<usize>, force_clean: bool) -> Result<()> {
+pub async fn do_staging_benchmark<T: Staging<L> + SegmentReadWrite, L: BlockLoader<BlockPtr>>(staging: T, iter: u64, bit_shift: Range<usize>, force_clean: bool) -> Result<()> {
 
     if force_clean {
         print!("Staging benchmark force cleanup ...");
