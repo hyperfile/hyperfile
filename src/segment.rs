@@ -220,7 +220,7 @@ impl<T: SegmentReadWrite> Writer<T> {
         self.ctx.append(self.segid, buf)
     }
 
-    pub async fn done(&self) -> Result<()> {
+    pub async fn done(self) -> Result<()> {
         self.ctx.done(self.segid, &self.data, self.offset).await
     }
 }
