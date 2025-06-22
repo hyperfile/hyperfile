@@ -21,6 +21,10 @@ use log::{info, debug, warn};
 use tokio::sync::OwnedSemaphorePermit;
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
 use btree_ondisk::btree::BtreeNodeDirty;
+#[cfg(feature = "reactor")]
+use ::reactor::TaskHandler;
+#[cfg(feature = "reactor")]
+use crate::file::handler::FileContext;
 use crate::*;
 use crate::buffer::DataBlock;
 use crate::{BlockIndex, BlockPtr};
@@ -198,8 +202,282 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         Ok(self.inode().get_last_seq())
     }}
 
+    fn flush_process_pre_build_segment(&self) -> impl Future<Output = Result<(SegmentId, DirtyDataBlocks<'_>)>> {async {
+        let dirty_data_blocks = self.get_data_blocks_dirty();
+
+        if dirty_data_blocks.len() == 0 && !self.bmap_dirty() {
+            if self.inode().is_attr_dirty() {
+                debug!("inode attr is dirty, flush inode ONLY");
+                let b = self.bmap_get_raw();
+                let raw_inode = self.inode().to_raw(b);
+                let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), self.inode().get_ondisk_state(), FlushInodeFlag::Update).await?;
+                self.inode_mut().clear_attr_dirty();
+                self.inode_mut().set_ondisk_state(od_state);
+                let last_cno = self.inode().get_last_cno();
+                self.inode_mut().set_last_ondisk_cno(last_cno);
+            }
+            debug!("flush quit, NO dirty data blocks amd bmap is NOT dirty");
+            let segid = self.inode().get_last_seq();
+            return Ok((segid, DirtyDataBlocks { inner: None, owned: None }));
+        }
+        Ok((0, dirty_data_blocks))
+    }}
+
+    fn flush_process_build_segment(&self, dirty_data_blocks: DirtyDataBlocks<'_>)
+            -> impl Future<Output = Result<(segment::Writer<T>, SegmentId, InodeRaw, Vec<BtreeNodeDirty<'_, BlockIndex, V, BlockPtr>>)>>
+    {async move {
+        // prepare for a segment
+        let _start = Instant::now();
+
+        // 1. collect all dirty meta data
+        let dirty_meta_vec = self.bmap_lookup_dirty();
+        debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
+            dirty_meta_vec.len(), dirty_data_blocks.len());
+
+        let segid = self.inode_mut().get_next_seq();
+        let mut file_off = 0;
+        let mut segwr = self.staging().new_segwr(segid, &self.config().meta);
+
+        let dirty_data_blocks = self.get_data_blocks_dirty();
+        let ndatadirty = dirty_data_blocks.len();
+        file_off += segment::Writer::<T>::calc_ss_aligned_bytes(ndatadirty);
+
+        let mut block_seq = 0;
+        // assign real blk ptr to meta data
+        for n in &dirty_meta_vec {
+            let blk_ptr = self.blk_ptr_encode(segid, file_off, block_seq);
+            let node_size = n.size();
+            // use 0 as key, but it's useless
+            debug!("assign block ptr for meta node: block ptr {}", self.blk_ptr_decode_display(&blk_ptr));
+            self.bmap_assign_meta_node(blk_ptr, n.clone()).await?;
+            segwr.inc_metablk();
+            file_off += node_size;
+            block_seq += 1;
+        }
+
+        // 2. collect all dirty data block
+
+        // assign real blk ptr to data block
+        for (blk_idx, n) in dirty_data_blocks.data().iter() {
+            let blk_ptr = self.blk_ptr_encode(segid, file_off, block_seq);
+            let block_size = n.size();
+            debug!("assign block ptr for data node: block ptr {}, block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
+            self.bmap_assign_data_node(blk_idx, blk_ptr).await?;
+            segwr.inc_datablk(blk_idx, &blk_ptr);
+            file_off += block_size;
+            block_seq += 1;
+        }
+
+        let _ = _start.elapsed();
+
+        // prepare inode
+        let b = self.bmap_get_raw();
+        let mut raw_inode = self.inode().to_raw(b);
+        raw_inode.i_last_cno = segid;
+        // TODO: calc segment checksum
+        segwr.realize_ss(0, &raw_inode);
+
+        // write out root node to staging file
+        let _start = Instant::now();
+        file_off = 0;
+        for n in &dirty_meta_vec {
+            let node_size = n.size();
+            let _ = segwr.append(n.as_slice())?;
+            file_off += node_size;
+        }
+        for (_, n) in dirty_data_blocks.data().iter() {
+            let block_size = n.size();
+            let _ = segwr.append(n.as_slice())?;
+            file_off += block_size;
+        }
+        let _ = _start.elapsed();
+        Ok((segwr, segid, raw_inode, dirty_meta_vec))
+    }}
+
+    fn flush_process_clear_dirty(&mut self, dirty_meta_vec: Vec<BtreeNodeDirty<'_, BlockIndex, V, BlockPtr>>) -> SegmentId {
+        // start to cleanup
+        let _start = Instant::now();
+
+        // clear dirty for all dirty meta node
+        for n in dirty_meta_vec {
+            n.clear_dirty();
+        }
+
+        self.clear_data_blocks_dirty();
+
+        // clear dirty for bmap
+        self.bmap_clear_dirty();
+        // reset last flush
+        self.set_last_flush();
+
+        let _ = _start.elapsed();
+        self.inode().get_last_ondisk_cno()
+    }
+
+    fn flush_process(&mut self) -> impl Future<Output = Result<SegmentId>> {async move {
+        let fn_start = Instant::now();
+        debug!("flush started");
+
+        let (segid, dirty_data_blocks) = self.flush_process_pre_build_segment().await?;
+        if segid > 0 {
+            return Ok(segid);
+        }
+        let (segwr, segid, raw_inode, dirty_meta_vec) = self.flush_process_build_segment(dirty_data_blocks).await?;
+
+        let _start = Instant::now();
+        segwr.done().await?;
+        // update last cno in memory after segment write out
+        self.inode_mut().set_last_cno(segid);
+        let _ = _start.elapsed();
+
+        // flush inode after writeout segment
+        let _start = Instant::now();
+        let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), self.inode().get_ondisk_state(), FlushInodeFlag::Update).await?;
+        let _ = _start.elapsed();
+        self.inode_mut().clear_attr_dirty();
+        self.inode_mut().set_ondisk_state(od_state);
+        let last_cno = self.inode().get_last_cno();
+        self.inode_mut().set_last_ondisk_cno(last_cno);
+
+        // start to cleanup
+        let _start = Instant::now();
+
+        // clear dirty for all dirty meta node
+        for n in dirty_meta_vec {
+            n.clear_dirty();
+        }
+
+        self.clear_data_blocks_dirty();
+
+        // clear dirty for bmap
+        self.bmap_clear_dirty();
+        // reset last flush
+        self.set_last_flush();
+
+        let _ = _start.elapsed();
+        let _ = fn_start.elapsed();
+        Ok(self.inode().get_last_ondisk_cno())
+    }}
+
+    #[cfg(all(feature = "wal", feature = "reactor"))]
+    fn wal_flush_process_reactor<'a: 'static>(&mut self, fh: TaskHandler<FileContext<'a>>) -> impl Future<Output = Result<SegmentId>> {async move {
+        let fn_start = Instant::now();
+        debug!("flush started");
+
+        let (segid, dirty_data_blocks) = self.flush_process_pre_build_segment().await?;
+        if segid > 0 {
+            return Ok(segid);
+        }
+        let (segwr, segid, raw_inode, dirty_meta_vec) = self.flush_process_build_segment(dirty_data_blocks).await?;
+
+        let staging = self.staging().clone();
+        let od_state = self.inode().get_ondisk_state().clone();
+        tokio::task::spawn(async move {
+            let _start = Instant::now();
+            match segwr.done().await {
+                Ok(_) => {},
+                Err(e) => {
+                    warn!("segment write failed in wal flush process: {:?}", e);
+                    let ctx = FileContext::new_wal_flush_recovery();
+                    fh.send_highprio(ctx);
+                    return;
+                },
+            }
+            match staging.flush_inode(raw_inode.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
+                Ok(od_state) => {
+                    let ctx = FileContext::new_wal_flush_done(segid, od_state.unwrap().clone());
+                    fh.send_highprio(ctx);
+                },
+                Err(e) => {
+                    warn!("flush inode failed in wal flush process: {:?}", e);
+                    let ctx = FileContext::new_wal_flush_recovery();
+                    fh.send_highprio(ctx);
+                },
+            }
+        });
+        self.inode_mut().set_last_cno(segid);
+        self.inode_mut().clear_attr_dirty();
+
+        // start to cleanup
+        let _start = Instant::now();
+
+        // clear dirty for all dirty meta node
+        for n in dirty_meta_vec {
+            n.clear_dirty();
+        }
+
+        self.clear_data_blocks_dirty();
+
+        // clear dirty for bmap
+        self.bmap_clear_dirty();
+        // reset last flush
+        self.set_last_flush();
+
+        let _ = _start.elapsed();
+        let _ = fn_start.elapsed();
+        Ok(self.inode().get_last_ondisk_cno())
+    }}
+
+    #[cfg(all(feature = "wal", feature = "blocking"))]
+    fn wal_flush_process_blocking<'a>(&mut self) -> impl Future<Output = Result<SegmentId>> {async move {
+        let fn_start = Instant::now();
+        debug!("flush started");
+
+        let (segid, dirty_data_blocks) = self.flush_process_pre_build_segment().await?;
+        if segid > 0 {
+            return Ok(segid);
+        }
+        let (segwr, segid, raw_inode, dirty_meta_vec) = self.flush_process_build_segment(dirty_data_blocks).await?;
+
+        let staging = self.staging().clone();
+        let od_state = self.inode().get_ondisk_state().clone();
+        let join = tokio::task::spawn(async move {
+            match segwr.done().await {
+                Ok(_) => {},
+                Err(e) => {
+                    warn!("segment write failed in wal flush process: {:?}", e);
+                    return Err(e);
+                },
+            }
+            match staging.flush_inode(raw_inode.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
+                Ok(od_state) => { return Ok(od_state); },
+                Err(e) => {
+                    warn!("flush inode failed in wal flush process: {:?}", e);
+                    return Err(e);
+                },
+            }
+        });
+
+        let od_state = join.await??;
+
+        self.inode_mut().set_last_cno(segid);
+        self.inode_mut().clear_attr_dirty();
+        self.inode_mut().set_ondisk_state(od_state);
+        let last_cno = self.inode().get_last_cno();
+        self.inode_mut().set_last_ondisk_cno(last_cno);
+
+        // start to cleanup
+        let _start = Instant::now();
+
+        // clear dirty for all dirty meta node
+        for n in dirty_meta_vec {
+            n.clear_dirty();
+        }
+
+        self.clear_data_blocks_dirty();
+
+        // clear dirty for bmap
+        self.bmap_clear_dirty();
+        // reset last flush
+        self.set_last_flush();
+
+        let _ = _start.elapsed();
+        let _ = fn_start.elapsed();
+        Ok(self.inode().get_last_ondisk_cno())
+    }}
+
     // flush out dirty data
-    fn flush_process(&mut self) -> impl Future<Output = Result<SegmentId>> {async {
+    fn _flush_process(&mut self) -> impl Future<Output = Result<SegmentId>> {async move {
 
         let fn_start = Instant::now();
         debug!("flush started");
