@@ -5,6 +5,8 @@ use std::time::{Instant, Duration};
 use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
 use lru::LruCache;
+#[cfg(all(feature = "wal", feature = "reactor"))]
+use reactor::TaskHandler;
 use btree_ondisk::{bmap::BMap, BlockLoader};
 use btree_ondisk::btree::BtreeNodeDirty;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
@@ -16,8 +18,12 @@ use crate::segment::SegmentReadWrite;
 use crate::ondisk::{InodeRaw, BMapRawType};
 use crate::inode::{Inode, FlushInodeFlag};
 use crate::config::{HyperFileConfig, HyperFileMetaConfig};
+#[cfg(all(feature = "wal", feature = "reactor"))]
+use crate::file::handler::FileContext;
 #[cfg(feature = "wal")]
 use crate::wal::WalReadWrite;
+#[cfg(feature = "wal")]
+use crate::inode::OnDiskState;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
@@ -521,11 +527,30 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         Ok(false)
     }
 
+    #[cfg(all(feature = "wal", feature = "reactor"))]
+    pub(crate) async fn kick_wal_protected_flush_reactor(&mut self, fh: TaskHandler<FileContext<'a>>) -> Result<SegmentId> {
+        match self.wal_flush_process_reactor(fh).await {
+            Ok(segid) => { return Ok(segid) },
+            Err(e) => {
+                warn!("kick_wal_protected_flush_reactor failed: {:?}", e);
+                return self.wal_flush_recovery().await;
+            },
+        }
+    }
+
     #[cfg(feature = "wal")]
-    pub(crate) async fn wal_flush(&mut self) -> Result<()> {
-        // TODO: replace flush() with wal_protected_flush()
-        let _ = self.flush().await?;
-        Ok(())
+    pub(crate) fn wal_flush_done(&mut self, segid: SegmentId, od_state: OnDiskState) {
+        self.inode_mut().set_ondisk_state(Some(od_state));
+        let last_cno = self.inode().get_last_cno();
+        assert!(last_cno == segid);
+        self.inode_mut().set_last_ondisk_cno(last_cno);
+    }
+
+    // starting wal flush recovery process by reloading inode from backend storage
+    // everything should be clean or give a panic if unrecoverable
+    #[cfg(feature = "wal")]
+    pub(crate) async fn wal_flush_recovery(&mut self) -> Result<SegmentId> {
+        todo!();
     }
 
     pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {

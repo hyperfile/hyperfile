@@ -353,8 +353,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if self.need_flush() {
             #[cfg(feature = "wal")]
             {
-                let fh = req.fh.clone();
-                let ctx = FileContext::new_wal_flush();
+                let fh = req.fh;
+                let ctx = FileContext::new_wal_flush(fh.clone());
                 fh.send_highprio(ctx);
             }
             #[cfg(not(feature = "wal"))]
@@ -452,8 +452,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if self.need_flush() {
             #[cfg(feature = "wal")]
             {
-                let fh = req.fh.clone();
-                let ctx = FileContext::new_wal_flush();
+                let fh = req.fh;
+                let ctx = FileContext::new_wal_flush(fh.clone());
                 fh.send_highprio(ctx);
             }
             #[cfg(not(feature = "wal"))]
