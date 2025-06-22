@@ -71,6 +71,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn blk_ptr_decode_display(&self, blk_ptr: &BlockPtr) -> String;
     // data cache
     fn clear_data_blocks_cache(&mut self);
+    fn set_data_blocks_cache_unlimited(&mut self);
+    fn restore_data_blocks_cache_limit(&mut self);
     // dirty data
     fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_>;
     fn clear_data_blocks_dirty(&mut self);
@@ -87,6 +89,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn bmap_clear_dirty(&mut self);
     fn bmap_update<'a>(&mut self, bmap: BMap<'a, BlockIndex, V, BlockPtr, L>);
     fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, V, BlockPtr, L>, blk_idx: &BlockIndex) -> impl Future<Output = Result<Option<V>>>;
+    fn bmap_set_cache_unlimited(&self) -> usize;
+    fn bmap_set_cache_limit(&self, liimt: usize);
     // inode
     fn inode(&self) -> &Inode;
     fn inode_mut(&self) -> &mut Inode;
@@ -352,6 +356,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         let staging = self.staging().clone();
         let od_state = self.inode().get_ondisk_state().clone();
+        // set bmap cache to unlimit, restore back until flush done
+        let bmap_cache_limit = self.bmap_set_cache_unlimited();
         tokio::task::spawn(async move {
             let _start = Instant::now();
             match segwr.done().await {
@@ -365,7 +371,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             }
             match staging.flush_inode(raw_inode.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
                 Ok(od_state) => {
-                    let ctx = FileContext::new_wal_flush_done(segid, od_state.unwrap().clone());
+                    let ctx = FileContext::new_wal_flush_done(segid, od_state.unwrap().clone(), bmap_cache_limit);
                     fh.send_highprio(ctx);
                 },
                 Err(e) => {
@@ -385,6 +391,9 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         for n in dirty_meta_vec {
             n.clear_dirty();
         }
+
+        // set data blocks cache unlimited
+        self.set_data_blocks_cache_unlimited();
 
         self.clear_data_blocks_dirty();
 

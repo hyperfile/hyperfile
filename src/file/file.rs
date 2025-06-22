@@ -9,6 +9,7 @@ use lru::LruCache;
 use reactor::TaskHandler;
 use btree_ondisk::{bmap::BMap, BlockLoader};
 use btree_ondisk::btree::BtreeNodeDirty;
+use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
@@ -99,7 +100,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         };
 
         let data_cache_blocks = if flags.is_direct() {
-            0
+            #[cfg(not(feature = "wal"))]
+            { 0 }
+            // reset to data_cache_blocks if we are in wal mode
+            #[cfg(feature = "wal")]
+            { config.runtime.data_cache_blocks }
         } else {
             config.runtime.data_cache_blocks
         };
@@ -196,7 +201,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         };
 
         let data_cache_blocks = if flags.is_direct() {
-            0
+            #[cfg(not(feature = "wal"))]
+            { 0 }
+            // reset to data_cache_blocks if we are in wal mode
+            #[cfg(feature = "wal")]
+            { config.runtime.data_cache_blocks }
         } else {
             config.runtime.data_cache_blocks
         };
@@ -508,8 +517,28 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             || (ndatadirty * data_block_size) > self.config.runtime.segment_buffer_size;
         // trigger flush if file opened in O_SYNC
         let sync_flush = self.flags.is_sync();
+        let sync_flush = if sync_flush {
+            #[cfg(not(feature = "wal"))]
+            { true }
+            // in wal mode, we dont's need immediately flush
+            #[cfg(feature = "wal")]
+            { false }
+        } else {
+            false
+        };
+
         // trigger flush if file opened in O_DIRECT
         let direct_flush = self.flags.is_direct();
+        let direct_flush = if direct_flush {
+            #[cfg(not(feature = "wal"))]
+            { true }
+            // in wal mode, we dont's need immediately flush
+            #[cfg(feature = "wal")]
+            { false }
+        } else {
+            false
+        };
+
         let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
         let last_flush_expired = self.last_flush.elapsed() >= Duration::from_millis(max_flush_interval);
         if last_flush_expired || threshold_flush || sync_flush || direct_flush {
@@ -539,11 +568,14 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 
     #[cfg(feature = "wal")]
-    pub(crate) fn wal_flush_done(&mut self, segid: SegmentId, od_state: OnDiskState) {
+    pub(crate) fn wal_flush_done(&mut self, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) {
         self.inode_mut().set_ondisk_state(Some(od_state));
         let last_cno = self.inode().get_last_cno();
         assert!(last_cno == segid);
         self.inode_mut().set_last_ondisk_cno(last_cno);
+        // restore cache limit
+        self.restore_data_blocks_cache_limit();
+        self.bmap_set_cache_limit(bmap_cache_limit);
     }
 
     // starting wal flush recovery process by reloading inode from backend storage
@@ -1041,6 +1073,18 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
         }
     }
 
+    fn set_data_blocks_cache_unlimited(&mut self) {
+        use std::num::NonZeroUsize;
+        self.data_blocks_cache.resize(NonZeroUsize::new(usize::MAX).unwrap());
+    }
+
+    fn restore_data_blocks_cache_limit(&mut self) {
+        use std::num::NonZeroUsize;
+        self.data_blocks_cache.resize(
+            NonZeroUsize::new(self.data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
+        );
+    }
+
     fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_> {
         let b: BTreeMap<BlockIndex, &DataBlock> = self.data_blocks_dirty.iter()
                         .map(|(idx, blk)| (*idx, blk))
@@ -1105,6 +1149,16 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
 
     async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<BlockPtr>> {
         bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await
+    }
+
+    fn bmap_set_cache_unlimited(&self) -> usize {
+        let limit = self.bmap.get_cache_limit();
+        self.bmap.set_cache_limit(DEFAULT_CACHE_UNLIMITED);
+        limit
+    }
+
+    fn bmap_set_cache_limit(&self, limit: usize) {
+        self.bmap.set_cache_limit(limit);
     }
 
     fn staging(&self) -> &T {

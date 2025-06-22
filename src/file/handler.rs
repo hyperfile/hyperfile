@@ -161,6 +161,7 @@ pub struct FileReqWalFlush<'a> {
 pub struct FileReqWalFlushDone {
     pub segid: SegmentId,
     pub od_state: OnDiskState,
+    pub bmap_cache_limit: usize,
 }
 
 #[cfg(feature = "wal")]
@@ -414,10 +415,10 @@ impl<'a> FileContext<'a> {
     }
 
     #[cfg(feature = "wal")]
-    pub fn new_wal_flush_done(segid: SegmentId, od_state: OnDiskState) -> Self {
+    pub fn new_wal_flush_done(segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) -> Self {
         let req = FileReq {
             op: FileReqOp::WalFlushDone,
-            body: FileReqBody { wal_flush_done: ManuallyDrop::new(FileReqWalFlushDone { segid, od_state }), },
+            body: FileReqBody { wal_flush_done: ManuallyDrop::new(FileReqWalFlushDone { segid, od_state, bmap_cache_limit, }), },
         };
         let resp = FileResp {
             wal_flush_done: ManuallyDrop::new(()),
@@ -734,7 +735,8 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 let segid = req.segid;
                 let od_state = req.od_state;
-                self.inner.wal_flush_done(segid, od_state);
+                let bmap_cache_limit = req.bmap_cache_limit;
+                self.inner.wal_flush_done(segid, od_state, bmap_cache_limit);
                 info!("wal flush done, segid: {}", segid);
                 let _ = resp.to_wal_flush_done();
             },
