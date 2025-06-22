@@ -236,7 +236,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite, L: BlockLoader<B
 
         let dirty_data_blocks = self.get_data_blocks_dirty();
         let ndatadirty = dirty_data_blocks.len();
-        file_off += segment::Writer::<'_, T>::calc_ss_aligned_bytes(ndatadirty);
+        file_off += segment::Writer::<T>::calc_ss_aligned_bytes(ndatadirty);
 
         let mut block_seq = 0;
         // assign real blk ptr to meta data

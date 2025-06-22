@@ -155,7 +155,7 @@ impl Staging<S3BlockLoader> for S3Staging {
     }
 
     fn new_segwr(&self, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> segment::Writer<S3Staging> {
-        segment::Writer::<S3Staging>::new(self, self.runtime_config.segment_buffer_size, segid, hyper_file_config)
+        segment::Writer::<S3Staging>::new(self.clone(), self.runtime_config.segment_buffer_size, segid, hyper_file_config)
     }
 
     fn dir_filename(&self) -> (&str, &str) {

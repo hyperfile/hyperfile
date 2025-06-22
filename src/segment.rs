@@ -156,8 +156,8 @@ impl SegmentSum {
     }
 }
 
-pub struct Writer<'a, T> {
-    ctx: &'a T,
+pub struct Writer<T> {
+    ctx: T,
     data: Vec<u8>,
     offset: usize,
     segid: SegmentId,
@@ -165,8 +165,8 @@ pub struct Writer<'a, T> {
 }
 
 // router stub to real impl of writer function in Staging
-impl<'a, T: SegmentReadWrite> Writer<'a, T> {
-    pub fn new(ctx: &'a T, buf_size: usize, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> Self {
+impl<T: SegmentReadWrite> Writer<T> {
+    pub fn new(ctx: T, buf_size: usize, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> Self {
         let data = Vec::with_capacity(buf_size);
 
         let mut hdr = SegmentHeader::new();
@@ -226,7 +226,7 @@ impl<'a, T: SegmentReadWrite> Writer<'a, T> {
 }
 
 // functions for SegmentSummary
-impl<'a, T> Writer<'a, T> {
+impl<T> Writer<T> {
     // count one meta block
     pub fn inc_metablk(&mut self) {
         self.ss.hdr.s_nmetablk += 1;
