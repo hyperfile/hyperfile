@@ -24,7 +24,7 @@ use super::{HyperTrait, DirtyDataBlocks};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
 
-pub struct HyperFile<'a, T: Send, L: BlockLoader<BlockPtr>> {
+pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     pub(crate) staging: T,
     pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>,
     pub(crate) bmap_ud: BMapUserData,
@@ -48,7 +48,7 @@ pub struct HyperFile<'a, T: Send, L: BlockLoader<BlockPtr>> {
     pub(crate) wal: Option<Box<dyn WalReadWrite + Send>>,
 }
 
-impl<T: Send, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
+impl<T: Send + Clone, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "==== dump HyperFile ====")?;
         writeln!(f, "  {:?}", self.config)?;
@@ -58,7 +58,7 @@ impl<T: Send, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
     }
 }
 
-impl<T: Send, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
+impl<T: Send + Clone, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
     fn drop(&mut self) {
         #[cfg(feature = "reactor")]
         if let Some(rt) = self.rt.take() {
@@ -67,7 +67,7 @@ impl<T: Send, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
     }
 }
 
-impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
     {
         let meta_config = config.meta.clone();
@@ -678,7 +678,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + 'static, L: BlockLoa
     }
 }
 
-impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     // we only care about incomplete blocks and not in dirty list
     // return:
     //   - vec of data block ptr we need to retrieve
@@ -983,7 +983,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
 impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
     where
-        T: Staging<L> + SegmentReadWrite + Send + 'static,
+        T: Staging<L> + SegmentReadWrite + Send + Clone + 'static,
         L: BlockLoader<BlockPtr> + Clone,
 {
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
