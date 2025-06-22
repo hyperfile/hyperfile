@@ -294,26 +294,6 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         Ok((segwr, segid, raw_inode, dirty_meta_vec))
     }}
 
-    fn flush_process_clear_dirty(&mut self, dirty_meta_vec: Vec<BtreeNodeDirty<'_, BlockIndex, V, BlockPtr>>) -> SegmentId {
-        // start to cleanup
-        let _start = Instant::now();
-
-        // clear dirty for all dirty meta node
-        for n in dirty_meta_vec {
-            n.clear_dirty();
-        }
-
-        self.clear_data_blocks_dirty();
-
-        // clear dirty for bmap
-        self.bmap_clear_dirty();
-        // reset last flush
-        self.set_last_flush();
-
-        let _ = _start.elapsed();
-        self.inode().get_last_ondisk_cno()
-    }
-
     fn flush_process(&mut self) -> impl Future<Output = Result<SegmentId>> {async move {
         let fn_start = Instant::now();
         debug!("flush started");
@@ -477,6 +457,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     }}
 
     // flush out dirty data
+    // original flush process
     fn _flush_process(&mut self) -> impl Future<Output = Result<SegmentId>> {async move {
 
         let fn_start = Instant::now();
