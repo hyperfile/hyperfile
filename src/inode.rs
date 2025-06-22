@@ -23,7 +23,7 @@ impl fmt::Display for Stat {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct OnDiskState {
     pub checksum: String,
     pub timestamp: i64,
