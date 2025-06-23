@@ -127,7 +127,7 @@ impl<'a: 'static> HyperFileTokio<'a> {
     }
 
     pub async fn flush_ext(&self) -> Result<u64> {
-        let (ctx, rx) = FileContext::new_flush();
+        let (ctx, rx) = FileContext::new_flush(self.inner.clone());
         self.inner.send(ctx);
         rx.await.expect("task channel closed")
     }
@@ -311,7 +311,7 @@ impl AsyncWrite for HyperFileTokio<'_> {
         let me = self.get_mut();
         match me.state {
             State::Idle(_) => {
-                let (ctx, rx) = FileContext::new_flush();
+                let (ctx, rx) = FileContext::new_flush(me.inner.clone());
                 me.inner.send(ctx);
                 me.state = State::Busy(Operation::Flush(rx));
                 cx.waker().wake_by_ref();

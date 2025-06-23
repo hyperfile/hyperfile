@@ -147,7 +147,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
 
     pub async fn fh_flush(&mut self) -> Result<u64>
     {
-        let (ctx, rx) = FileContext::new_flush();
+        let (ctx, rx) = FileContext::new_flush(self.inner.clone());
         self.inner.send(ctx);
         rx.await.expect("task channel closed")
     }

@@ -152,7 +152,9 @@ pub struct FileReqSetAttr {
     pub stat: libc::stat,
 }
 
-pub struct FileReqFlush {}
+pub struct FileReqFlush<'a> {
+    pub fh: TaskHandler<FileContext<'a>>,
+}
 
 #[cfg(feature = "wal")]
 pub struct FileReqWalFlush<'a> {
@@ -220,7 +222,7 @@ pub union FileReqBody<'a> {
     wal_flush_done: ManuallyDrop<FileReqWalFlushDone>,
     #[cfg(feature = "wal")]
     wal_flush_recovery: ManuallyDrop<FileReqWalFlushRecovery>,
-    flush: ManuallyDrop<FileReqFlush>,
+    flush: ManuallyDrop<FileReqFlush<'a>>,
     release: ManuallyDrop<FileReqRelease>,
     last_cno: ManuallyDrop<FileReqLastCno>,
 }
@@ -394,11 +396,11 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
-    pub fn new_flush() -> (Self, oneshot::Receiver<FileRespFlush>) {
+    pub fn new_flush(fh: TaskHandler<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespFlush>) {
         let (tx, rx) = oneshot::channel::<FileRespFlush>();
         let req = FileReq {
             op: FileReqOp::Flush,
-            body: FileReqBody { flush: ManuallyDrop::new(FileReqFlush {}), },
+            body: FileReqBody { flush: ManuallyDrop::new(FileReqFlush { fh, }), },
         };
         let resp = FileResp {
             flush: ManuallyDrop::new(tx),
