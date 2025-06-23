@@ -10,6 +10,8 @@ use reactor::TaskHandler;
 use btree_ondisk::{bmap::BMap, BlockLoader};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
+#[cfg(feature = "wal")]
+use tokio::sync::RwLock;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
@@ -53,6 +55,8 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     pub(crate) rt: Option<tokio::runtime::Runtime>,
     #[cfg(feature = "wal")]
     pub(crate) wal: Option<Box<dyn WalReadWrite + Send>>,
+    #[cfg(feature = "wal")]
+    pub(crate) flushing_segments: Arc<RwLock<HashMap<SegmentId, Vec<u8>>>>,
 }
 
 impl<T: Send + Clone, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
@@ -136,6 +140,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
             wal: wal,
+            #[cfg(feature = "wal")]
+            flushing_segments: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -241,6 +247,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
             wal: wal,
+            #[cfg(feature = "wal")]
+            flushing_segments: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -568,11 +576,12 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 
     #[cfg(feature = "wal")]
-    pub(crate) fn wal_flush_done(&mut self, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) {
+    pub(crate) async fn wal_flush_done(&mut self, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) {
         self.inode_mut().set_ondisk_state(Some(od_state));
         let last_cno = self.inode().get_last_cno();
         assert!(last_cno == segid);
         self.inode_mut().set_last_ondisk_cno(last_cno);
+        self.wal_clear_mem_segment(segid).await;
         // restore cache limit
         self.restore_data_blocks_cache_limit();
         self.bmap_set_cache_limit(bmap_cache_limit);
@@ -849,6 +858,24 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             buf.copy_from_slice(&slice[offset..offset + buf.len()]);
             return Ok(());
         }
+        #[cfg(feature = "wal")]
+        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+            let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
+            if segid > self.inode().get_last_ondisk_cno() {
+                let data_block_size = self.config.meta.data_block_size;
+                let data_buf = unsafe {
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+                };
+                let lock = self.flushing_segments.read().await;
+                let Some(data) = lock.get(&segid) else {
+                    panic!("unable to find segid: {segid} from inflight flushing segments");
+                };
+                let start_off = staging_off + offset;
+                let end = start_off + data_block_size;
+                data_buf.copy_from_slice(&data[start_off..end]);
+                return Ok(());
+            }
+        }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let _ = self.staging.load_data_block(segid, staging_off, offset, self.config.meta.data_block_size, buf).await?;
@@ -865,6 +892,24 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
     async fn load_data_block_write_path(&self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
         debug!("load_data_block - block ptr: {}", self.blk_ptr_decode_display(&blk_ptr));
+        #[cfg(feature = "wal")]
+        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+            let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
+            if segid > self.inode().get_last_ondisk_cno() {
+                let data_block_size = self.config.meta.data_block_size;
+                let data_buf = unsafe {
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+                };
+                let lock = self.flushing_segments.read().await;
+                let Some(data) = lock.get(&segid) else {
+                    panic!("unable to find segid: {segid} from inflight flushing segments");
+                };
+                let start_off = staging_off + offset;
+                let end = start_off + data_block_size;
+                data_buf.copy_from_slice(&data[start_off..end]);
+                return Ok(());
+            }
+        }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let _ = self.staging.load_data_block(segid, staging_off, offset, self.config.meta.data_block_size, buf).await?;
@@ -1186,5 +1231,22 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
 
     async fn sleep(dur: Duration) {
         tokio::time::sleep(dur).await;
+    }
+
+    // wal
+    #[cfg(feature = "wal")]
+    async fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Vec<u8>) {
+        let mut lock = self.flushing_segments.write().await;
+        if let Some(_) = lock.insert(mem_segid, mem_segdata) {
+            panic!("wal set mem segment - segid {mem_segid} already exists in memory flushing segments");
+        }
+    }
+
+    #[cfg(feature = "wal")]
+    async fn wal_clear_mem_segment(&self, mem_segid: SegmentId) {
+        let mut lock = self.flushing_segments.write().await;
+        if let None = lock.remove(&mem_segid) {
+            panic!("wal clear mem segment - segid {mem_segid} did not exists in memory flushing segments");
+        }
     }
 }

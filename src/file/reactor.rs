@@ -57,6 +57,28 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
             return Ok(SpawnReadSize::ImmSize(data_buf.len()));
         }
+        #[cfg(feature = "wal")]
+        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+            let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
+            if segid > self.inode().get_last_ondisk_cno() {
+                let data_block_size = self.config.meta.data_block_size;
+                let data_buf = unsafe {
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+                };
+                let flushing_segments = self.flushing_segments.clone();
+                let join = self.rt.as_ref().unwrap().spawn(async move {
+                    let lock = flushing_segments.read().await;
+                    let Some(data) = lock.get(&segid) else {
+                        panic!("unable to find segid: {segid} from inflight flushing segments");
+                    };
+                    let start_off = staging_off + offset;
+                    let end = start_off + data_block_size;
+                    data_buf.copy_from_slice(&data[start_off..end]);
+                    data_buf.len()
+                });
+                return Ok(SpawnReadSize::JoinSize(join));
+            }
+        }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let staging = self.staging.clone();
@@ -85,6 +107,28 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
     pub(crate) fn spawn_load_data_block_write_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<JoinHandle<usize>> {
         debug!("spawn_load_data_block_write_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
+        #[cfg(feature = "wal")]
+        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+            let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
+            if segid > self.inode().get_last_ondisk_cno() {
+                let data_block_size = self.config.meta.data_block_size;
+                let data_buf = unsafe {
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+                };
+                let flushing_segments = self.flushing_segments.clone();
+                let join = self.rt.as_ref().unwrap().spawn(async move {
+                    let lock = flushing_segments.read().await;
+                    let Some(data) = lock.get(&segid) else {
+                        panic!("unable to find segid: {segid} from inflight flushing segments");
+                    };
+                    let start_off = staging_off + offset;
+                    let end = start_off + data_block_size;
+                    data_buf.copy_from_slice(&data[start_off..end]);
+                    data_buf.len()
+                });
+                return Ok(join);
+            }
+        }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             let staging = self.staging.clone();

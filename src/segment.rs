@@ -223,6 +223,11 @@ impl<T: SegmentReadWrite> Writer<T> {
     pub async fn done(self) -> Result<()> {
         self.ctx.done(self.segid, &self.data, self.offset).await
     }
+
+    #[cfg(feature = "wal")]
+    pub fn clone_data(&self) -> (SegmentId, Vec<u8>) {
+        (self.segid, self.data.clone())
+    }
 }
 
 // functions for SegmentSummary

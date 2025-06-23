@@ -100,6 +100,12 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn set_last_flush(&mut self);
     fn sleep(dur: Duration) -> impl Future<Output = ()>;
 
+    // wal
+    #[cfg(feature = "wal")]
+    fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Vec<u8>) -> impl Future<Output = ()>;
+    #[cfg(feature = "wal")]
+    fn wal_clear_mem_segment(&self, mem_segid: SegmentId) -> impl Future<Output = ()>;
+
     // provided method
     fn bmap_get_raw(&self) -> BMapRawType {
         let mut b: BMapRawType = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
@@ -358,6 +364,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let od_state = self.inode().get_ondisk_state().clone();
         // set bmap cache to unlimit, restore back until flush done
         let bmap_cache_limit = self.bmap_set_cache_unlimited();
+        let (mem_segid, mem_segdata) = segwr.clone_data();
+        self.wal_set_mem_segment(mem_segid, mem_segdata).await;
         tokio::task::spawn(async move {
             let _start = Instant::now();
             match segwr.done().await {

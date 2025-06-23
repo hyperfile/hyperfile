@@ -736,7 +736,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let segid = req.segid;
                 let od_state = req.od_state;
                 let bmap_cache_limit = req.bmap_cache_limit;
-                self.inner.wal_flush_done(segid, od_state, bmap_cache_limit);
+                self.inner.wal_flush_done(segid, od_state, bmap_cache_limit).await;
                 info!("wal flush done, segid: {}", segid);
                 let _ = resp.to_wal_flush_done();
             },
