@@ -25,7 +25,7 @@ use crate::config::{HyperFileConfig, HyperFileMetaConfig};
 use crate::file::handler::FileContext;
 #[cfg(feature = "wal")]
 use crate::wal::WalReadWrite;
-#[cfg(feature = "wal")]
+#[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::inode::OnDiskState;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
@@ -575,7 +575,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         }
     }
 
-    #[cfg(feature = "wal")]
+    #[cfg(all(feature = "wal", feature = "reactor"))]
     pub(crate) async fn wal_flush_done(&mut self, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) {
         self.inode_mut().set_ondisk_state(Some(od_state));
         let last_cno = self.inode().get_last_cno();
