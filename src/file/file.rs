@@ -577,7 +577,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         match self.wal_flush_process_blocking().await {
             Ok(segid) => { return Ok(segid) },
             Err(e) => {
-                warn!("kick_wal_protected_flush_reactor failed: {:?}", e);
+                warn!("kick_wal_protected_flush_blocking failed: {:?}", e);
                 return self.wal_flush_recovery(lock).await;
             },
         }
