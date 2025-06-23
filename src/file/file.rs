@@ -564,6 +564,18 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         Ok(false)
     }
 
+    #[allow(dead_code)]
+    #[cfg(all(feature = "wal", feature = "blocking"))]
+    pub(crate) async fn kick_wal_protected_flush_blocking(&mut self) -> Result<SegmentId> {
+        match self.wal_flush_process_blocking().await {
+            Ok(segid) => { return Ok(segid) },
+            Err(e) => {
+                warn!("kick_wal_protected_flush_reactor failed: {:?}", e);
+                return self.wal_flush_recovery().await;
+            },
+        }
+    }
+
     #[cfg(all(feature = "wal", feature = "reactor"))]
     pub(crate) async fn kick_wal_protected_flush_reactor(&mut self, fh: TaskHandler<FileContext<'a>>) -> Result<SegmentId> {
         match self.wal_flush_process_reactor(fh).await {
