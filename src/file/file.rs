@@ -609,6 +609,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         // restore cache limit
         self.restore_data_blocks_cache_limit();
         self.bmap_set_cache_limit(bmap_cache_limit);
+        self.set_last_flush();
         drop(lock);
     }
 

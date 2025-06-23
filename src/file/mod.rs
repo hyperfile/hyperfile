@@ -418,7 +418,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // clear dirty for bmap
         self.bmap_clear_dirty();
         // reset last flush
-        self.set_last_flush();
+        // defer set last flash in wal_flush_done
 
         let _ = _start.elapsed();
         let _ = fn_start.elapsed();
