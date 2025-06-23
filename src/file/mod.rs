@@ -424,7 +424,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         let _ = _start.elapsed();
         let _ = fn_start.elapsed();
-        Ok(self.inode().get_last_ondisk_cno())
+        // return cno in inode memory instead cno on disk
+        Ok(self.inode().get_last_cno())
     }}
 
     #[cfg(all(feature = "wal", feature = "blocking"))]

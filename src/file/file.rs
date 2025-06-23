@@ -759,7 +759,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     // return last persistent cno on disk
     #[inline]
     pub fn last_cno(&self) -> u64 {
-        self.inode.get_last_ondisk_cno()
+        #[cfg(not(feature = "wal"))]
+        return self.inode.get_last_ondisk_cno();
+        #[cfg(feature = "wal")]
+        return self.inode.get_last_cno();
     }
 
     pub fn staging_config(&self) -> &StagingConfig {
