@@ -548,7 +548,9 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 };
                 let res = self.inner.spawn_write(req, resp).await;
                 match res {
-                    Ok(_) => {},
+                    Ok(bytes) => {
+                        let _ = resp_write.try_send(Ok(bytes));
+                    },
                     Err(ref e) => {
                         if e.kind() != ErrorKind::ResourceBusy {
                             #[cfg(feature = "range-lock")]
@@ -596,7 +598,9 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 fetched.append(&mut req.fetched);
                 let res = self.inner.absorb_write(req, resp, fetched).await;
                 match res {
-                    Ok(_) => {},
+                    Ok(bytes) => {
+                        let _ = resp_write.try_send(Ok(bytes));
+                    },
                     Err(ref e) => {
                         if e.kind() != ErrorKind::ResourceBusy {
                             #[cfg(feature = "range-lock")]
@@ -630,7 +634,9 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 };
                 let res = self.inner.spawn_write_zero(req, resp).await;
                 match res {
-                    Ok(_) => {},
+                    Ok(bytes) => {
+                        let _ = resp_write.try_send(Ok(bytes));
+                    },
                     Err(ref e) => {
                         if e.kind() != ErrorKind::ResourceBusy {
                             #[cfg(feature = "range-lock")]
@@ -678,7 +684,9 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 fetched.append(&mut req.fetched);
                 let res = self.inner.absorb_write_zero(req, resp, fetched).await;
                 match res {
-                    Ok(_) => {},
+                    Ok(bytes) => {
+                        let _ = resp_write.try_send(Ok(bytes));
+                    },
                     Err(ref e) => {
                         if e.kind() != ErrorKind::ResourceBusy {
                             #[cfg(feature = "range-lock")]

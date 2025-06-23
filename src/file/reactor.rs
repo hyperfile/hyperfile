@@ -1,7 +1,5 @@
 //! IO function used by LocalSpawner reactor
-use std::io::{Result, ErrorKind};
-#[cfg(any(feature = "wal", feature = "range-lock"))]
-use std::io::Error;
+use std::io::{Result, Error, ErrorKind};
 use log::{debug, warn};
 use btree_ondisk::BlockLoader;
 use tokio::task::JoinHandle;
@@ -326,6 +324,16 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         Ok(total_bytes)
     }
 
+    // NOTE: for write process, we use following return value convention
+    //
+    // Ok(bytes) => write process end successfully, call try_send(Ok(bytes)) in handler main loop
+    // Err(ResourceBusy) => task requeued or pass to next stage task
+    // Err(e) => faile happend, call unlock range and try_send() for error
+    //
+    // for *_bh task, it is always end of of process, so call try_send(res) in anyway
+    // for wal* task, it is always in the middle of process, so only handle Err(e) is enough
+    // WalFlush is another story, it's internal process
+
     pub(crate) async fn absorb_write(&mut self, req: FileReqWrite<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
         // insert fetched block back to dirty list,
         // for the case: block idx exists on dirty
@@ -638,17 +646,13 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if v.len() > 0 {
             // retrieve data by spawn
             self.spawn_write_retrieve(req, resp, v).await?;
-            return Ok(len);
+            return Err(Error::new(ErrorKind::ResourceBusy, "hand over to spawn write retrieve"));
         }
 
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
-        let resp_write = resp.clone_write_resp();
         let actual_bytes = self.absorb_write(req, resp, Vec::new()).await?;
         assert!(len == actual_bytes);
-
-        // kick off response
-        let _ = resp_write.try_send(Ok(actual_bytes));
         Ok(len)
     }
 
@@ -674,17 +678,13 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if v.len() > 0 {
             // retrieve data by spawn
             self.spawn_write_zero_retrieve(req, resp, v).await?;
-            return Ok(len);
+            return Err(Error::new(ErrorKind::ResourceBusy, "hand over to spawn write zero retrieve"));
         }
 
         // no need to pre-retrive anything,
         // this is HAPPY PATH, continue on this runtime
-        let resp_write = resp.clone_write_zero_resp();
         let actual_bytes = self.absorb_write_zero(req, resp, Vec::new()).await?;
         assert!(len == actual_bytes);
-
-        // kick off response
-        let _ = resp_write.try_send(Ok(actual_bytes));
         Ok(len)
     }
 
