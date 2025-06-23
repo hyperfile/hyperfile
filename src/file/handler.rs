@@ -5,6 +5,8 @@ use std::io::{Result, ErrorKind};
 #[cfg(feature = "wal")]
 use log::{warn, info};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
+#[cfg(feature = "wal")]
+use tokio::sync::OwnedMutexGuard;
 use reactor::{Task, TaskHandler};
 use crate::SegmentId;
 #[cfg(feature = "wal")]
@@ -159,13 +161,16 @@ pub struct FileReqWalFlush<'a> {
 
 #[cfg(feature = "wal")]
 pub struct FileReqWalFlushDone {
+    pub lock: OwnedMutexGuard<()>,
     pub segid: SegmentId,
     pub od_state: OnDiskState,
     pub bmap_cache_limit: usize,
 }
 
 #[cfg(feature = "wal")]
-pub struct FileReqWalFlushRecovery {}
+pub struct FileReqWalFlushRecovery {
+    pub lock: OwnedMutexGuard<()>,
+}
 
 pub struct FileReqRelease {}
 
@@ -415,10 +420,10 @@ impl<'a> FileContext<'a> {
     }
 
     #[cfg(feature = "wal")]
-    pub fn new_wal_flush_done(segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) -> Self {
+    pub fn new_wal_flush_done(lock: OwnedMutexGuard<()>, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) -> Self {
         let req = FileReq {
             op: FileReqOp::WalFlushDone,
-            body: FileReqBody { wal_flush_done: ManuallyDrop::new(FileReqWalFlushDone { segid, od_state, bmap_cache_limit, }), },
+            body: FileReqBody { wal_flush_done: ManuallyDrop::new(FileReqWalFlushDone { lock, segid, od_state, bmap_cache_limit, }), },
         };
         let resp = FileResp {
             wal_flush_done: ManuallyDrop::new(()),
@@ -427,10 +432,10 @@ impl<'a> FileContext<'a> {
     }
 
     #[cfg(feature = "wal")]
-    pub fn new_wal_flush_recovery() -> Self {
+    pub fn new_wal_flush_recovery(lock: OwnedMutexGuard<()>) -> Self {
         let req = FileReq {
             op: FileReqOp::WalFlushRecovery,
-            body: FileReqBody { wal_flush_recovery: ManuallyDrop::new(FileReqWalFlushRecovery {}), },
+            body: FileReqBody { wal_flush_recovery: ManuallyDrop::new(FileReqWalFlushRecovery { lock, }), },
         };
         let resp = FileResp {
             wal_flush_recovery: ManuallyDrop::new(()),
@@ -720,7 +725,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let _ = resp.to_trunc().send(res);
             },
             FileReqOp::Flush => {
-                let md = unsafe { req.body.release };
+                let md = unsafe { req.body.flush };
                 let _ = ManuallyDrop::into_inner(md);
                 let res = self.inner.flush().await;
                 let _ = resp.to_flush().send(res);
@@ -739,18 +744,20 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::WalFlushDone => {
                 let md = unsafe { req.body.wal_flush_done };
                 let req = ManuallyDrop::into_inner(md);
+                let lock = req.lock;
                 let segid = req.segid;
                 let od_state = req.od_state;
                 let bmap_cache_limit = req.bmap_cache_limit;
-                self.inner.wal_flush_done(segid, od_state, bmap_cache_limit).await;
+                self.inner.wal_flush_done(lock, segid, od_state, bmap_cache_limit).await;
                 info!("wal flush done, segid: {}", segid);
                 let _ = resp.to_wal_flush_done();
             },
             #[cfg(feature = "wal")]
             FileReqOp::WalFlushRecovery => {
                 let md = unsafe { req.body.wal_flush_recovery };
-                let _ = ManuallyDrop::into_inner(md);
-                let res = self.inner.wal_flush_recovery().await;
+                let req = ManuallyDrop::into_inner(md);
+                let lock = req.lock;
+                let res = self.inner.wal_flush_recovery(lock).await;
                 if res.is_err() {
                     panic!("wal flush recovery failed {:?}", res);
                 }

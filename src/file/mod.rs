@@ -18,7 +18,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
 use std::collections::BTreeMap;
 use log::{info, debug, warn};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, OwnedMutexGuard};
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
 use btree_ondisk::btree::BtreeNodeDirty;
 #[cfg(all(feature = "wal", feature = "reactor"))]
@@ -79,6 +79,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     // lock
     fn lock(&self) -> impl Future<Output = OwnedSemaphorePermit>;
     fn unlock(&self, permit: OwnedSemaphorePermit);
+    fn flush_lock(&self) -> impl Future<Output = OwnedMutexGuard<()>>;
+    fn flush_unlock(&self, lock: OwnedMutexGuard<()>);
     // bmap
     fn bmap_as_slice(&self) -> &[u8];
     fn bmap_get_block_loader(&self) -> L;
@@ -350,15 +352,23 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     }}
 
     #[cfg(all(feature = "wal", feature = "reactor"))]
-    fn wal_flush_process_reactor<'a: 'static>(&mut self, fh: TaskHandler<FileContext<'a>>) -> impl Future<Output = Result<SegmentId>> {async move {
+    fn wal_flush_process_reactor<'a: 'static>(&mut self, fh: TaskHandler<FileContext<'a>>, lock: OwnedMutexGuard<()>)
+            -> impl Future<Output = std::result::Result<SegmentId, (OwnedMutexGuard<()>, Error)>>
+    {async move {
         let fn_start = Instant::now();
         debug!("flush started");
 
-        let (segid, dirty_data_blocks) = self.flush_process_pre_build_segment().await?;
+        let (segid, dirty_data_blocks) = match self.flush_process_pre_build_segment().await {
+            Ok((segid, dirty_data_blocks)) => (segid, dirty_data_blocks),
+            Err(e) => return Err((lock, e)),
+        };
         if segid > 0 {
             return Ok(segid);
         }
-        let (segwr, segid, raw_inode, dirty_meta_vec) = self.flush_process_build_segment(dirty_data_blocks).await?;
+        let (segwr, segid, raw_inode, dirty_meta_vec) = match self.flush_process_build_segment(dirty_data_blocks).await {
+            Ok((segwr, segid, raw_inode, dirty_meta_vec)) => (segwr, segid, raw_inode, dirty_meta_vec),
+            Err(e) => return Err((lock, e)),
+        };
 
         let staging = self.staging().clone();
         let od_state = self.inode().get_ondisk_state().clone();
@@ -372,19 +382,19 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
                 Ok(_) => {},
                 Err(e) => {
                     warn!("segment write failed in wal flush process: {:?}", e);
-                    let ctx = FileContext::new_wal_flush_recovery();
+                    let ctx = FileContext::new_wal_flush_recovery(lock);
                     fh.send_highprio(ctx);
                     return;
                 },
             }
             match staging.flush_inode(raw_inode.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
                 Ok(od_state) => {
-                    let ctx = FileContext::new_wal_flush_done(segid, od_state.unwrap().clone(), bmap_cache_limit);
+                    let ctx = FileContext::new_wal_flush_done(lock, segid, od_state.unwrap().clone(), bmap_cache_limit);
                     fh.send_highprio(ctx);
                 },
                 Err(e) => {
                     warn!("flush inode failed in wal flush process: {:?}", e);
-                    let ctx = FileContext::new_wal_flush_recovery();
+                    let ctx = FileContext::new_wal_flush_recovery(lock);
                     fh.send_highprio(ctx);
                 },
             }
@@ -603,7 +613,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let mut retries = 0;
         let mut backoff = DEFAULT_FLUSH_BACKOFF_SECS;
         while retries < DEFAULT_FLUSH_RETRIES {
-            let permit = self.lock().await;
+            let lock = self.flush_lock().await;
             match self.flush_process().await {
                 Ok(segid) => { return Ok(segid) },
                 Err(err) => {
@@ -613,7 +623,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
                     warn!("{err}");
                 },
             }
-            self.unlock(permit);
+            self.flush_unlock(lock);
             // back off sleep
             Self::sleep(Duration::from_secs(backoff)).await;
             let _ = self.refresh_bmap().await?;

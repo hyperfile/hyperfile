@@ -12,7 +12,10 @@ use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
 #[cfg(feature = "wal")]
 use tokio::sync::RwLock;
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use tokio::sync::{
+    Semaphore, OwnedSemaphorePermit,
+    Mutex, OwnedMutexGuard,
+};
 use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId, SegmentOffset, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
 use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
@@ -49,6 +52,7 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     pub(crate) flags: HyperFileFlags,
     pub(crate) last_flush: Instant,
     pub(crate) sema: Arc<Semaphore>,
+    pub(crate) flush_lock: Arc<Mutex<()>>,
     #[cfg(feature = "range-lock")]
     pub(crate) range_lock: RangeLock,
     #[cfg(feature = "reactor")]
@@ -136,6 +140,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(permits)),
+            flush_lock: Arc::new(Mutex::new(())),
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
@@ -243,6 +248,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(permits)),
+            flush_lock: Arc::new(Mutex::new(())),
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
@@ -567,28 +573,34 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     #[allow(dead_code)]
     #[cfg(all(feature = "wal", feature = "blocking"))]
     pub(crate) async fn kick_wal_protected_flush_blocking(&mut self) -> Result<SegmentId> {
+        let lock = self.flush_lock().await;
         match self.wal_flush_process_blocking().await {
             Ok(segid) => { return Ok(segid) },
             Err(e) => {
                 warn!("kick_wal_protected_flush_reactor failed: {:?}", e);
-                return self.wal_flush_recovery().await;
+                return self.wal_flush_recovery(lock).await;
             },
         }
     }
 
     #[cfg(all(feature = "wal", feature = "reactor"))]
     pub(crate) async fn kick_wal_protected_flush_reactor(&mut self, fh: TaskHandler<FileContext<'a>>) -> Result<SegmentId> {
-        match self.wal_flush_process_reactor(fh).await {
+        let Ok(lock) = self.flush_lock.clone().try_lock_owned() else {
+            // FIXME: skip this flush by return ResourceBusy for now,
+            // should this flush be re-queue?
+            return Err(Error::new(ErrorKind::ResourceBusy, "another flush is in-progress"));
+        };
+        match self.wal_flush_process_reactor(fh, lock).await {
             Ok(segid) => { return Ok(segid) },
-            Err(e) => {
+            Err((lock, e)) => {
                 warn!("kick_wal_protected_flush_reactor failed: {:?}", e);
-                return self.wal_flush_recovery().await;
+                return self.wal_flush_recovery(lock).await;
             },
         }
     }
 
     #[cfg(all(feature = "wal", feature = "reactor"))]
-    pub(crate) async fn wal_flush_done(&mut self, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) {
+    pub(crate) async fn wal_flush_done(&mut self, lock: OwnedMutexGuard<()>, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) {
         self.inode_mut().set_ondisk_state(Some(od_state));
         let last_cno = self.inode().get_last_cno();
         assert!(last_cno == segid);
@@ -597,12 +609,14 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         // restore cache limit
         self.restore_data_blocks_cache_limit();
         self.bmap_set_cache_limit(bmap_cache_limit);
+        drop(lock);
     }
 
     // starting wal flush recovery process by reloading inode from backend storage
     // everything should be clean or give a panic if unrecoverable
     #[cfg(feature = "wal")]
-    pub(crate) async fn wal_flush_recovery(&mut self) -> Result<SegmentId> {
+    pub(crate) async fn wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
+        drop(lock);
         todo!();
     }
 
@@ -1168,6 +1182,14 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
 
     fn unlock(&self, permit: OwnedSemaphorePermit) {
         drop(permit);
+    }
+
+    async fn flush_lock(&self) -> OwnedMutexGuard<()> {
+        self.flush_lock.clone().lock_owned().await
+    }
+
+    fn flush_unlock(&self, lock: OwnedMutexGuard<()>) {
+        drop(lock);
     }
 
     fn bmap_as_slice(&self) -> &[u8] {
