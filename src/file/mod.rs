@@ -21,9 +21,9 @@ use log::{info, debug, warn};
 use tokio::sync::OwnedSemaphorePermit;
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
 use btree_ondisk::btree::BtreeNodeDirty;
-#[cfg(feature = "reactor")]
+#[cfg(all(feature = "wal", feature = "reactor"))]
 use ::reactor::TaskHandler;
-#[cfg(feature = "reactor")]
+#[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::file::handler::FileContext;
 use crate::*;
 use crate::buffer::DataBlock;
