@@ -47,7 +47,8 @@ impl<'a> DirtyDataBlocks<'a> {
         } else if let Some(owned) = &self.owned {
             return owned.len();
         }
-        panic!("invalid DirtyDataBlocks");
+        // if both inner/owned are None, return 0
+        return 0;
     }
 
     pub fn data(&'a self) -> BTreeMap<BlockIndex, &'a DataBlock> {
