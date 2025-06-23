@@ -494,13 +494,16 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
         let (req, resp) = ctx.take();
         match req.op {
             FileReqOp::GetAttr => {
+                let md = unsafe { req.body.getattr };
+                let _ = ManuallyDrop::into_inner(md);
                 let stat = self.inner.stat();
                 let resp = resp.to_getattr();
                 let _ = resp.send(Ok(stat));
             },
             FileReqOp::SetAttr => {
-                let body = unsafe { req.body.setattr };
-                let stat = body.stat;
+                let md = unsafe { req.body.setattr };
+                let req = ManuallyDrop::into_inner(md);
+                let stat = req.stat;
                 let res = self.inner.update_stat(&stat).await;
                 let _ = resp.to_setattr().send(res);
             },
@@ -710,12 +713,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::Trunc => {
-                let body = unsafe { req.body.trunc };
-                let offset = body.offset;
+                let md = unsafe { req.body.trunc };
+                let req = ManuallyDrop::into_inner(md);
+                let offset = req.offset;
                 let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
             },
             FileReqOp::Flush => {
+                let md = unsafe { req.body.release };
+                let _ = ManuallyDrop::into_inner(md);
                 let res = self.inner.flush().await;
                 let _ = resp.to_flush().send(res);
             },
@@ -751,10 +757,14 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let _ = resp.to_wal_flush_recovery();
             },
             FileReqOp::Release => {
+                let md = unsafe { req.body.release };
+                let _ = ManuallyDrop::into_inner(md);
                 let res = self.inner.release().await;
                 let _ = resp.to_release().send(res);
             },
             FileReqOp::LastCno => {
+                let md = unsafe { req.body.last_cno };
+                let _ = ManuallyDrop::into_inner(md);
                 let res = self.inner.last_cno();
                 let _ = resp.to_last_cno().send(res);
             },
