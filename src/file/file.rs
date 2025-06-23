@@ -395,7 +395,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         for (blk_idx, _, _) in blk_iter {
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
         }
 
         let oldsize = self.inode.size();
@@ -440,7 +440,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             // and insert zero block into block map
             if start_off == 0 && data_len == data_block_size {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 bytes_write += data_len;
                 let _ = self.data_blocks_dirty.remove(&blk_idx);
                 continue;
@@ -450,7 +450,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             // TODO: merge this with new cache impl
             if start_off == 0 && (blk_idx as usize * data_block_size) + start_off + data_len > oldsize {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 bytes_write += data_len;
                 let _ = self.data_blocks_dirty.remove(&blk_idx);
                 continue;
@@ -461,7 +461,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             zero.resize(data_len, 0);
             self.update_cache(blk_idx, start_off, &zero);
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
             bytes_write += data_len;
         }
 
@@ -500,13 +500,13 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             if block_wrapper.is_zero() {
                 let _ = self.data_blocks_dirty.remove(&blk_idx);
                 bytes_write += blk_sz;
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 continue;
             }
             self.update_cache(blk_idx, 0, block_wrapper.as_slice());
             bytes_write += blk_sz;
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
         }
         // try update file size by offset and len from last block
         let last_block_wrapper = blocks.last().expect("unable to get last block, input blocks is empty");
@@ -685,7 +685,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         to_clear.fill(0);
         // back to dirty list
         self.data_blocks_dirty.insert(*blk_idx, block);
-        let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
+        let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
         Ok(true)
     }
 
@@ -1073,7 +1073,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     }
                     bytes_write += part.len();
                 }
-                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
+                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
                 continue;
             }
             // is full block
@@ -1083,13 +1083,13 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             if block_wrapper.is_zero() {
                 let _ = self.data_blocks_dirty.remove(&blk_idx);
                 bytes_write += blk_sz;
-                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 continue;
             }
             self.update_cache(*blk_idx, 0, block_wrapper.as_slice());
             bytes_write += blk_sz;
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
+            let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
         }
         // try update file size by offset and len from last block
         let (blk_idx, (is_full_block, v_blocks)) = merged.pop_last().expect("unable to get last block, input blocks is empty");

@@ -379,7 +379,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         for (blk_idx, _, _) in blk_iter {
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
+            // NOTE:
+            // since we have update the dirty blocks cache,
+            // if we failed in bmap insert, we have not way to rollback, so let's panic here
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
         }
 
         let oldsize = self.inode.size();
@@ -447,6 +450,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let opt_permit = req.spawn_write_permit.take();
         assert!(opt_permit.is_some());
 
+        // NOTE:
+        // since we have update the dirty blocks cache,
+        // if we failed in bmap operations, we have not way to rollback, so let's panic here
+
         let data_block_size = self.config.meta.data_block_size;
         let oldsize = self.inode.size();
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
@@ -456,7 +463,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             // and insert zero block into block map
             if start_off == 0 && data_len == data_block_size {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 bytes_write += data_len;
                 let _ = self.data_blocks_dirty.remove(&blk_idx);
                 continue;
@@ -466,7 +473,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             // TODO: merge this with new cache impl
             if start_off == 0 && (blk_idx as usize * data_block_size) + start_off + data_len > oldsize {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await?;
+                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 bytes_write += data_len;
                 let _ = self.data_blocks_dirty.remove(&blk_idx);
                 continue;
@@ -477,7 +484,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             zero.resize(data_len, 0);
             self.update_cache(blk_idx, start_off, &zero);
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
+            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
             bytes_write += data_len;
         }
 

@@ -200,7 +200,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // rebuild dirty bmap
         for (blk_idx, _) in dirty_data_blocks.data().iter() {
             // if blk index is already exists, overwrite it
-            let _ = Self::bmap_insert_dummy_value(&mut bmap, blk_idx).await;
+            let _ = Self::bmap_insert_dummy_value(&mut bmap, blk_idx).await
+                .expect("failed to insert dummy value to bmap for dirty blocks during rebuild bmap");
         }
         assert!(bmap.dirty() == true);
 
