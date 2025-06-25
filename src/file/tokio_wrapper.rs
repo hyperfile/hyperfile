@@ -348,7 +348,7 @@ impl AsyncWrite for HyperFileTokio<'_> {
         let me = self.get_mut();
         match me.state {
             State::Idle(_) => {
-                let (ctx, rx) = FileContext::new_release();
+                let (ctx, rx) = FileContext::new_release(me.inner.clone());
                 me.inner.send(ctx);
                 me.state = State::Busy(Operation::Release(rx));
                 cx.waker().wake_by_ref();

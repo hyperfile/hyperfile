@@ -175,7 +175,9 @@ pub struct FileReqWalFlushRecovery {
     pub lock: OwnedMutexGuard<()>,
 }
 
-pub struct FileReqRelease {}
+pub struct FileReqRelease<'a> {
+    pub fh: TaskHandler<FileContext<'a>>,
+}
 
 pub struct FileReqLastCno {}
 
@@ -224,7 +226,7 @@ pub union FileReqBody<'a> {
     #[cfg(feature = "wal")]
     wal_flush_recovery: ManuallyDrop<FileReqWalFlushRecovery>,
     flush: ManuallyDrop<FileReqFlush<'a>>,
-    release: ManuallyDrop<FileReqRelease>,
+    release: ManuallyDrop<FileReqRelease<'a>>,
     last_cno: ManuallyDrop<FileReqLastCno>,
 }
 
@@ -446,11 +448,11 @@ impl<'a> FileContext<'a> {
         Self { req: Some(req), resp: Some(resp) }
     }
 
-    pub fn new_release() -> (Self, oneshot::Receiver<FileRespRelease>) {
+    pub fn new_release(fh: TaskHandler<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespRelease>) {
         let (tx, rx) = oneshot::channel::<FileRespRelease>();
         let req = FileReq {
             op: FileReqOp::Release,
-            body: FileReqBody { release: ManuallyDrop::new(FileReqRelease {}), },
+            body: FileReqBody { release: ManuallyDrop::new(FileReqRelease { fh, }), },
         };
         let resp = FileResp {
             release: ManuallyDrop::new(tx),
@@ -490,6 +492,14 @@ impl<'a> FileContext<'a> {
         let req = FileReq {
             op: FileReqOp::WriteZero,
             body: FileReqBody { write_zero: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    pub fn reform_release(req: FileReqRelease<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::Release,
+            body: FileReqBody { release: ManuallyDrop::new(req) },
         };
         Self { req: Some(req), resp: Some(resp) }
     }
@@ -784,9 +794,22 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             },
             FileReqOp::Release => {
                 let md = unsafe { req.body.release };
-                let _ = ManuallyDrop::into_inner(md);
+                let req = ManuallyDrop::into_inner(md);
                 let res = self.inner.release().await;
-                let _ = resp.to_release().send(res);
+                match res {
+                    Ok(_) => {
+                        let _ = resp.to_release().send(res);
+                    },
+                    Err(ref e) => {
+                        if e.kind() != ErrorKind::ResourceBusy {
+                            let _ = resp.to_release().send(res);
+                        } else {
+                            let fh = req.fh.clone();
+                            let ctx = FileContext::reform_release(req, resp);
+                            fh.send_highprio(ctx);
+                        }
+                    },
+                }
             },
             FileReqOp::LastCno => {
                 let md = unsafe { req.body.last_cno };

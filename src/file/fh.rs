@@ -91,7 +91,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
 
     pub async fn fh_release(&mut self) -> Result<u64>
     {
-        let (ctx, rx) = FileContext::new_release();
+        let (ctx, rx) = FileContext::new_release(self.inner.clone());
         self.inner.send(ctx);
         rx.await.expect("task channel closed")
     }
