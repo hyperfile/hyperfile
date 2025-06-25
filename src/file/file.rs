@@ -264,6 +264,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 
     pub async fn release(&mut self) -> Result<SegmentId> {
+        #[cfg(feature = "wal")]
+        let Ok(_) = self.flush_lock.try_lock() else {
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is in-progress"));
+        };
         #[cfg(feature = "reactor")]
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
@@ -575,7 +579,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     pub(crate) async fn kick_wal_protected_flush_blocking(&mut self) -> Result<SegmentId> {
         let lock = self.flush_lock().await;
         match self.wal_flush_process_blocking().await {
-            Ok(segid) => { return Ok(segid) },
+            Ok(segid) => {
+                self.flush_unlock(lock);
+                return Ok(segid);
+            },
             Err(e) => {
                 warn!("kick_wal_protected_flush_blocking failed: {:?}", e);
                 return self.wal_flush_recovery(lock).await;
@@ -591,7 +598,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             return Err(Error::new(ErrorKind::ResourceBusy, "another flush is in-progress"));
         };
         match self.wal_flush_process_reactor(fh, lock).await {
-            Ok(segid) => { return Ok(segid) },
+            Ok(segid) => {
+                return Ok(segid);
+            },
             Err((lock, e)) => {
                 warn!("kick_wal_protected_flush_reactor failed: {:?}", e);
                 return self.wal_flush_recovery(lock).await;
