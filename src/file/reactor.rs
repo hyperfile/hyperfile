@@ -559,9 +559,6 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
             let fh = req.fh.clone();
-            #[cfg(feature = "wal")]
-            let ctx = FileContext::write_wal(req, resp);
-            #[cfg(not(feature = "wal"))]
             let ctx = FileContext::write_absorb(req, resp);
             fh.send_highprio(ctx);
         });
@@ -606,9 +603,6 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
             let fh = req.fh.clone();
-            #[cfg(feature = "wal")]
-            let ctx = FileContext::write_zero_wal(req, resp);
-            #[cfg(not(feature = "wal"))]
             let ctx = FileContext::write_zero_absorb(req, resp);
             fh.send_highprio(ctx);
         });
