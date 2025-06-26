@@ -765,7 +765,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 let res = self.inner.kick_wal_protected_flush_reactor(req.fh).await;
                 if res.is_err() {
-                    warn!("kick wal flush failed {:?}", res);
+                    warn!("kick wal flush failed {:?}, ignore this flush request", res);
                 }
                 let _ = resp.to_wal_flush();
             },
