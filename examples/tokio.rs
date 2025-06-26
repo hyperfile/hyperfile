@@ -10,9 +10,16 @@ use hyperfile::file::hyper::Hyper;
 use hyperfile::file::tokio_wrapper::HyperFileTokio;
 use hyperfile::file::flags::FileFlags;
 use hyperfile::file::mode::FileMode;
+use hyperfile::config::{
+    HyperFileConfigBuilder, HyperFileConfig,
+    HyperFileRuntimeConfig, HyperFileMetaConfig,
+};
+use hyperfile::staging::config::StagingConfig;
+#[cfg(feature = "wal")]
+use hyperfile::wal::config::HyperFileWalConfig;
 use settings::*;
 
-async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>, write_zero: bool) -> Result<()> {
+async fn random_write(client: &Client, config: &HyperFileConfig, data: &mut Vec<u8>, write_zero: bool) -> Result<()> {
     let rand_data_offset = rand::random_range(DEFAULT_RANDOM_WRITE_OFFSET);
     let mut rand_data_bytes = rand::random_range(DEFAULT_RANDOM_WRITE_BYTES);
     if rand_data_offset + rand_data_bytes >= DEFAULT_MAX_FILE_SIZE {
@@ -31,7 +38,7 @@ async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>, write_zero
 
     let flags = FileFlags::rdwr();
     let mode = FileMode::default_file();
-    let mut file = HyperFileTokio::open_or_create_with_default_opt(&client, &uri, flags, mode).await?;
+    let mut file = HyperFileTokio::open_or_create_with_config(&client, config.clone(), flags, mode).await?;
     // write content
     let filled_buf = &mut data[rand_data_offset..total_len];
     if write_zero {
@@ -48,11 +55,12 @@ async fn random_write(client: &Client, uri: &str, data: &mut Vec<u8>, write_zero
     assert!(write_bytes == rand_data_bytes);
     file.flush().await?;
     let last_cno = file.last_cno().await;
+    file.shutdown().await?;
     println!(". Done with last cno {}", last_cno);
     Ok(())
 }
 
-async fn random_truncate(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()> {
+async fn random_truncate(client: &Client, config: &HyperFileConfig, data: &mut Vec<u8>) -> Result<()> {
     let curr_len = data.len();
     // ratio to truncate only one byte
     let new_file_len = if curr_len == 0 {
@@ -68,7 +76,7 @@ async fn random_truncate(client: &Client, uri: &str, data: &mut Vec<u8>) -> Resu
     // open file for read
     let flags = FileFlags::rdwr();
     let mode = FileMode::default_file();
-    let mut file = HyperFileTokio::open_or_create_with_default_opt(&client, &uri, flags, mode).await?;
+    let mut file = HyperFileTokio::open_or_create_with_config(&client, config.clone(), flags, mode).await?;
     // get stat
     let stat = file.metadata().await?;
     assert!(stat.st_size == data.len() as i64);
@@ -85,16 +93,17 @@ async fn random_truncate(client: &Client, uri: &str, data: &mut Vec<u8>) -> Resu
     file.flush().await?;
     let last_cno = file.last_cno().await;
     data.resize(new_file_len, 0);
+    file.shutdown().await?;
     println!(". Done with last cno {}", last_cno);
     Ok(())
 }
 
-async fn read_check(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()> {
+async fn read_check(client: &Client, config: &HyperFileConfig, data: &mut Vec<u8>) -> Result<()> {
     let total_bytes = data.len();
     // open file for read
     let flags = FileFlags::rdonly();
     let mode = FileMode::default_file();
-    let mut file = HyperFileTokio::open_or_create_with_default_opt(&client, &uri, flags, mode).await?;
+    let mut file = HyperFileTokio::open_or_create_with_config(&client, config.clone(), flags, mode).await?;
     // get stat
     let stat = file.metadata().await?;
     assert!(stat.st_size == total_bytes as i64);
@@ -121,6 +130,8 @@ async fn read_check(client: &Client, uri: &str, data: &mut Vec<u8>) -> Result<()
 async fn main() -> Result<()> {
     env_logger::init();
 	let uri = std::env::var("HYPERFILE_STAGING_ROOT_URI").unwrap();
+    #[cfg(feature = "wal")]
+	let wal_uri = std::env::var("HYPERFILE_WAL_ROOT_URI").unwrap();
 
     // build s3 client
 	let config = aws_config::load_from_env().await;
@@ -137,18 +148,37 @@ async fn main() -> Result<()> {
 
     let mut data: Vec<u8> = Vec::new();
 
+    let meta_config = HyperFileMetaConfig::default();
+    let staging_config = StagingConfig::new_s3_uri(&uri, None);
+    let runtime_config = HyperFileRuntimeConfig::default_large();
+    #[cfg(not(feature = "wal"))]
+    let file_config = HyperFileConfigBuilder::new()
+                        .with_meta_config(&meta_config)
+                        .with_staging_config(&staging_config)
+                        .with_runtime_config(&runtime_config)
+                        .build();
+    #[cfg(feature = "wal")]
+    let wal_config = HyperFileWalConfig::new(&wal_uri);
+    #[cfg(feature = "wal")]
+    let file_config = HyperFileConfigBuilder::new()
+                        .with_meta_config(&meta_config)
+                        .with_staging_config(&staging_config)
+                        .with_runtime_config(&runtime_config)
+                        .with_wal_config(&wal_config)
+                        .build();
+
     for _ in 0..NUM_ITER {
         if rand::rng().random_ratio(5, 10) {
-            random_write(&client, &uri, &mut data, false).await?;
+            random_write(&client, &file_config, &mut data, false).await?;
         } else if rand::rng().random_ratio(2, 10) {
-            random_write(&client, &uri, &mut data, true).await?;
+            random_write(&client, &file_config, &mut data, true).await?;
         } else {
-            random_truncate(&client, &uri, &mut data).await?;
+            random_truncate(&client, &file_config, &mut data).await?;
         }
     }
 
     println!("Final read check...");
-    read_check(&client, &uri, &mut data).await?;
+    read_check(&client, &file_config, &mut data).await?;
 
     Ok(())
 }
