@@ -66,8 +66,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 let flushing_segments = self.flushing_segments.clone();
                 let join = self.rt.as_ref().unwrap().spawn(async move {
                     let lock = flushing_segments.read().await;
-                    let Some(data) = lock.get(&segid) else {
+                    let Some(weak_data) = lock.get(&segid) else {
                         panic!("unable to find segid: {segid} from inflight flushing segments");
+                    };
+                    let Some(data) = weak_data.upgrade() else {
+                        panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
                     };
                     let start_off = staging_off + offset;
                     let end = start_off + data_block_size;
@@ -116,8 +119,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 let flushing_segments = self.flushing_segments.clone();
                 let join = self.rt.as_ref().unwrap().spawn(async move {
                     let lock = flushing_segments.read().await;
-                    let Some(data) = lock.get(&segid) else {
+                    let Some(weak_data) = lock.get(&segid) else {
                         panic!("unable to find segid: {segid} from inflight flushing segments");
+                    };
+                    let Some(data) = weak_data.upgrade() else {
+                        panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
                     };
                     let start_off = staging_off + offset;
                     let end = start_off + data_block_size;
@@ -407,7 +413,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         if self.need_flush() {
             #[cfg(feature = "wal")]
-            {
+            if let Err(_) = self.flush_lock.try_lock() {
+                // if flushing is on going, let skip it
+            } else {
                 let fh = req.fh;
                 let ctx = FileContext::new_wal_flush(fh.clone());
                 fh.send_highprio(ctx);
@@ -510,7 +518,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         if self.need_flush() {
             #[cfg(feature = "wal")]
-            {
+            if let Err(_) = self.flush_lock.try_lock() {
+                // if flushing is on going, let skip it
+            } else {
                 let fh = req.fh;
                 let ctx = FileContext::new_wal_flush(fh.clone());
                 fh.send_highprio(ctx);

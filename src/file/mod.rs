@@ -17,6 +17,10 @@ pub mod lock;
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
 use std::collections::BTreeMap;
+#[cfg(feature = "wal")]
+use std::sync::Weak;
+#[cfg(feature = "wal")]
+use std::pin::Pin;
 use log::{info, debug, warn};
 use tokio::sync::{OwnedSemaphorePermit, OwnedMutexGuard};
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
@@ -105,7 +109,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
     // wal
     #[cfg(feature = "wal")]
-    fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Vec<u8>) -> impl Future<Output = ()>;
+    fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
     #[cfg(feature = "wal")]
     fn wal_clear_mem_segment(&self, mem_segid: SegmentId) -> impl Future<Output = ()>;
 
@@ -376,7 +380,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let od_state = self.inode().get_ondisk_state().clone();
         // set bmap cache to unlimit, restore back until flush done
         let bmap_cache_limit = self.bmap_set_cache_unlimited();
-        let (mem_segid, mem_segdata) = segwr.clone_data();
+        let (mem_segid, mem_segdata) = segwr.get_weak_data();
         self.wal_set_mem_segment(mem_segid, mem_segdata).await;
         tokio::task::spawn(async move {
             let _start = Instant::now();

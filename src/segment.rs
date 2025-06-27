@@ -1,5 +1,11 @@
 use std::fmt;
 use std::io::Result;
+#[cfg(feature = "wal")]
+use std::sync::Arc;
+#[cfg(feature = "wal")]
+use std::sync::Weak;
+#[cfg(feature = "wal")]
+use std::pin::Pin;
 use crate::SegmentId;
 use crate::ondisk::{SegmentHeader, SegmentBlockEntryRaw};
 use crate::{BlockIndex, BlockPtr};
@@ -158,7 +164,10 @@ impl SegmentSum {
 
 pub struct Writer<T> {
     ctx: T,
+    #[cfg(not(feature = "wal"))]
     data: Vec<u8>,
+    #[cfg(feature = "wal")]
+    data: Arc<Pin<Box<Vec<u8>>>>,
     offset: usize,
     segid: SegmentId,
     ss: SegmentSum,
@@ -178,7 +187,10 @@ impl<T: SegmentReadWrite> Writer<T> {
 
         Self {
             ctx: ctx,
+            #[cfg(not(feature = "wal"))]
             data: data,
+            #[cfg(feature = "wal")]
+            data: Arc::new(Box::pin(data)),
             offset: 0,
             segid: segid,
             ss: SegmentSum {
@@ -200,6 +212,9 @@ impl<T: SegmentReadWrite> Writer<T> {
     pub fn realize_ss(&mut self, checksum: u32, inode: &InodeRaw) {
         // don't actually need checksum now
         let ss_bytes = self.ss.update(checksum, inode);
+        #[cfg(not(feature = "wal"))]
+        let ss_aligned_bytes = {
+
         self.data.resize(ss_bytes, 0);
         self.ss.write_to(&mut self.data);
 
@@ -207,13 +222,53 @@ impl<T: SegmentReadWrite> Writer<T> {
         let ss_aligned_bytes = (ss_bytes + 4096 - 1) >> 12 << 12;
         // extend current ss to aligned size
         self.data.resize(ss_aligned_bytes, 0);
+
+        ss_aligned_bytes
+
+        };
+
+        #[cfg(feature = "wal")]
+        let ss_aligned_bytes = {
+
+        let Some(data) = Arc::get_mut(&mut self.data) else {
+            panic!("failed to get back inner data buffer during segment build");
+        };
+        data.resize(ss_bytes, 0);
+        self.ss.write_to(data);
+        // calc 4KiB aligned bytes from real size of ss
+        let ss_aligned_bytes = (ss_bytes + 4096 - 1) >> 12 << 12;
+        // extend current ss to aligned size
+        data.resize(ss_aligned_bytes, 0);
+
+        ss_aligned_bytes
+
+        };
+
         self.offset += ss_aligned_bytes;
     }
 
     pub fn append(&mut self, buf: &[u8]) -> Result<()> {
         let len = buf.len();
+        #[cfg(not(feature = "wal"))]
+        let slice_start = {
+
         self.data.resize(self.offset + len, 0);
         let slice_start = &mut self.data[self.offset..];
+        slice_start
+
+        };
+        #[cfg(feature = "wal")]
+        let slice_start = {
+
+        let Some(data) = Arc::get_mut(&mut self.data) else {
+            panic!("failed to get back inner data buffer during segment build");
+        };
+        data.resize(self.offset + len, 0);
+        let slice_start = &mut data[self.offset..];
+        slice_start
+
+        };
+
         let (data, _) = slice_start.split_at_mut(len);
         data.copy_from_slice(buf);
         self.offset += len;
@@ -225,8 +280,8 @@ impl<T: SegmentReadWrite> Writer<T> {
     }
 
     #[cfg(feature = "wal")]
-    pub fn clone_data(&self) -> (SegmentId, Vec<u8>) {
-        (self.segid, self.data.clone())
+    pub fn get_weak_data(&self) -> (SegmentId, Weak<Pin<Box<Vec<u8>>>>) {
+        (self.segid, Arc::downgrade(&self.data))
     }
 }
 

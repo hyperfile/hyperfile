@@ -1,6 +1,10 @@
 use std::fmt;
 use std::collections::{HashMap, BTreeMap};
 use std::sync::Arc;
+#[cfg(feature = "wal")]
+use std::sync::Weak;
+#[cfg(feature = "wal")]
+use std::pin::Pin;
 use std::time::{Instant, Duration};
 use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
@@ -60,7 +64,7 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     #[cfg(feature = "wal")]
     pub(crate) wal: Option<Box<dyn WalReadWrite + Send>>,
     #[cfg(feature = "wal")]
-    pub(crate) flushing_segments: Arc<RwLock<HashMap<SegmentId, Vec<u8>>>>,
+    pub(crate) flushing_segments: Arc<RwLock<HashMap<SegmentId, Weak<Pin<Box<Vec<u8>>>>>>>,
 }
 
 impl<T: Send + Clone, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
@@ -906,8 +910,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
                 let lock = self.flushing_segments.read().await;
-                let Some(data) = lock.get(&segid) else {
+                let Some(weak_data) = lock.get(&segid) else {
                     panic!("unable to find segid: {segid} from inflight flushing segments");
+                };
+                let Some(data) = weak_data.upgrade() else {
+                    panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
                 };
                 let start_off = staging_off + offset;
                 let end = start_off + data_block_size;
@@ -940,8 +947,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
                 let lock = self.flushing_segments.read().await;
-                let Some(data) = lock.get(&segid) else {
+                let Some(weak_data) = lock.get(&segid) else {
                     panic!("unable to find segid: {segid} from inflight flushing segments");
+                };
+                let Some(data) = weak_data.upgrade() else {
+                    panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
                 };
                 let start_off = staging_off + offset;
                 let end = start_off + data_block_size;
@@ -1282,7 +1292,7 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
 
     // wal
     #[cfg(feature = "wal")]
-    async fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Vec<u8>) {
+    async fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) {
         let mut lock = self.flushing_segments.write().await;
         if let Some(_) = lock.insert(mem_segid, mem_segdata) {
             panic!("wal set mem segment - segid {mem_segid} already exists in memory flushing segments");
