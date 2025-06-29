@@ -1302,8 +1302,14 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
     #[cfg(feature = "wal")]
     async fn wal_clear_mem_segment(&self, mem_segid: SegmentId) {
         let mut lock = self.flushing_segments.write().await;
-        if let None = lock.remove(&mem_segid) {
+        let Some(weak_mem_seg) = lock.remove(&mem_segid) else {
             panic!("wal clear mem segment - segid {mem_segid} did not exists in memory flushing segments");
-        }
+        };
+        let Some(mem_seg) = weak_mem_seg.upgrade() else {
+            panic!("wal clear mem segment - segid {mem_segid} not be able to upgrade");
+        };
+        unsafe { Arc::decrement_strong_count(Arc::as_ptr(&mem_seg)) };
+        // end of mem segment life
+        drop(mem_seg);
     }
 }

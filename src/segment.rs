@@ -326,7 +326,11 @@ impl<T: SegmentReadWrite> Writer<T> {
     }
 
     pub async fn done(self) -> Result<()> {
-        self.ctx.done(self.segid, &self.data, self.offset).await
+        let _ = self.ctx.done(self.segid, &self.data, self.offset).await?;
+        #[cfg(feature = "wal")]
+        // force a strong count to keep data's life until wal_clear_mem_segment()
+        unsafe { Arc::increment_strong_count(Arc::as_ptr(&self.data)) };
+        Ok(())
     }
 
     #[cfg(feature = "wal")]
