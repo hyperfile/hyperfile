@@ -905,7 +905,6 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             if segid > self.inode().get_last_ondisk_cno() {
-                let data_block_size = self.config.meta.data_block_size;
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
@@ -917,7 +916,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
                 };
                 let start_off = staging_off + offset;
-                let end = start_off + data_block_size;
+                let end = start_off + data_buf.len();
                 data_buf.copy_from_slice(&data[start_off..end]);
                 return Ok(());
             }
@@ -942,7 +941,6 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             if segid > self.inode().get_last_ondisk_cno() {
-                let data_block_size = self.config.meta.data_block_size;
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
@@ -954,7 +952,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
                 };
                 let start_off = staging_off + offset;
-                let end = start_off + data_block_size;
+                let end = start_off + data_buf.len();
                 data_buf.copy_from_slice(&data[start_off..end]);
                 return Ok(());
             }
