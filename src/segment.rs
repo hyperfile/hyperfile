@@ -12,6 +12,8 @@ use crate::{BlockIndex, BlockPtr};
 use crate::config::HyperFileMetaConfig;
 use crate::inode::Inode;
 use crate::ondisk::InodeRaw;
+#[cfg(feature = "concurrent-segment-build")]
+use crate::buffer::DataBlock;
 
 pub struct Segment;
 
@@ -273,6 +275,54 @@ impl<T: SegmentReadWrite> Writer<T> {
         data.copy_from_slice(buf);
         self.offset += len;
         self.ctx.append(self.segid, buf)
+    }
+
+    #[cfg(feature = "concurrent-segment-build")]
+    pub fn spawn_append(&mut self, chunk: Vec<&DataBlock>) -> Result<tokio::task::JoinHandle<()>> {
+        let len = chunk.iter().map(|block| block.size()).sum();
+        #[cfg(not(feature = "wal"))]
+        let slice_start = {
+
+        self.data.resize(self.offset + len, 0);
+        let slice_start = &mut self.data[self.offset..];
+        slice_start
+
+        };
+        #[cfg(feature = "wal")]
+        let slice_start = {
+
+        let Some(data) = Arc::get_mut(&mut self.data) else {
+            panic!("failed to get back inner data buffer during segment build");
+        };
+        data.resize(self.offset + len, 0);
+        let slice_start = &mut data[self.offset..];
+        slice_start
+
+        };
+
+        let (data, _) = slice_start.split_at_mut(len);
+        // extend source and target buf lifetime for spawn_blocking
+        let new_data = unsafe {
+            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data.len())
+        };
+        let new_chunk = chunk.into_iter()
+                .map(|block| unsafe {
+                    let buf = block.as_slice();
+                    std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len())
+                })
+                .collect::<Vec<&[u8]>>();
+        let join = tokio::task::spawn_blocking(move || {
+            for (i, buf) in new_chunk.into_iter().enumerate() {
+                let start = i * buf.len();
+                let end = start + buf.len();
+                let data = &mut new_data[start..end];
+                data.copy_from_slice(buf);
+            }
+        });
+        self.offset += len;
+        // NOTE:
+        // call of self.ctx.append(self.segid, buf) is removed
+        Ok(join)
     }
 
     pub async fn done(self) -> Result<()> {

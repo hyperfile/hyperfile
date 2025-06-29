@@ -32,6 +32,7 @@ human_bytes = "0.4.3"
 default = ["reactor", "meta_loader_batch"]
 meta_loader_batch = []
 wal = []
+concurrent-segment-build = []
 # concurrency control by range lock
 range-lock = ["dep:rangemap"]
 reactor = ["dep:reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
