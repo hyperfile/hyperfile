@@ -873,6 +873,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             // NOTE: this not intend to happen in currently design, kick warning
             block.copy(off, buf);
             self.data_blocks_dirty.insert(blk_idx, block);
+            #[cfg(not(feature = "wal"))]
             warn!("update_cache - block index: {blk_idx} not in dirty list but in cache list, this is not by design");
         } else {
             // can't found in dirty list, create a new one
