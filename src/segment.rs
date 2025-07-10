@@ -18,7 +18,7 @@ use crate::buffer::DataBlock;
 pub struct Segment;
 
 impl Segment {
-    pub(crate) fn segid_to_staging_file_id(segid: SegmentId) -> String {
+    pub fn segid_to_staging_file_id(segid: SegmentId) -> String {
         format!("{:0>10}", segid)
     }
 }
