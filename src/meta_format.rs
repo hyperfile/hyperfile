@@ -140,4 +140,12 @@ impl BlockPtrFormat {
     pub fn decode_micro_group_id(blk_ptr: &BlockPtr) -> u64 {
         blk_ptr & BLOCK_PTR_SEGMENT_MG_GROUP_INDEX_MASK
     }
+
+    // segid location is fixed, not depend on specific format
+    #[inline]
+    pub fn decode_segid(blk_ptr: &BlockPtr) -> SegmentId {
+        let p = blk_ptr & !BLOCK_PTR_LOCATION_MASK;
+        let segid = (p & BLOCK_PTR_SEGMENT_ID_MASK) >> BLOCK_PTR_SEGMENT_ID_BIT_SHIFT;
+        segid as SegmentId
+    }
 }
