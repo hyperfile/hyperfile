@@ -125,7 +125,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let wal = config.wal.to_wal(config.meta.data_block_size, inode.get_last_seq())?;
 
         #[cfg(feature = "range-lock")]
-        let range_lock = RangeLock::new();
+        let range_lock = RangeLock::new(config.meta.data_block_size as u64);
 
         use std::num::NonZeroUsize;
         let mut file = Self {
@@ -233,7 +233,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let wal = config.wal.to_wal(config.meta.data_block_size, inode.get_last_seq())?;
 
         #[cfg(feature = "range-lock")]
-        let range_lock = RangeLock::new();
+        let range_lock = RangeLock::new(config.meta.data_block_size as u64);
 
         use std::num::NonZeroUsize;
         let mut file = Self {
