@@ -13,7 +13,6 @@ use crate::SegmentId;
 use crate::inode::OnDiskState;
 use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::hyper::Hyper;
-#[cfg(not(feature = "wal"))]
 use super::HyperTrait;
 
 pub type FileRespGetAttr = Result<libc::stat>;
@@ -753,10 +752,19 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::Flush => {
                 let md = unsafe { req.body.flush };
                 let req = ManuallyDrop::into_inner(md);
-                let res = self.inner.kick_wal_protected_flush_reactor(req.fh).await;
-                if res.is_err() {
-                    warn!("kick wal flush failed {:?}", res);
-                }
+                let res = if self.inner.wal.is_none() {
+                    let res = self.inner.flush().await;
+                    if res.is_err() {
+                        warn!("kick flush failed {:?}", res);
+                    }
+                    res
+                } else {
+                    let res = self.inner.kick_wal_protected_flush_reactor(req.fh).await;
+                    if res.is_err() {
+                        warn!("kick wal flush failed {:?}", res);
+                    }
+                    res
+                };
                 let _ = resp.to_flush().send(res);
             },
             #[cfg(feature = "wal")]

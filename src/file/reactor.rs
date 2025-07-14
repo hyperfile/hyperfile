@@ -56,7 +56,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             return Ok(SpawnReadSize::ImmSize(data_buf.len()));
         }
         #[cfg(feature = "wal")]
-        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+        if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             if segid > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
@@ -108,7 +108,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     pub(crate) fn spawn_load_data_block_write_path(&self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<JoinHandle<usize>> {
         debug!("spawn_load_data_block_write_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         #[cfg(feature = "wal")]
-        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+        if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             if segid > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
@@ -411,7 +411,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         if self.need_flush() {
             #[cfg(feature = "wal")]
-            if let Err(_) = self.flush_lock.try_lock() {
+            if self.wal.is_none() {
+                self.flush().await?;
+            } else if let Err(_) = self.flush_lock.try_lock() {
                 // if flushing is on going, let skip it
             } else {
                 let fh = req.fh;
@@ -516,7 +518,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         if self.need_flush() {
             #[cfg(feature = "wal")]
-            if let Err(_) = self.flush_lock.try_lock() {
+            if self.wal.is_none() {
+                self.flush().await?;
+            } else if let Err(_) = self.flush_lock.try_lock() {
                 // if flushing is on going, let skip it
             } else {
                 let fh = req.fh;

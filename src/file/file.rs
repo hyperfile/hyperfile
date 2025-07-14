@@ -903,7 +903,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             return Ok(());
         }
         #[cfg(feature = "wal")]
-        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+        if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             if segid > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
@@ -939,7 +939,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     async fn load_data_block_write_path(&self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
         debug!("load_data_block - block ptr: {}", self.blk_ptr_decode_display(&blk_ptr));
         #[cfg(feature = "wal")]
-        if BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
+        if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             if segid > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
