@@ -358,7 +358,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if let Some(_) = &mut self.wal {
             let fh = req.fh.clone();
             let ctx = FileContext::write_wal(req, resp);
-            fh.send_highprio(ctx);
+            fh.send_cb(ctx);
             // TODO: change to ErrorKind::InProgress when it's stable
             return Err(Error::new(ErrorKind::ResourceBusy, "op resubmit to exec write wal"));
         }
@@ -449,7 +449,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if let Some(_) = &mut self.wal {
             let fh = req.fh.clone();
             let ctx = FileContext::write_zero_wal(req, resp);
-            fh.send_highprio(ctx);
+            fh.send_cb(ctx);
             // TODO: change to ErrorKind::InProgress when it's stable
             return Err(Error::new(ErrorKind::ResourceBusy, "op resubmit to exec write zero wal"));
         }
@@ -572,7 +572,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             let _ = actual_bytes;
             let fh = req.fh.clone();
             let ctx = FileContext::write_absorb(req, resp);
-            fh.send_highprio(ctx);
+            fh.send_cb(ctx);
         });
 
         Ok(())
@@ -616,7 +616,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             let _ = actual_bytes;
             let fh = req.fh.clone();
             let ctx = FileContext::write_zero_absorb(req, resp);
-            fh.send_highprio(ctx);
+            fh.send_cb(ctx);
         });
 
         Ok(())
@@ -712,7 +712,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             }
             let fh = req.fh.clone();
             let ctx = FileContext::write_absorb_bh(req, resp);
-            fh.send_highprio(ctx);
+            fh.send_cb(ctx);
         });
         Ok(len)
     }
@@ -734,7 +734,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             }
             let fh = req.fh.clone();
             let ctx = FileContext::write_zero_absorb_bh(req, resp);
-            fh.send_highprio(ctx);
+            fh.send_cb(ctx);
         });
         Ok(len)
     }

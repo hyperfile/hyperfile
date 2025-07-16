@@ -431,19 +431,19 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
                 Err(e) => {
                     warn!("segment write failed in wal flush process: {:?}", e);
                     let ctx = FileContext::new_wal_flush_recovery(lock);
-                    fh.send_highprio(ctx);
+                    fh.send_cb(ctx);
                     return;
                 },
             }
             match staging.flush_inode(raw_inode.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
                 Ok(od_state) => {
                     let ctx = FileContext::new_wal_flush_done(lock, segid, od_state.unwrap().clone(), bmap_cache_limit);
-                    fh.send_highprio(ctx);
+                    fh.send_cb(ctx);
                 },
                 Err(e) => {
                     warn!("flush inode failed in wal flush process: {:?}", e);
                     let ctx = FileContext::new_wal_flush_recovery(lock);
-                    fh.send_highprio(ctx);
+                    fh.send_cb(ctx);
                 },
             }
         });
