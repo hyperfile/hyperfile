@@ -502,6 +502,23 @@ impl<'a> FileContext<'a> {
         };
         Self { req: Some(req), resp: Some(resp) }
     }
+
+    pub fn reform_flush(req: FileReqFlush<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::Flush,
+            body: FileReqBody { flush: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn reform_wal_flush(req: FileReqWalFlush<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::WalFlush,
+            body: FileReqBody { wal_flush: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
 }
 
 impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
@@ -744,7 +761,14 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             #[cfg(not(feature = "wal"))]
             FileReqOp::Flush => {
                 let md = unsafe { req.body.flush };
-                let _ = ManuallyDrop::into_inner(md);
+                let _req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                if self.inner.range_lock.is_locked() {
+                    let fh = _req.fh.clone();
+                    let ctx = FileContext::reform_flush(_req, resp);
+                    fh.send_cb(ctx);
+                    return;
+                }
                 let res = self.inner.flush().await;
                 let _ = resp.to_flush().send(res);
             },
@@ -752,6 +776,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::Flush => {
                 let md = unsafe { req.body.flush };
                 let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                if self.inner.range_lock.is_locked() {
+                    let fh = req.fh.clone();
+                    let ctx = FileContext::reform_flush(req, resp);
+                    // move flush op to cb queue
+                    // so that flush op can run immediately after all inflight write op finished
+                    fh.send_cb(ctx);
+                    return;
+                }
                 let res = if self.inner.wal.is_none() {
                     let res = self.inner.flush().await;
                     if res.is_err() {
@@ -771,6 +804,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::WalFlush => {
                 let md = unsafe { req.body.wal_flush };
                 let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                if self.inner.range_lock.is_locked() {
+                    let fh = req.fh.clone();
+                    let ctx = FileContext::reform_wal_flush(req, resp);
+                    // move flush op to cb queue
+                    // so that flush op can run immediately after all inflight write op finished
+                    fh.send_cb(ctx);
+                    return;
+                }
                 let res = self.inner.kick_wal_protected_flush_reactor(req.fh).await;
                 if res.is_err() {
                     warn!("kick wal flush failed {:?}, ignore this flush request", res);
