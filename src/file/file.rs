@@ -124,6 +124,15 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         #[cfg(feature = "wal")]
         let wal = config.wal.to_wal(config.meta.data_block_size, inode.get_last_seq())?;
 
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = wal {
+            let v = wal.collect_segments().await?;
+            if v.len() > 0 {
+                warn!("wal {} is not empty, please clear before create new file", config.wal.root_uri);
+                return Err(Error::new(ErrorKind::ResourceBusy, "wal directory is not empty"));
+            }
+        }
+
         #[cfg(feature = "range-lock")]
         let range_lock = RangeLock::new(config.meta.data_block_size as u64);
 
