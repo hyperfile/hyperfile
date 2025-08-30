@@ -273,6 +273,19 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         };
         // refresh bmap if need to do recovery
         let _ = file.refresh_bmap().await?;
+
+        #[cfg(feature = "wal")]
+        if let Some(ref wal) = file.wal {
+            let v = wal.collect_segments().await?;
+            if let Some(wal_max_segid) = v.iter().max() {
+                let last_seq = file.inode().get_last_seq();
+                if *wal_max_segid >= last_seq {
+                    warn!("inconsistent wal data - max segid on wal: {}, seq in inode: {}", wal_max_segid, last_seq);
+                    let lock = file.flush_lock().await;
+                    let _ = file.wal_flush_recovery(lock).await;
+                }
+            }
+        }
         Ok(file)
     }
 
