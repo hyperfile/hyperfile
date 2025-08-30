@@ -4,12 +4,43 @@ use bytes::Buf;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
-use aws_sdk_s3::types::{Object, ObjectIdentifier};
+use aws_sdk_s3::types::{Object, ObjectIdentifier, CommonPrefix};
 use crate::inode::OnDiskState;
 
 pub(crate) struct S3Ops;
 
 impl S3Ops {
+    pub(crate) async fn do_list_directory(client: &Client, bucket: &str, prefix: &str, mut f: impl FnMut(&CommonPrefix)) -> Result<()> {
+        let mut stream = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .delimiter("/")
+            .into_paginator()
+            .send();
+
+        while let Some(page) = stream.next().await {
+            match page {
+                Ok(list_res) => {
+                    if let Some(prefixes) = list_res.common_prefixes {
+                        prefixes.iter().for_each(|p| f(p))
+                    }
+                },
+                Err(sdk_err) => {
+                    let mut err_str = format!("ListObjectV2 s3://{}/{} error: ", bucket, prefix);
+                    if let Some(serv_err) = sdk_err.as_service_error() {
+                        err_str.push_str(&format!("{}", serv_err));
+                    } else {
+                        err_str.push_str(&format!("{}", sdk_err));
+                    };
+                    error!("{}", err_str);
+                    return Err(Error::new(ErrorKind::Other, err_str));
+                },
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn do_list_objects(client: &Client, bucket: &str, prefix: &str, mut f: impl FnMut(&Object)) -> Result<()> {
         let mut stream = client
             .list_objects_v2()
