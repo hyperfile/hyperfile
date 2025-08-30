@@ -14,7 +14,6 @@ pub(crate) struct S3Wal {
     pub(crate) client: Client,
     pub(crate) bucket: String,
     pub(crate) root_path: String,
-    #[allow(dead_code)]
     pub(crate) root_path_slash: String,  // root path with tail slash
     #[allow(dead_code)]
     pub(crate) data_block_size: usize,
@@ -110,6 +109,33 @@ impl WalReadWrite for S3Wal {
         Box::pin(async move {
             let zero: Vec<u8> = Vec::new();
             S3Ops::do_put_object(&client, &bucket, &key, &zero, &None).await.and(Ok(()))
+        })
+    }
+
+    // collect segment id by list first level of directory with delimit
+    fn collect_segments(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SegmentId>>> + Send + '_>> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let root_path_slash = self.root_path_slash.clone();
+        Box::pin(async move {
+            let mut v = Vec::new();
+            let filter = |c: &aws_sdk_s3::types::CommonPrefix| {
+                if let Some(prefix) = c.prefix() {
+                    let prefix = prefix.trim_end_matches('/');
+                    let segid_str = prefix.trim_start_matches(&root_path_slash);
+                    if let Ok(segid) = segid_str.parse::<u64>() {
+                        v.push(segid);
+                    }
+                }
+            };
+            let res = S3Ops::do_list_directory(&client, &bucket, &root_path_slash, filter).await;
+            match res {
+                Ok(_) => {
+                    v.sort();
+                    Ok(v)
+                },
+                Err(e) => Err(e),
+            }
         })
     }
 
