@@ -3,12 +3,12 @@ use std::pin::Pin;
 use std::io::{Result, Error, ErrorKind};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
 use aws_sdk_s3::Client;
-use crate::buffer::BatchDataBlockWrapper;
 use crate::{segment::Segment, SegmentId};
 use crate::s3commons::S3Ops;
 use crate::s3uri::S3Uri;
-use super::WalReadWrite;
+use super::{WalReadWrite, WalChunkDesc};
 
 pub(crate) struct S3Wal {
     pub(crate) client: Client,
@@ -70,7 +70,6 @@ impl S3Wal {
 
     // return: (seq, offset, len)
     #[inline]
-    #[allow(dead_code)]
     fn decode(&self, objname: &str) -> Option<(usize, usize, usize)> {
         let parts: Vec<&str> = objname.split('_').collect();
         if parts.len() != 3 {
@@ -112,8 +111,8 @@ impl WalReadWrite for S3Wal {
         })
     }
 
-    // collect segment id by list first level of directory with delimit
-    fn collect_segments(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SegmentId>>> + Send + '_>> {
+    // get segment ids by list first level of directory with delimit
+    fn list_segments(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SegmentId>>> + Send + '_>> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let root_path_slash = self.root_path_slash.clone();
@@ -139,8 +138,32 @@ impl WalReadWrite for S3Wal {
         })
     }
 
-    #[allow(dead_code)]
-    fn collect(&self, _segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Vec<BatchDataBlockWrapper>>> + Send + '_>> {
-        todo!();
+    // list ondisk wal chunks by segment id
+    fn list_chunks(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<BTreeMap<usize, WalChunkDesc>>> + Send + '_>> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let wal_segment_root_path = format!("{}{}/", self.root_path_slash, Segment::segid_to_staging_file_id(segid));
+        Box::pin(async move {
+            let mut map = BTreeMap::new();
+            let filter = |o: &aws_sdk_s3::types::Object| {
+                if let Some(key) = o.key() {
+                    let objname = key.trim_start_matches(&wal_segment_root_path);
+                    if let Some((seq, offset, len)) = self.decode(&objname) {
+                        let ondisk_size = o.size().expect("unable to get object size");
+                        let is_zero = if ondisk_size == 0 {
+                            true
+                        } else {
+                            false
+                        };
+                        map.insert(seq, WalChunkDesc { seq, key: key.to_string(), offset, len, is_zero });
+                    }
+                }
+            };
+            let res = S3Ops::do_list_objects(&client, &bucket, &wal_segment_root_path, filter).await;
+            match res {
+                Ok(_) => Ok(map),
+                Err(e) => Err(e),
+            }
+        })
     }
 }
