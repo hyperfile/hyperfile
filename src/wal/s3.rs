@@ -68,6 +68,12 @@ impl S3Wal {
         format!("{}/{}/{}_{}_{}", self.root_path, seg_s, seq, offset, len)
     }
 
+    #[inline]
+    fn encode_static(&self, seq: usize, segid: SegmentId, offset: usize, len: usize) -> String {
+        let seg_s = Segment::segid_to_staging_file_id(segid);
+        format!("{}/{}/{}_{}_{}", self.root_path, seg_s, seq, offset, len)
+    }
+
     // return: (seq, offset, len)
     #[inline]
     fn decode(&self, objname: &str) -> Option<(usize, usize, usize)> {
@@ -108,6 +114,20 @@ impl WalReadWrite for S3Wal {
         Box::pin(async move {
             let zero: Vec<u8> = Vec::new();
             S3Ops::do_put_object(&client, &bucket, &key, &zero, &None).await.and(Ok(()))
+        })
+    }
+
+    fn read(&self, seq: usize, segid: SegmentId, offset: usize, len: usize) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + '_>> {
+        let key = self.encode_static(seq, segid, offset, len);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        Box::pin(async move {
+            let mut buf = Vec::with_capacity(len);
+            let res = S3Ops::do_get_object(&client, &bucket, &key, &mut buf, None, false).await;
+            match res {
+                Ok(_) => Ok(buf),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -155,7 +175,7 @@ impl WalReadWrite for S3Wal {
                         } else {
                             false
                         };
-                        map.insert(seq, WalChunkDesc { seq, key: key.to_string(), offset, len, is_zero });
+                        map.insert(seq, WalChunkDesc { seq, segid, key: key.to_string(), offset, len, is_zero });
                     }
                 }
             };

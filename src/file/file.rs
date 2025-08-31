@@ -672,6 +672,31 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         wal.list_chunks(segid).await
     }
 
+    #[cfg(feature = "wal")]
+    pub async fn wal_replay_chunks(&mut self, segid: SegmentId) -> Result<SegmentId> {
+        let map = self.wal_list_chunks(segid).await?;
+
+        // take out wal to avoid write path exec into wal again
+        let wal = self.wal.take();
+
+        // retrieve all chunks and write to file
+        // TODO: currently one by one, make it concurrent in future
+        for (_, chunk) in map.iter() {
+            if chunk.is_zero {
+                let _ = self.write_zero(chunk.offset, chunk.len).await?;
+            } else {
+                let data = wal.as_ref().unwrap().read(chunk.seq, chunk.segid, chunk.offset, chunk.len).await?;
+                let _ = self.write(chunk.offset, &data).await?;
+            }
+        }
+
+        // install wal back
+        self.wal = wal;
+
+        // force flush
+        self.flush().await
+    }
+
     pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {
         // TODO update necessary inode fields
         let mut b: BMapRawType = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
