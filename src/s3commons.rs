@@ -4,12 +4,15 @@ use bytes::Buf;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
-use aws_sdk_s3::types::{Object, ObjectIdentifier, CommonPrefix};
+use aws_sdk_s3::types::{Object, ObjectIdentifier};
+#[cfg(feature = "wal")]
+use aws_sdk_s3::types::CommonPrefix;
 use crate::inode::OnDiskState;
 
 pub(crate) struct S3Ops;
 
 impl S3Ops {
+    #[cfg(feature = "wal")]
     pub(crate) async fn do_list_directory(client: &Client, bucket: &str, prefix: &str, mut f: impl FnMut(&CommonPrefix)) -> Result<()> {
         let mut stream = client
             .list_objects_v2()
