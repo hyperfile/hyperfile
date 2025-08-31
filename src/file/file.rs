@@ -31,7 +31,7 @@ use crate::config::{HyperFileConfig, HyperFileMetaConfig};
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::file::handler::FileContext;
 #[cfg(feature = "wal")]
-use crate::wal::WalReadWrite;
+use crate::wal::{WalReadWrite, WalChunkDesc};
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::inode::OnDiskState;
 use super::flags::HyperFileFlags;
@@ -126,7 +126,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         #[cfg(feature = "wal")]
         if let Some(ref wal) = wal {
-            let v = wal.collect_segments().await?;
+            let v = wal.list_segments().await?;
             if v.len() > 0 {
                 warn!("wal {} is not empty, please clear before create new file", config.wal.root_uri);
                 return Err(Error::new(ErrorKind::ResourceBusy, "wal directory is not empty"));
@@ -276,7 +276,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         #[cfg(feature = "wal")]
         if let Some(ref wal) = file.wal {
-            let v = wal.collect_segments().await?;
+            let v = wal.list_segments().await?;
             if let Some(wal_max_segid) = v.iter().max() {
                 let last_seq = file.inode().get_last_seq();
                 if *wal_max_segid >= last_seq {
@@ -654,6 +654,22 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     pub(crate) async fn wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
         drop(lock);
         todo!();
+    }
+
+    #[cfg(feature = "wal")]
+    pub async fn wal_list_segments(&self) -> Result<Vec<SegmentId>> {
+        let Some(ref wal) = self.wal else {
+            return Err(Error::new(ErrorKind::Unsupported, "wal is not configured"));
+        };
+        wal.list_segments().await
+    }
+
+    #[cfg(feature = "wal")]
+    pub async fn wal_list_chunks(&self, segid: SegmentId) -> Result<BTreeMap<usize, WalChunkDesc>> {
+        let Some(ref wal) = self.wal else {
+            return Err(Error::new(ErrorKind::Unsupported, "wal is not configured"));
+        };
+        wal.list_chunks(segid).await
     }
 
     pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {
