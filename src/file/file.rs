@@ -7,7 +7,7 @@ use std::sync::Weak;
 use std::pin::Pin;
 use std::time::{Instant, Duration};
 use std::io::{Error, ErrorKind, Result};
-use log::{debug, warn};
+use log::{debug, warn, info};
 use lru::LruCache;
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use reactor::TaskHandler;
@@ -652,8 +652,36 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     // everything should be clean or give a panic if unrecoverable
     #[cfg(feature = "wal")]
     pub(crate) async fn wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
+        info!("wal_flush_recovery - started");
+        match self.do_wal_flush_recovery(lock).await {
+            Ok(cno) => {
+                if cno != 0 { return Ok(cno); }
+                warn!("wal_flush_recovery - return with cno 0");
+            },
+            Err(e) => {
+                warn!("wal_flush_recovery - return with err {}", e);
+            },
+        }
+        panic!("wal_flush_recovery - failed, please fix wal with offline tools");
+    }
+
+    #[cfg(feature = "wal")]
+    async fn do_wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
+        let v = self.wal_list_segments().await?;
+        let last_ondisk = self.inode().get_last_ondisk_cno();
+        // filter out candidate segment id to playback
+        let mut segids: Vec<_> = v.into_iter().filter(|id| *id >= last_ondisk).collect();
+        segids.sort();
+        debug!("do_wal_flush_recovery - replay segments {:?}", segids);
+
+        let mut cno = 0;
+        for segid in segids {
+            cno = self.wal_replay_chunks(segid).await?;
+            assert!(cno == segid + 1);
+        }
+
         drop(lock);
-        todo!();
+        Ok(cno)
     }
 
     #[cfg(feature = "wal")]
@@ -674,6 +702,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
     #[cfg(feature = "wal")]
     pub async fn wal_replay_chunks(&mut self, segid: SegmentId) -> Result<SegmentId> {
+        debug!("wal_replay_chunks - start to process {}", segid);
         let map = self.wal_list_chunks(segid).await?;
 
         // take out wal to avoid write path exec into wal again
@@ -694,7 +723,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         self.wal = wal;
 
         // force flush
-        self.flush().await
+        self.flush_process().await
     }
 
     pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {
