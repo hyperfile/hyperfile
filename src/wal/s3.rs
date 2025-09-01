@@ -123,6 +123,7 @@ impl WalReadWrite for S3Wal {
         let bucket = self.bucket.clone();
         Box::pin(async move {
             let mut buf = Vec::with_capacity(len);
+            buf.resize(len, 0);
             let res = S3Ops::do_get_object(&client, &bucket, &key, &mut buf, None, false).await;
             match res {
                 Ok(_) => Ok(buf),
