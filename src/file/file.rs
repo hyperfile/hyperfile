@@ -7,7 +7,7 @@ use std::sync::Weak;
 use std::pin::Pin;
 use std::time::{Instant, Duration};
 use std::io::{Error, ErrorKind, Result};
-use log::{debug, warn, info};
+use log::{debug, warn};
 use lru::LruCache;
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use reactor::TaskHandler;
@@ -652,7 +652,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     // everything should be clean or give a panic if unrecoverable
     #[cfg(feature = "wal")]
     pub(crate) async fn wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
-        info!("wal_flush_recovery - started");
+        debug!("wal_flush_recovery - started");
         match self.do_wal_flush_recovery(lock).await {
             Ok(cno) => {
                 if cno != 0 { return Ok(cno); }
