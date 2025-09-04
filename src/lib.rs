@@ -9,6 +9,7 @@ pub mod buffer;
 pub mod utils;
 pub mod staging;
 pub mod meta_loader;
+pub mod cache;
 pub(crate) mod s3commons;
 #[cfg(feature = "wal")]
 pub mod wal;
