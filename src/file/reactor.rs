@@ -30,7 +30,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     fn spawn_load_data_block_read_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<SpawnReadSize> {
         debug!("spawn_load_data_block_read_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         // in read path we would check dirty cache before do real data load
-        if let Some(block) = self.cache.get_block(&blk_id) {
+        if let Some(block) = self.cache.get(&blk_id) {
             // cache hit
             let slice = unsafe {
                 std::slice::from_raw_parts(block.as_slice().as_ptr() as *const u8, block.as_slice().len())
@@ -130,7 +130,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             });
             return Ok(join);
         } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
-            if let Some(block) = self.cache.get_block(&blk_id) {
+            if let Some(block) = self.cache.get(&blk_id) {
                 // cache hit
                 debug!("load_data_block - Cache Hit on data blocks dirty for block index: {}", blk_id);
                 let slice = unsafe {
@@ -331,7 +331,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         // to update the block data
         for block in fetched.into_iter() {
             let blk_idx = block.index();
-            let None = self.cache.insert_block(blk_idx, block) else {
+            let None = self.cache.insert(blk_idx, block) else {
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
         }
@@ -418,7 +418,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         // to update the block data
         for block in fetched.into_iter() {
             let blk_idx = block.index();
-            let None = self.cache.insert_block(blk_idx, block) else {
+            let None = self.cache.insert(blk_idx, block) else {
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
         }
@@ -459,7 +459,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 // insert or update
                 let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 bytes_write += data_len;
-                let _ = self.cache.remove_block(&blk_idx);
+                let _ = self.cache.remove(&blk_idx);
                 continue;
             }
             // for a incomplete block
@@ -469,7 +469,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 // insert or update
                 let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
                 bytes_write += data_len;
-                let _ = self.cache.remove_block(&blk_idx);
+                let _ = self.cache.remove(&blk_idx);
                 continue;
             }
             // update cache data with zero
