@@ -1068,8 +1068,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             }
         }
         #[cfg(feature = "reactor")]
-        while let Some(j) = joins.pop() {
-            let _ = j.await.unwrap();
+        while let Some(o) = joins.pop() {
+            match o {
+                super::reactor::ImmOrJoinSize::ImmSize(_) => {},
+                super::reactor::ImmOrJoinSize::JoinSize(j) => { let _ = j.await; },
+            }
         }
 
         // insert fetched data blocks into dirty list

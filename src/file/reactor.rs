@@ -12,7 +12,7 @@ use crate::buffer::DataBlock;
 use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 
-enum ImmOrJoinSize {
+pub(crate) enum ImmOrJoinSize {
     ImmSize(usize),
     JoinSize(JoinHandle<usize>),
 }
@@ -91,7 +91,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         }
     }
 
-    pub(crate) fn spawn_load_data_block_write_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<JoinHandle<usize>> {
+    pub(crate) fn spawn_load_data_block_write_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {
         debug!("spawn_load_data_block_write_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
@@ -114,7 +114,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     data_buf.copy_from_slice(&data[start_off..end]);
                     data_buf.len()
                 });
-                return Ok(join);
+                return Ok(ImmOrJoinSize::JoinSize(join));
             }
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
@@ -128,7 +128,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
                 data_buf.len()
             });
-            return Ok(join);
+            return Ok(ImmOrJoinSize::JoinSize(join));
         } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
             if let Some(block) = self.cache.get(&blk_id) {
                 // cache hit
@@ -139,11 +139,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
-                let join = self.rt.as_ref().unwrap().spawn(async move {
-                    data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
-                    data_buf.len()
-                });
-                return Ok(join);
+                data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
+                return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
             }
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_id);
         } else if BlockPtrFormat::is_zero_block(&blk_ptr) {
@@ -151,11 +148,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             let data_buf = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
-            let join = self.rt.as_ref().unwrap().spawn(async move {
-                data_buf.fill(0);
-                data_buf.len()
-            });
-            return Ok(join);
+            data_buf.fill(0);
+            return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
         } else {
             panic!("incorrect block ptr {} to load", blk_ptr);
         }
@@ -542,8 +536,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         self.rt.as_ref().unwrap().spawn(async move {
             let mut actual_bytes = 0;
-            while let Some(j) = joins.pop() {
-                let bytes = j.await.unwrap();
+            while let Some(o) = joins.pop() {
+                let bytes = match o {
+                    ImmOrJoinSize::ImmSize(size) => size,
+                    ImmOrJoinSize::JoinSize(j) => j.await.unwrap(),
+                };
                 actual_bytes += bytes;
             }
             req.fetched.append(&mut fetched);
@@ -586,8 +583,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
         self.rt.as_ref().unwrap().spawn(async move {
             let mut actual_bytes = 0;
-            while let Some(j) = joins.pop() {
-                let bytes = j.await.unwrap();
+            while let Some(o) = joins.pop() {
+                let bytes = match o {
+                    ImmOrJoinSize::ImmSize(size) => size,
+                    ImmOrJoinSize::JoinSize(j) => j.await.unwrap(),
+                };
                 actual_bytes += bytes;
             }
             req.fetched.append(&mut fetched);
