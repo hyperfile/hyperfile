@@ -61,18 +61,61 @@ impl Drop for AllocDataBlock {
     }
 }
 
+pub struct MmapDataBlock {
+    ptr: *mut u8,
+    size: usize,
+}
+
+unsafe impl Send for MmapDataBlock {}
+unsafe impl Sync for MmapDataBlock {}
+
+impl MmapDataBlock {
+    pub fn new(ptr: *mut u8, size: usize) -> Self {
+        Self { ptr, size }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self.ptr, self.size)
+        }
+    }
+
+    pub fn as_mut_slice(&self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr, self.size)
+        }
+    }
+}
+
+pub enum AlignedDataBlock {
+    Alloc(Pin<Box<AllocDataBlock>>),
+    Mmap(MmapDataBlock),
+}
+
 const DATA_BLOCK_FLAG_SHOULD_CACHE: u64 = 0x1;
 
 pub struct DataBlock {
-    data: Pin<Box<AllocDataBlock>>,
+    data: AlignedDataBlock,
     index: BlockIndex,
     flags: u64,
 }
 
 impl DataBlock {
     pub fn new(index: BlockIndex, size: usize) -> Self {
+        Self::new_alloc(index, size)
+    }
+
+    pub fn new_alloc(index: BlockIndex, size: usize) -> Self {
         Self {
-            data: Box::pin(AllocDataBlock::new(size)),
+            data: AlignedDataBlock::Alloc(Box::pin(AllocDataBlock::new(size))),
+            index: index,
+            flags: 0,
+        }
+    }
+
+    pub fn new_mmap(index: BlockIndex, ptr: *mut u8, size: usize) -> Self {
+        Self {
+            data: AlignedDataBlock::Mmap(MmapDataBlock::new(ptr, size)),
             index: index,
             flags: 0,
         }
@@ -81,7 +124,7 @@ impl DataBlock {
     // duplicate a data block by copy
     pub fn dup(&self) -> Self {
         let n = Self {
-            data: Box::pin(AllocDataBlock::new(self.size())),
+            data: AlignedDataBlock::Alloc(Box::pin(AllocDataBlock::new(self.size()))),
             index: self.index(),
             flags: self.flags,
         };
@@ -97,19 +140,29 @@ impl DataBlock {
     // unique id from value of inner buffer pointer
     #[inline]
     pub fn uid(&self) -> u64 {
-        self.data.ptr as u64
+        match &self.data {
+            AlignedDataBlock::Alloc(alloc) => alloc.ptr as u64,
+            AlignedDataBlock::Mmap(mmap) => mmap.ptr as u64,
+        }
     }
 
     // get buffer size
     #[inline]
     pub fn size(&self) -> usize {
-        self.data.layout.size()
+        match &self.data {
+            AlignedDataBlock::Alloc(alloc) => alloc.layout.size(),
+            AlignedDataBlock::Mmap(mmap) => mmap.size,
+        }
     }
 
     /// copy all data from slice into block buffer start with offset
     pub fn copy(&mut self, offset: usize, data: &[u8]) {
+        let ptr = match &self.data {
+            AlignedDataBlock::Alloc(alloc) => alloc.ptr,
+            AlignedDataBlock::Mmap(mmap) => mmap.ptr,
+        };
         let s = unsafe {
-            let ptr = self.data.ptr.add(offset);
+            let ptr = ptr.add(offset);
             std::slice::from_raw_parts_mut(ptr, data.len())
         };
         s.copy_from_slice(data);
@@ -117,8 +170,12 @@ impl DataBlock {
 
     /// copy data from block into supplied buffer
     pub fn copy_out(&self, offset: usize, buf: &mut [u8]) {
+        let ptr = match &self.data {
+            AlignedDataBlock::Alloc(alloc) => alloc.ptr,
+            AlignedDataBlock::Mmap(mmap) => mmap.ptr,
+        };
         let s = unsafe {
-            let ptr = self.data.ptr.add(offset);
+            let ptr = ptr.add(offset);
             std::slice::from_raw_parts_mut(ptr, buf.len())
         };
         buf.copy_from_slice(s);
@@ -126,12 +183,18 @@ impl DataBlock {
 
     // expose inner data as slice
     pub fn as_slice(&self) -> &[u8] {
-        self.data.as_slice()
+        match &self.data {
+            AlignedDataBlock::Alloc(alloc) => alloc.as_slice(),
+            AlignedDataBlock::Mmap(mmap) => mmap.as_slice(),
+        }
     }
 
     // expose inner data as slice
     pub fn as_mut_slice(&self) -> &mut [u8] {
-        self.data.as_mut_slice()
+        match &self.data {
+            AlignedDataBlock::Alloc(alloc) => alloc.as_mut_slice(),
+            AlignedDataBlock::Mmap(mmap) => mmap.as_mut_slice(),
+        }
     }
 
     pub fn set_should_cache(&mut self) {
