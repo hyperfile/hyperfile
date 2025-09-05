@@ -12,12 +12,12 @@ use crate::buffer::DataBlock;
 use super::file::HyperFile;
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
 
-enum SpawnReadSize {
+enum ImmOrJoinSize {
     ImmSize(usize),
     JoinSize(JoinHandle<usize>),
 }
 
-impl SpawnReadSize {
+impl ImmOrJoinSize {
     fn size(&self) -> usize {
         match self {
             Self::ImmSize(sz) => { *sz },
@@ -27,7 +27,7 @@ impl SpawnReadSize {
 }
 
 impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    fn spawn_load_data_block_read_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<SpawnReadSize> {
+    fn spawn_load_data_block_read_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {
         debug!("spawn_load_data_block_read_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         // in read path we would check dirty cache before do real data load
         if let Some(block) = self.cache.get(&blk_id) {
@@ -39,7 +39,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
             data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
-            return Ok(SpawnReadSize::ImmSize(data_buf.len()));
+            return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
         }
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
@@ -62,7 +62,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     data_buf.copy_from_slice(&data[start_off..end]);
                     data_buf.len()
                 });
-                return Ok(SpawnReadSize::JoinSize(join));
+                return Ok(ImmOrJoinSize::JoinSize(join));
             }
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
@@ -76,7 +76,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
                 data_buf.len()
             });
-            return Ok(SpawnReadSize::JoinSize(join));
+            return Ok(ImmOrJoinSize::JoinSize(join));
         } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_id);
         } else if BlockPtrFormat::is_zero_block(&blk_ptr) {
@@ -85,7 +85,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
             data_buf.fill(0);
-            return Ok(SpawnReadSize::ImmSize(data_buf.len()));
+            return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
         } else {
             panic!("spawn_load_data_block_read_path - offset: {}, bytes: {}, incorrect block ptr {} to load", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         }
@@ -277,7 +277,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         }
 
         // if nothing need to join, return directly
-        if joins.iter().all(|x| match x { SpawnReadSize::ImmSize(_) => true, SpawnReadSize::JoinSize(_) => false, }) {
+        if joins.iter().all(|x| match x { ImmOrJoinSize::ImmSize(_) => true, ImmOrJoinSize::JoinSize(_) => false, }) {
             let actual_bytes = joins.iter().map(|x| x.size()).sum();
             assert!(total_bytes == actual_bytes);
             if actual_bytes > 0 {
@@ -300,8 +300,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             let mut actual_bytes = 0;
             while let Some(join) = joins.pop() {
                 let bytes = match join {
-                    SpawnReadSize::ImmSize(sz) => { sz },
-                    SpawnReadSize::JoinSize(j) => { j.await.unwrap() },
+                    ImmOrJoinSize::ImmSize(sz) => { sz },
+                    ImmOrJoinSize::JoinSize(j) => { j.await.unwrap() },
                 };
                 actual_bytes += bytes;
             }
