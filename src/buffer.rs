@@ -23,15 +23,15 @@ unsafe impl GlobalAlloc for AlignedAlloc {
     }
 }
 
-pub struct AlignedDataBlock {
+pub struct AllocDataBlock {
     ptr: *mut u8,
     layout: Layout,
 }
 
-unsafe impl Send for AlignedDataBlock {}
-unsafe impl Sync for AlignedDataBlock {}
+unsafe impl Send for AllocDataBlock {}
+unsafe impl Sync for AllocDataBlock {}
 
-impl AlignedDataBlock {
+impl AllocDataBlock {
     pub fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, MIN_ALIGNED).expect("unable to create layout for aligned block");
         Self {
@@ -53,7 +53,7 @@ impl AlignedDataBlock {
     }
 }
 
-impl Drop for AlignedDataBlock {
+impl Drop for AllocDataBlock {
     fn drop(&mut self) {
         unsafe {
             dealloc(self.ptr, self.layout);
@@ -64,7 +64,7 @@ impl Drop for AlignedDataBlock {
 const DATA_BLOCK_FLAG_SHOULD_CACHE: u64 = 0x1;
 
 pub struct DataBlock {
-    data: Pin<Box<AlignedDataBlock>>,
+    data: Pin<Box<AllocDataBlock>>,
     index: BlockIndex,
     flags: u64,
 }
@@ -72,7 +72,7 @@ pub struct DataBlock {
 impl DataBlock {
     pub fn new(index: BlockIndex, size: usize) -> Self {
         Self {
-            data: Box::pin(AlignedDataBlock::new(size)),
+            data: Box::pin(AllocDataBlock::new(size)),
             index: index,
             flags: 0,
         }
@@ -81,7 +81,7 @@ impl DataBlock {
     // duplicate a data block by copy
     pub fn dup(&self) -> Self {
         let n = Self {
-            data: Box::pin(AlignedDataBlock::new(self.size())),
+            data: Box::pin(AllocDataBlock::new(self.size())),
             index: self.index(),
             flags: self.flags,
         };
@@ -214,7 +214,7 @@ impl AlignedDataBlockWrapper {
 }
 
 pub struct PartDataBlock {
-    data: Option<Pin<Box<AlignedDataBlock>>>,
+    data: Option<Pin<Box<AllocDataBlock>>>,
     index: BlockIndex,
     // offset of data within block
     offset: usize,
@@ -227,7 +227,7 @@ pub struct PartDataBlock {
 impl PartDataBlock {
     pub(crate) fn new(index: BlockIndex, size: usize, offset: usize, len: usize, is_zero: bool) -> Self {
         Self {
-            data: if is_zero { None } else { Some(Box::pin(AlignedDataBlock::new(len))) },
+            data: if is_zero { None } else { Some(Box::pin(AllocDataBlock::new(len))) },
             index,
             offset,
             size,
