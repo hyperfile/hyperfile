@@ -879,7 +879,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     // test if block of index need to be retrieve
     #[inline]
     pub(crate) fn write_prepare_block_index(&mut self, blk_idx: &BlockIndex) -> bool {
-        self.cache.contains(blk_idx)
+        !self.cache.contains(blk_idx)
     }
 
     async fn write_retrieve(&mut self, list: Vec<BlockIndex>) -> Result<Vec<DataBlock>> {

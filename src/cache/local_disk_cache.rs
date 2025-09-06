@@ -221,13 +221,13 @@ impl LocalDiskCache {
 
     pub(crate) fn contains(&mut self, blk_idx: &BlockIndex) -> bool {
         if self.data_blocks_dirty.contains_key(blk_idx) {
-            return false;
+            return true;
         }
         if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
             self.data_blocks_dirty.insert(*blk_idx, block);
-            return false;
+            return true;
         }
-        true
+        false
     }
 
     pub(crate) fn get_mut(&mut self, blk_idx: &BlockIndex) -> Option<&mut DataBlock> {
