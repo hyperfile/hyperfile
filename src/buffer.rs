@@ -87,25 +87,17 @@ impl MmapDataBlock {
         }
     }
 
-    fn do_lock(ptr: *const libc::c_void, size: libc::size_t) -> Result<()> {
+    pub fn lock(&self) {
         unsafe {
-            let ret = libc::mlock(ptr, size);
+            let ret = libc::mlock(
+                self.ptr as *const libc::c_void,
+                self.size as libc::size_t
+            );
             if ret == -1 {
-                return Err(std::io::Error::last_os_error());
+                panic!("failed to mulock {:p} - {}, err: {}",
+                    self.ptr, self.size, std::io::Error::last_os_error());
             }
-            Ok(())
         }
-    }
-
-    pub async fn lock(&self) {
-        let ptr = self.ptr as u64;
-        let size = self.size as libc::size_t;
-        tokio::task::spawn_blocking(move || {
-            Self::do_lock(ptr as *const libc::c_void, size)
-        })
-        .await
-        .expect("failed to join spawn blocking on mlock")
-        .expect("failed to mlock")
     }
 
     pub fn unlock(&self) {
@@ -287,9 +279,7 @@ impl DataBlock {
             AlignedDataBlock::Alloc(_) => {},
             AlignedDataBlock::Mmap(mmap) => {
                 if self.is_locked() { return; }
-                futures::executor::block_on(async {
-                    mmap.lock().await
-                });
+                mmap.lock();
                 self.set_locked();
             },
         }
