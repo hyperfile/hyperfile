@@ -127,7 +127,9 @@ pub enum AlignedDataBlock {
     Mmap(MmapDataBlock),
 }
 
-const DATA_BLOCK_FLAG_SHOULD_CACHE: u64 = 0x1;
+const DATA_BLOCK_FLAG_DIRTY: u64 = 0x1;
+const DATA_BLOCK_FLAG_MMAP_LOCKED: u64 = 0x2;
+const DATA_BLOCK_FLAG_SHOULD_CACHE: u64 = 0x4;
 
 pub struct DataBlock {
     data: AlignedDataBlock,
@@ -232,6 +234,46 @@ impl DataBlock {
         }
     }
 
+    pub fn set_dirty(&self) {
+        let flags = self.flags | DATA_BLOCK_FLAG_DIRTY;
+        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
+        unsafe {
+            std::ptr::write_volatile(ptr, flags);
+        }
+    }
+
+    pub fn clear_dirty(&self) {
+        let flags = self.flags & !DATA_BLOCK_FLAG_DIRTY;
+        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
+        unsafe {
+            std::ptr::write_volatile(ptr, flags);
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.flags & DATA_BLOCK_FLAG_DIRTY == DATA_BLOCK_FLAG_DIRTY
+    }
+
+    pub fn set_locked(&self) {
+        let flags = self.flags | DATA_BLOCK_FLAG_MMAP_LOCKED;
+        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
+        unsafe {
+            std::ptr::write_volatile(ptr, flags);
+        }
+    }
+
+    pub fn clear_locked(&self) {
+        let flags = self.flags & !DATA_BLOCK_FLAG_MMAP_LOCKED;
+        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
+        unsafe {
+            std::ptr::write_volatile(ptr, flags);
+        }
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.flags & DATA_BLOCK_FLAG_MMAP_LOCKED == DATA_BLOCK_FLAG_MMAP_LOCKED
+    }
+
     pub fn set_should_cache(&mut self) {
         self.flags |= DATA_BLOCK_FLAG_SHOULD_CACHE;
     }
@@ -244,10 +286,12 @@ impl DataBlock {
         match &self.data {
             AlignedDataBlock::Alloc(_) => {},
             AlignedDataBlock::Mmap(mmap) => {
+                if self.is_locked() { return; }
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     mmap.lock().await
                 });
+                self.set_locked();
             },
         }
     }
@@ -255,7 +299,11 @@ impl DataBlock {
     pub fn unlock(&self) {
         match &self.data {
             AlignedDataBlock::Alloc(_) => {},
-            AlignedDataBlock::Mmap(mmap) => mmap.unlock(),
+            AlignedDataBlock::Mmap(mmap) => {
+                if !self.is_locked() { return; }
+                mmap.unlock();
+                self.clear_locked();
+            },
         }
     }
 }
