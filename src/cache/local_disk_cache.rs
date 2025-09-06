@@ -224,6 +224,7 @@ impl LocalDiskCache {
             return true;
         }
         if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
+            block.lock();
             self.data_blocks_dirty.insert(*blk_idx, block);
             return true;
         }
