@@ -48,6 +48,10 @@ impl MemCache {
         );
     }
 
+    pub(crate) fn new_block(&self, blk_idx: BlockIndex) -> DataBlock {
+        DataBlock::new(blk_idx, self.data_block_size)
+    }
+
     pub(crate) fn get(&mut self, blk_idx: &BlockIndex) -> Option<&DataBlock> {
         // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(blk_idx) {

@@ -513,11 +513,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     async fn spawn_write_retrieve(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
-        let data_block_size = self.config.meta.data_block_size;
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
@@ -529,7 +528,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     fetched.push(block);
                 },
@@ -560,11 +559,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     async fn spawn_write_zero_retrieve(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
-        let data_block_size = self.config.meta.data_block_size;
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
@@ -576,7 +574,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let mut block = DataBlock::new(blk_idx, data_block_size);
+                    let mut block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     fetched.push(block);
                 },
