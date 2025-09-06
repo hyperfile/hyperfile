@@ -287,8 +287,7 @@ impl DataBlock {
             AlignedDataBlock::Alloc(_) => {},
             AlignedDataBlock::Mmap(mmap) => {
                 if self.is_locked() { return; }
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
+                futures::executor::block_on(async {
                     mmap.lock().await
                 });
                 self.set_locked();
