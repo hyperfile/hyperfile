@@ -378,6 +378,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let oldsize = self.inode.size();
         if off + len > oldsize {
             self.inode.set_size(off + len);
+            self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
         drop(opt_permit);
@@ -481,6 +482,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let oldsize = self.inode.size();
         if off + len > oldsize {
             self.inode.set_size(off + len);
+            self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
         drop(opt_permit);

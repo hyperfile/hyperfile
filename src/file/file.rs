@@ -38,13 +38,19 @@ use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
+#[cfg(not(feature = "local-disk-cache"))]
 use crate::cache::mem_cache::MemCache;
+#[cfg(feature = "local-disk-cache")]
+use crate::cache::local_disk_cache::LocalDiskCache;
 
 pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     pub(crate) staging: T,
     pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>,
     pub(crate) bmap_ud: BMapUserData,
+    #[cfg(not(feature = "local-disk-cache"))]
     pub(crate) cache: MemCache,
+    #[cfg(feature = "local-disk-cache")]
+    pub(crate) cache: LocalDiskCache,
     pub(crate) inode: Inode,
     pub(crate) config: HyperFileConfig,
     pub(crate) max_dirty_blocks: usize,
@@ -135,7 +141,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
+            #[cfg(not(feature = "local-disk-cache"))]
             cache: MemCache::new(data_cache_blocks, config.meta.data_block_size),
+            #[cfg(feature = "local-disk-cache")]
+            cache: LocalDiskCache::new("/tmp/cache.file", 0, data_cache_blocks, config.meta.data_block_size)?,
             inode: inode,
             config: config,
             max_dirty_blocks: max_dirty_blocks,
@@ -237,7 +246,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
+            #[cfg(not(feature = "local-disk-cache"))]
             cache: MemCache::new(data_cache_blocks, config.meta.data_block_size),
+            #[cfg(feature = "local-disk-cache")]
+            cache: LocalDiskCache::open("/tmp/cache.file", inode.size(), data_cache_blocks, config.meta.data_block_size)?,
             inode: inode,
             config: config,
             max_dirty_blocks: max_dirty_blocks,
@@ -415,6 +427,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let oldsize = self.inode.size();
         if off + len > oldsize {
             self.inode.set_size(off + len);
+            self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
         // TODO: rollback to old size if flush failed
@@ -482,6 +495,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let oldsize = self.inode.size();
         if off + len > oldsize {
             self.inode.set_size(off + len);
+            self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
         // TODO: rollback to old size if flush failed
@@ -529,6 +543,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         let len = last_block_wrapper.size();
         if off + len > oldsize {
             self.inode.set_size(off + len);
+            self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
         drop(permit);
@@ -784,6 +799,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             let data_changed = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
             // no need to change metadata blocks, just update the new file size
             self.inode.set_size(new_size);
+            self.cache.set_size(new_size);
             self.inode.update_mtime();
             if data_changed {
                 debug!("truncate - data changed, trigger flush");
@@ -799,6 +815,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if tgt_blk_idx > cur_blk_idx {
             // no need to modify bmap, just update new file size
             self.inode.set_size(new_size);
+            self.cache.set_size(new_size);
             self.inode.update_mtime();
             debug!("truncate - extend file size with no bmap change, update file attr only");
             drop(permit);
@@ -821,6 +838,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             let _ = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
         }
         self.inode.set_size(new_size);
+        self.cache.set_size(new_size);
         self.inode.update_mtime();
         drop(permit);
         self.flush().await?;
@@ -1129,6 +1147,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         };
         if off + len > oldsize {
             self.inode.set_size(off + len);
+            self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
         drop(permit);

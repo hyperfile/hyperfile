@@ -1,4 +1,7 @@
 use std::fmt;
+use std::io::{Error, Result};
+use std::path::Path;
+use std::os::fd::AsRawFd;
 use std::num::NonZeroUsize;
 use std::collections::BTreeMap;
 use log::{debug, warn};
@@ -7,39 +10,138 @@ use crate::{BlockIndex, BlockIndexIter};
 use crate::buffer::DataBlock;
 use crate::file::DirtyDataBlocks;
 
-pub(crate) struct MemCache {
-    // NOTE:
-    //   1) dirty list is higher priority than cache list
-    //   2) data cache only intend to cache incomplete block access
+pub(crate) struct LocalDiskCache {
+    addr: u64, // acturallly *mut libc::c_void
+    size: usize,
+    file: std::fs::File,
     pub(crate) data_blocks_cache: LruCache<BlockIndex, DataBlock>,
     pub(crate) data_blocks_dirty: BTreeMap<BlockIndex, DataBlock>, // index by block uid
     pub(crate) data_cache_blocks: usize,
     pub(crate) data_block_size: usize,
-
 }
 
-impl fmt::Display for MemCache {
+impl fmt::Display for LocalDiskCache {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "  data dirty size: {}", self.data_blocks_dirty.len())?;
         writeln!(f, "  data cache blocks: {}, data cache size: {}", self.data_cache_blocks, self.data_blocks_cache.len())
     }
 }
 
-impl MemCache {
-    pub(crate) fn new(data_cache_blocks: usize, data_block_size: usize) -> Self {
-        Self {
-            data_blocks_cache: LruCache::new(
-                // fail back to 1 if data_cache_blocks is set to zero
-                NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
-            ),
-            data_blocks_dirty: BTreeMap::new(),
+impl LocalDiskCache {
+    pub(crate) fn new(file_path: impl AsRef<Path>, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(file_path)?;
+        let fd = file.as_raw_fd();
+
+        // init backend file ondisk
+        unsafe {
+            let ret = libc::ftruncate(fd, size as libc::off_t);
+            if ret != 0 {
+                return Err(Error::last_os_error());
+            }
+        }
+
+        // create memory map
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut::<libc::c_void>(),
+                size as libc::size_t,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+
+        if addr == libc::MAP_FAILED {
+            return Err(Error::last_os_error());
+        }
+
+        let data_blocks_cache = lru::LruCache::new(
+            NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
+        );
+
+        let data_blocks_dirty = BTreeMap::new();
+
+        Ok(Self {
+            addr: addr as u64,
+            size,
+            file,
+            data_blocks_cache,
+            data_blocks_dirty,
             data_cache_blocks,
             data_block_size,
-        }
+        })
     }
 
-    pub(crate) fn set_size(&self, _: usize) {
-        /* do nothing */
+    pub(crate) fn open(file_path: impl AsRef<Path>, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file_path)?;
+        let metadata = file.metadata()?;
+        let cache_file_size = metadata.len() as usize;
+        let fd = file.as_raw_fd();
+        assert!(cache_file_size == size);
+
+        // create memory map
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut::<libc::c_void>(),
+                size as libc::size_t,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+
+        if addr == libc::MAP_FAILED {
+            return Err(Error::last_os_error());
+        }
+
+        let data_blocks_cache = lru::LruCache::new(
+            NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
+        );
+
+        let data_blocks_dirty = BTreeMap::new();
+
+        Ok(Self {
+            addr: addr as u64,
+            size,
+            file,
+            data_blocks_cache,
+            data_blocks_dirty,
+            data_cache_blocks,
+            data_block_size,
+        })
+    }
+
+    pub(crate) fn set_size(&self, new_size: usize) {
+        let fd = self.file.as_raw_fd();
+        let addr = self.addr as *mut libc::c_void;
+        let ret = unsafe {
+            libc::ftruncate(fd, new_size as libc::off_t)
+        };
+        if ret == -1 {
+            panic!("ftruncate failed to change cache file size from {} to {}, error: {}",
+                self.size, new_size, Error::last_os_error());
+        }
+        let ret = unsafe {
+            libc::mremap(addr, self.size, new_size, 0)
+        };
+        if ret == libc::MAP_FAILED {
+            panic!("mremap failed to change cache space size from {} to {}, error: {}",
+                self.size, new_size, Error::last_os_error());
+        }
+        assert!(ret == addr);
+        unsafe {
+            let ptr = std::ptr::addr_of!(self.size) as *mut usize;
+            std::ptr::write_volatile(ptr, new_size);
+        }
     }
 
     pub(crate) fn set_unlimited(&mut self) {
@@ -53,7 +155,18 @@ impl MemCache {
     }
 
     pub(crate) fn new_block(&self, blk_idx: BlockIndex) -> DataBlock {
-        DataBlock::new(blk_idx, self.data_block_size)
+        DataBlock::new_alloc(blk_idx, self.data_block_size)
+    }
+
+    fn new_dirty_block(&self, blk_idx: BlockIndex) -> DataBlock {
+        let addr = self.addr as *mut u8;
+        let ptr = unsafe {
+            addr.add(blk_idx as usize * self.data_block_size)
+        };
+        let block = DataBlock::new_mmap(blk_idx, ptr, self.data_block_size);
+        block.set_dirty();
+        block.lock();
+        block
     }
 
     pub(crate) fn get(&mut self, blk_idx: &BlockIndex) -> Option<&DataBlock> {
@@ -61,33 +174,40 @@ impl MemCache {
         if let Some(block) = self.data_blocks_dirty.get(blk_idx) {
             // cache hit
             debug!("Cache Hit on dirty list for block index: {}", blk_idx);
+            assert!(block.is_locked());
             return Some(block);
         }
         // check data cache
         if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.get(blk_idx)).unwrap() {
             // cache hit
             debug!("Cache Hit on cache list for block index: {}", blk_idx);
+            assert!(!block.is_locked());
+            block.lock();
             return Some(block);
         }
         None
     }
 
-    // force insert a block
     pub(crate) fn insert(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock> {
         // be sure block is not in cache list
         let _ = self.data_blocks_cache.pop(&blk_idx);
-        self.data_blocks_dirty.insert(blk_idx, block)
+        assert!(!block.is_dirty());
+        let mut dirty_block = self.new_dirty_block(blk_idx);
+        dirty_block.copy(0, block.as_slice());
+        self.data_blocks_dirty.insert(blk_idx, dirty_block)
     }
 
-    // remove a block
     pub(crate) fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {
         // be sure block is not in cache list
         let _ = self.data_blocks_cache.pop(&blk_idx);
         self.data_blocks_dirty.remove(blk_idx)
+            .and_then(|block| {
+                block.clear_dirty();
+                block.unlock();
+                Some(block)
+            })
     }
 
-    // test if block of index need to be retrieve
-    #[inline]
     pub(crate) fn contains(&mut self, blk_idx: &BlockIndex) -> bool {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return false;
@@ -104,15 +224,14 @@ impl MemCache {
             return self.data_blocks_dirty.get_mut(blk_idx);
         }
         if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
+            block.lock();
+            block.set_dirty();
             self.data_blocks_dirty.insert(*blk_idx, block);
             return self.data_blocks_dirty.get_mut(blk_idx);
         }
         None
     }
 
-    // we only care about incomplete blocks and not in dirty list
-    // return:
-    //   - vec of data block ptr we need to retrieve
     pub(crate) fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
         let mut output = Vec::new();
         let blk_iter = BlockIndexIter::new(off, len, self.data_block_size);
@@ -131,6 +250,8 @@ impl MemCache {
             }
             if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
                 // incomplete block found in data blocks cache
+                block.lock();
+                block.set_dirty();
                 self.data_blocks_dirty.insert(blk_idx, block);
                 continue;
             }
@@ -146,23 +267,22 @@ impl MemCache {
             // found in dirty list, just update it's content
             block.copy(off, buf);
         } else if let Some(mut block) = self.data_blocks_cache.pop(blk_idx) {
+            block.lock();
             // not found in dirty list but on cache list,
             // let's update block content and move it to dirty list
             // NOTE: this not intend to happen in currently design, kick warning
             block.copy(off, buf);
+            block.set_dirty();
             self.data_blocks_dirty.insert(*blk_idx, block);
             warn!("update_cache - block index: {blk_idx} not in dirty list but in cache list, this is not by design");
         } else {
             // can't found in dirty list, create a new one
-            let mut block = DataBlock::new(*blk_idx, self.data_block_size);
+            let mut block = self.new_dirty_block(*blk_idx);
             block.copy(off, buf);
             self.data_blocks_dirty.insert(*blk_idx, block);
         }
     }
 
-    // return:
-    //   true - block truncated and is on dirty list
-    //   false - block not found in the cache
     pub(crate) fn truncate_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> bool {
         if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
             let buf = block.as_mut_slice();
@@ -172,10 +292,12 @@ impl MemCache {
             return true;
         }
         if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
+            block.lock();
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
             to_clear.fill(0);
             debug!("data block in cache list, data cleared");
+            block.set_dirty();
             // move data block into dirty list
             self.data_blocks_dirty.insert(*blk_idx, block);
             return true;
@@ -196,6 +318,8 @@ impl MemCache {
 
     pub(crate) fn clear_dirty(&mut self) {
         while let Some((blk_idx, block)) = self.data_blocks_dirty.pop_first() {
+            block.clear_dirty();
+            block.unlock();
             if !block.is_should_cache() {
                 continue;
             }
