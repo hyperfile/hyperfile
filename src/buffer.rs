@@ -1,4 +1,3 @@
-use std::io::Result;
 use std::pin::Pin;
 use std::alloc::GlobalAlloc;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -289,7 +288,7 @@ impl DataBlock {
         match &self.data {
             AlignedDataBlock::Alloc(_) => {},
             AlignedDataBlock::Mmap(mmap) => {
-                if !self.is_locked() { return; }
+                if !self.is_locked() || self.is_dirty() { return; }
                 mmap.unlock();
                 self.clear_locked();
             },
