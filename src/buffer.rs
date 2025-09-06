@@ -1,3 +1,4 @@
+use std::io::Result;
 use std::pin::Pin;
 use std::alloc::GlobalAlloc;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -83,6 +84,40 @@ impl MmapDataBlock {
     pub fn as_mut_slice(&self) -> &mut [u8] {
         unsafe {
             std::slice::from_raw_parts_mut(self.ptr, self.size)
+        }
+    }
+
+    fn do_lock(ptr: *const libc::c_void, size: libc::size_t) -> Result<()> {
+        unsafe {
+            let ret = libc::mlock(ptr, size);
+            if ret == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    pub async fn lock(&self) {
+        let ptr = self.ptr as u64;
+        let size = self.size as libc::size_t;
+        tokio::task::spawn_blocking(move || {
+            Self::do_lock(ptr as *const libc::c_void, size)
+        })
+        .await
+        .expect("failed to join spawn blocking on mlock")
+        .expect("failed to mlock")
+    }
+
+    pub fn unlock(&self) {
+        unsafe {
+            let ret = libc::munlock(
+                self.ptr as *const libc::c_void,
+                self.size as libc::size_t,
+            );
+            if ret == -1 {
+                panic!("failed to mulock {:p} - {}, err: {}",
+                    self.ptr, self.size, std::io::Error::last_os_error());
+            }
         }
     }
 }
@@ -203,6 +238,25 @@ impl DataBlock {
 
     pub fn is_should_cache(&self) -> bool {
         self.flags & DATA_BLOCK_FLAG_SHOULD_CACHE == DATA_BLOCK_FLAG_SHOULD_CACHE
+    }
+
+    pub fn lock(&self) {
+        match &self.data {
+            AlignedDataBlock::Alloc(_) => {},
+            AlignedDataBlock::Mmap(mmap) => {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    mmap.lock().await
+                });
+            },
+        }
+    }
+
+    pub fn unlock(&self) {
+        match &self.data {
+            AlignedDataBlock::Alloc(_) => {},
+            AlignedDataBlock::Mmap(mmap) => mmap.unlock(),
+        }
     }
 }
 

@@ -39,6 +39,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
             data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
+            block.unlock();
             return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
         }
         #[cfg(feature = "wal")]
@@ -140,6 +141,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
                 data_buf.copy_from_slice(&slice[offset..offset + data_buf.len()]);
+                block.unlock();
                 return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
             }
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_id);

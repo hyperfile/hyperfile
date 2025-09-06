@@ -348,6 +348,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 // fast path check on dirty list
                 debug!("      - BlockIndex {blk_idx} CACHE HIT");
                 block.copy_out(off, this);
+                block.unlock();
             } else {
                 debug!("      - lookup BlockIndex {blk_idx} for BlockPtr");
                 let blk_ptr = self.bmap.lookup(&blk_idx).await
@@ -902,6 +903,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if let Some(block) = self.cache.get(&blk_idx) {
             let slice = block.as_slice();
             buf.copy_from_slice(&slice[offset..offset + buf.len()]);
+            block.unlock();
             return Ok(());
         }
         #[cfg(feature = "wal")]
@@ -968,6 +970,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             if let Some(block) = self.cache.get(&blk_idx) {
                 let slice = block.as_slice();
                 buf.copy_from_slice(&slice[offset..offset + buf.len()]);
+                block.unlock();
                 return Ok(());
             }
             panic!("failed to get block index: {} from data blocks dirty cache for dummy block ptr", blk_idx);
@@ -1097,6 +1100,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     }
                     bytes_write += part.len();
                 }
+                block.unlock();
                 let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
                 continue;
             }
