@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::{Error, Result};
+use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 use std::os::fd::AsRawFd;
 use std::num::NonZeroUsize;
@@ -118,6 +118,17 @@ impl LocalDiskCache {
             data_cache_blocks,
             data_block_size,
         })
+    }
+
+    pub(crate) fn open_or_create(file_path: impl AsRef<Path>, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Self> {
+        Self::open(&file_path, size, data_cache_blocks, data_block_size)
+            .or_else(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    Self::new(file_path, size, data_cache_blocks, data_block_size)
+                } else {
+                    Err(e)
+                }
+            })
     }
 
     pub(crate) fn set_size(&self, new_size: usize) {

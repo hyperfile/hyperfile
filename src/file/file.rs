@@ -249,7 +249,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             #[cfg(not(feature = "local-disk-cache"))]
             cache: MemCache::new(data_cache_blocks, config.meta.data_block_size),
             #[cfg(feature = "local-disk-cache")]
-            cache: LocalDiskCache::open("/tmp/cache.file", inode.size(), data_cache_blocks, config.meta.data_block_size)?,
+            cache: LocalDiskCache::open_or_create("/tmp/cache.file", inode.size(), data_cache_blocks, config.meta.data_block_size)?,
             inode: inode,
             config: config,
             max_dirty_blocks: max_dirty_blocks,
