@@ -328,6 +328,19 @@ impl LocalDiskCache {
         DirtyDataBlocks { inner: Some(b), owned: None }
     }
 
+    fn discard(&self, blk_idx: BlockIndex) {
+        let fd = self.file.as_raw_fd();
+        let offset = (blk_idx as usize * self.data_block_size) as libc::off_t;
+        let len = self.data_block_size as libc::off_t;
+        let ret = unsafe {
+            libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset, len)
+        };
+        if ret == -1 {
+            panic!("fallocate failed to punch hole at offset: {}, len: {}, error: {}",
+                offset, len, Error::last_os_error());
+        }
+    }
+
     pub(crate) fn clear_dirty(&mut self) {
         while let Some((blk_idx, block)) = self.data_blocks_dirty.pop_first() {
             block.clear_dirty();
@@ -336,8 +349,12 @@ impl LocalDiskCache {
                 continue;
             }
             // keep block that should cache into cache list
-            if let Some(_) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.put(blk_idx, block)).unwrap() {
-                panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
+            if let Some((old_blk_idx, _)) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.push(blk_idx, block)).unwrap() {
+                if old_blk_idx == blk_idx {
+                    panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
+                } else {
+                    self.discard(old_blk_idx);
+                }
             }
         }
     }
