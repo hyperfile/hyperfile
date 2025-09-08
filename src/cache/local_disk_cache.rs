@@ -348,10 +348,7 @@ impl Cache for LocalDiskCache {
         while let Some((blk_idx, block)) = self.data_blocks_dirty.pop_first() {
             block.clear_dirty();
             block.unlock();
-            if !block.is_should_cache() {
-                continue;
-            }
-            // keep block that should cache into cache list
+            // push into cache list
             if let Some((old_blk_idx, _)) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.push(blk_idx, block)).unwrap() {
                 if old_blk_idx == blk_idx {
                     panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
