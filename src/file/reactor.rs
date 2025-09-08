@@ -28,7 +28,8 @@ impl ImmOrJoinSize {
 
 impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
     fn spawn_load_data_block_read_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {
-        debug!("spawn_load_data_block_read_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
+        debug!("spawn_load_data_block_read_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
+            blk_id, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         // in read path we would check dirty cache before do real data load
         if let Some(block) = self.cache.get(&blk_id) {
             // cache hit
@@ -88,12 +89,14 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             data_buf.fill(0);
             return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
         } else {
-            panic!("spawn_load_data_block_read_path - offset: {}, bytes: {}, incorrect block ptr {} to load", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
+            panic!("spawn_load_data_block_read_path - block index: {}, offset: {}, bytes: {}, incorrect block ptr {} to load",
+                blk_id, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         }
     }
 
     pub(crate) fn spawn_load_data_block_write_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {
-        debug!("spawn_load_data_block_write_path - offset: {}, bytes: {}, block ptr: {}", offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
+        debug!("spawn_load_data_block_write_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
+            blk_id, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
@@ -153,7 +156,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             data_buf.fill(0);
             return Ok(ImmOrJoinSize::ImmSize(data_buf.len()));
         } else {
-            panic!("incorrect block ptr {} to load", blk_ptr);
+            panic!("spawn_load_data_block_write_path - block index: {}, offset: {}, bytes: {}, incorrect block ptr {} to load",
+                blk_id, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         }
     }
 

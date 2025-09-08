@@ -138,8 +138,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             cache: crate::cache::cache_from_config(
                 &config.cache,
                 0,
+                data_cache_blocks,
                 config.meta.data_block_size,
-                data_cache_blocks
             )?,
             inode: inode,
             config: config,
@@ -245,8 +245,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             cache: crate::cache::cache_from_config(
                 &config.cache,
                 inode.size(),
+                data_cache_blocks,
                 config.meta.data_block_size,
-                data_cache_blocks
             )?,
             inode: inode,
             config: config,
@@ -913,7 +913,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 
     async fn load_data_block_read_path(&mut self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
-        debug!("load_data_block - block ptr: {}", self.blk_ptr_decode_display(&blk_ptr));
+        debug!("load_data_block_read_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
+            blk_idx, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         // in read path we would check both data and dirty cache before do real data load
         if let Some(block) = self.cache.get(&blk_idx) {
             let slice = block.as_slice();
@@ -951,12 +952,14 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             buf.fill(0);
             return Ok(());
         } else {
-            panic!("incorrect block ptr {} to load", self.blk_ptr_decode_display(&blk_ptr));
+            panic!("load_data_block_read_path - block index: {}, offset: {}, bytes: {}, incorrect block ptr {} to load",
+                blk_idx, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         }
     }
 
     async fn load_data_block_write_path(&mut self, blk_idx: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<()> {
-        debug!("load_data_block - block ptr: {}", self.blk_ptr_decode_display(&blk_ptr));
+        debug!("load_data_block_write_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
+            blk_idx, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
@@ -993,7 +996,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             buf.fill(0);
             return Ok(());
         } else {
-            panic!("incorrect block ptr {} to load", self.blk_ptr_decode_display(&blk_ptr));
+            panic!("load_data_block_write_path - block index: {}, offset: {}, bytes: {}, incorrect block ptr {} to load",
+                blk_idx, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         }
     }
 
