@@ -6,6 +6,7 @@ use lru::LruCache;
 use crate::{BlockIndex, BlockIndexIter};
 use crate::buffer::DataBlock;
 use crate::file::DirtyDataBlocks;
+use super::Cache;
 
 pub(crate) struct MemCache {
     // NOTE:
@@ -37,26 +38,28 @@ impl MemCache {
             data_block_size,
         }
     }
+}
 
-    pub(crate) fn set_size(&self, _: usize) {
+impl Cache for MemCache {
+    fn set_size(&self, _: usize) {
         /* do nothing */
     }
 
-    pub(crate) fn set_unlimited(&mut self) {
+    fn set_unlimited(&mut self) {
         self.data_blocks_cache.resize(NonZeroUsize::new(usize::MAX).unwrap());
     }
 
-    pub(crate) fn restore_limit(&mut self) {
+    fn restore_limit(&mut self) {
         self.data_blocks_cache.resize(
             NonZeroUsize::new(self.data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
         );
     }
 
-    pub(crate) fn new_block(&self, blk_idx: BlockIndex) -> DataBlock {
+    fn new_block(&self, blk_idx: BlockIndex) -> DataBlock {
         DataBlock::new(blk_idx, self.data_block_size)
     }
 
-    pub(crate) fn get(&mut self, blk_idx: &BlockIndex) -> Option<&DataBlock> {
+    fn get(&mut self, blk_idx: &BlockIndex) -> Option<&DataBlock> {
         // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(blk_idx) {
             // cache hit
@@ -73,14 +76,14 @@ impl MemCache {
     }
 
     // force insert a block
-    pub(crate) fn insert(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock> {
+    fn insert(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock> {
         // be sure block is not in cache list
         let _ = self.data_blocks_cache.pop(&blk_idx);
         self.data_blocks_dirty.insert(blk_idx, block)
     }
 
     // remove a block
-    pub(crate) fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {
+    fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {
         // be sure block is not in cache list
         let _ = self.data_blocks_cache.pop(&blk_idx);
         self.data_blocks_dirty.remove(blk_idx)
@@ -88,7 +91,7 @@ impl MemCache {
 
     // test if block of index need to be retrieve
     #[inline]
-    pub(crate) fn contains(&mut self, blk_idx: &BlockIndex) -> bool {
+    fn contains(&mut self, blk_idx: &BlockIndex) -> bool {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return true;
         }
@@ -99,7 +102,7 @@ impl MemCache {
         false
     }
 
-    pub(crate) fn get_mut(&mut self, blk_idx: &BlockIndex) -> Option<&mut DataBlock> {
+    fn get_mut(&mut self, blk_idx: &BlockIndex) -> Option<&mut DataBlock> {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return self.data_blocks_dirty.get_mut(blk_idx);
         }
@@ -113,7 +116,7 @@ impl MemCache {
     // we only care about incomplete blocks and not in dirty list
     // return:
     //   - vec of data block ptr we need to retrieve
-    pub(crate) fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
+    fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
         let mut output = Vec::new();
         let blk_iter = BlockIndexIter::new(off, len, self.data_block_size);
         debug!("start to write prepare for write offset {}, len {}", off, len);
@@ -141,7 +144,7 @@ impl MemCache {
         output
     }
 
-    pub(crate) fn update_cache(&mut self, blk_idx: &BlockIndex, off: usize, buf: &[u8]) {
+    fn update_cache(&mut self, blk_idx: &BlockIndex, off: usize, buf: &[u8]) {
         if let Some(block) = self.data_blocks_dirty.get_mut(blk_idx) {
             // found in dirty list, just update it's content
             block.copy(off, buf);
@@ -163,7 +166,7 @@ impl MemCache {
     // return:
     //   true - block truncated and is on dirty list
     //   false - block not found in the cache
-    pub(crate) fn truncate_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> bool {
+    fn truncate_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> bool {
         if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
@@ -183,18 +186,18 @@ impl MemCache {
         false
     }
 
-    pub(crate) fn dirty_count(&self) -> usize {
+    fn dirty_count(&self) -> usize {
         self.data_blocks_dirty.len()
     }
 
-    pub(crate) fn get_dirty(&self) -> DirtyDataBlocks<'_> {
+    fn get_dirty(&self) -> DirtyDataBlocks<'_> {
         let b: BTreeMap<BlockIndex, &DataBlock> = self.data_blocks_dirty.iter()
                         .map(|(idx, blk)| (*idx, blk))
                         .collect();
         DirtyDataBlocks { inner: Some(b), owned: None }
     }
 
-    pub(crate) fn clear_dirty(&mut self) {
+    fn clear_dirty(&mut self) {
         while let Some((blk_idx, block)) = self.data_blocks_dirty.pop_first() {
             if !block.is_should_cache() {
                 continue;
@@ -206,7 +209,7 @@ impl MemCache {
         }
     }
 
-    pub(crate) fn clear_data_blocks_cache(&mut self) {
+    fn clear_data_blocks_cache(&mut self) {
         if self.data_cache_blocks > 0 {
             self.data_blocks_cache.clear();
         }

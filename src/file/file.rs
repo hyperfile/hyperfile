@@ -33,24 +33,18 @@ use crate::file::handler::FileContext;
 use crate::wal::{WalReadWrite, WalChunkDesc};
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::inode::OnDiskState;
+use crate::cache::Cache;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
-#[cfg(not(feature = "local-disk-cache"))]
-use crate::cache::mem_cache::MemCache;
-#[cfg(feature = "local-disk-cache")]
-use crate::cache::local_disk_cache::LocalDiskCache;
 
 pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     pub(crate) staging: T,
     pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>,
     pub(crate) bmap_ud: BMapUserData,
-    #[cfg(not(feature = "local-disk-cache"))]
-    pub(crate) cache: MemCache,
-    #[cfg(feature = "local-disk-cache")]
-    pub(crate) cache: LocalDiskCache,
+    pub(crate) cache: Box<dyn Cache + Send>,
     pub(crate) inode: Inode,
     pub(crate) config: HyperFileConfig,
     pub(crate) max_dirty_blocks: usize,
@@ -141,10 +135,12 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
-            #[cfg(not(feature = "local-disk-cache"))]
-            cache: MemCache::new(data_cache_blocks, config.meta.data_block_size),
-            #[cfg(feature = "local-disk-cache")]
-            cache: LocalDiskCache::new("/tmp/cache.file", 0, data_cache_blocks, config.meta.data_block_size)?,
+            cache: crate::cache::cache_from_config(
+                &config.cache,
+                0,
+                config.meta.data_block_size,
+                data_cache_blocks
+            )?,
             inode: inode,
             config: config,
             max_dirty_blocks: max_dirty_blocks,
@@ -246,10 +242,12 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
-            #[cfg(not(feature = "local-disk-cache"))]
-            cache: MemCache::new(data_cache_blocks, config.meta.data_block_size),
-            #[cfg(feature = "local-disk-cache")]
-            cache: LocalDiskCache::open_or_create("/tmp/cache.file", inode.size(), data_cache_blocks, config.meta.data_block_size)?,
+            cache: crate::cache::cache_from_config(
+                &config.cache,
+                inode.size(),
+                config.meta.data_block_size,
+                data_cache_blocks
+            )?,
             inode: inode,
             config: config,
             max_dirty_blocks: max_dirty_blocks,

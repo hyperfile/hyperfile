@@ -9,6 +9,7 @@ use lru::LruCache;
 use crate::{BlockIndex, BlockIndexIter};
 use crate::buffer::DataBlock;
 use crate::file::DirtyDataBlocks;
+use super::Cache;
 
 pub(crate) struct LocalDiskCache {
     addr: u64, // acturallly *mut libc::c_void
@@ -131,7 +132,33 @@ impl LocalDiskCache {
             })
     }
 
-    pub(crate) fn set_size(&self, new_size: usize) {
+    fn new_dirty_block(&self, blk_idx: BlockIndex) -> DataBlock {
+        let addr = self.addr as *mut u8;
+        let ptr = unsafe {
+            addr.add(blk_idx as usize * self.data_block_size)
+        };
+        let block = DataBlock::new_mmap(blk_idx, ptr, self.data_block_size);
+        block.set_dirty();
+        block.lock();
+        block
+    }
+
+    fn discard(&self, blk_idx: BlockIndex) {
+        let fd = self.file.as_raw_fd();
+        let offset = (blk_idx as usize * self.data_block_size) as libc::off_t;
+        let len = self.data_block_size as libc::off_t;
+        let ret = unsafe {
+            libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset, len)
+        };
+        if ret == -1 {
+            panic!("fallocate failed to punch hole at offset: {}, len: {}, error: {}",
+                offset, len, Error::last_os_error());
+        }
+    }
+}
+
+impl Cache for LocalDiskCache {
+    fn set_size(&self, new_size: usize) {
         let fd = self.file.as_raw_fd();
         let addr = self.addr as *mut libc::c_void;
         let ret = unsafe {
@@ -155,32 +182,21 @@ impl LocalDiskCache {
         }
     }
 
-    pub(crate) fn set_unlimited(&mut self) {
+    fn set_unlimited(&mut self) {
         self.data_blocks_cache.resize(NonZeroUsize::new(usize::MAX).unwrap());
     }
 
-    pub(crate) fn restore_limit(&mut self) {
+    fn restore_limit(&mut self) {
         self.data_blocks_cache.resize(
             NonZeroUsize::new(self.data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
         );
     }
 
-    pub(crate) fn new_block(&self, blk_idx: BlockIndex) -> DataBlock {
+    fn new_block(&self, blk_idx: BlockIndex) -> DataBlock {
         DataBlock::new_alloc(blk_idx, self.data_block_size)
     }
 
-    fn new_dirty_block(&self, blk_idx: BlockIndex) -> DataBlock {
-        let addr = self.addr as *mut u8;
-        let ptr = unsafe {
-            addr.add(blk_idx as usize * self.data_block_size)
-        };
-        let block = DataBlock::new_mmap(blk_idx, ptr, self.data_block_size);
-        block.set_dirty();
-        block.lock();
-        block
-    }
-
-    pub(crate) fn get(&mut self, blk_idx: &BlockIndex) -> Option<&DataBlock> {
+    fn get(&mut self, blk_idx: &BlockIndex) -> Option<&DataBlock> {
         // check dirty cache
         if let Some(block) = self.data_blocks_dirty.get(blk_idx) {
             // cache hit
@@ -199,7 +215,7 @@ impl LocalDiskCache {
         None
     }
 
-    pub(crate) fn insert(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock> {
+    fn insert(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock> {
         // be sure block is not in cache list
         let _ = self.data_blocks_cache.pop(&blk_idx);
         assert!(!block.is_dirty());
@@ -208,7 +224,7 @@ impl LocalDiskCache {
         self.data_blocks_dirty.insert(blk_idx, dirty_block)
     }
 
-    pub(crate) fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {
+    fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {
         // be sure block is not in cache list
         let _ = self.data_blocks_cache.pop(&blk_idx);
         self.data_blocks_dirty.remove(blk_idx)
@@ -219,7 +235,7 @@ impl LocalDiskCache {
             })
     }
 
-    pub(crate) fn contains(&mut self, blk_idx: &BlockIndex) -> bool {
+    fn contains(&mut self, blk_idx: &BlockIndex) -> bool {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return true;
         }
@@ -231,7 +247,7 @@ impl LocalDiskCache {
         false
     }
 
-    pub(crate) fn get_mut(&mut self, blk_idx: &BlockIndex) -> Option<&mut DataBlock> {
+    fn get_mut(&mut self, blk_idx: &BlockIndex) -> Option<&mut DataBlock> {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return self.data_blocks_dirty.get_mut(blk_idx);
         }
@@ -244,7 +260,7 @@ impl LocalDiskCache {
         None
     }
 
-    pub(crate) fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
+    fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex> {
         let mut output = Vec::new();
         let blk_iter = BlockIndexIter::new(off, len, self.data_block_size);
         debug!("start to write prepare for write offset {}, len {}", off, len);
@@ -274,7 +290,7 @@ impl LocalDiskCache {
         output
     }
 
-    pub(crate) fn update_cache(&mut self, blk_idx: &BlockIndex, off: usize, buf: &[u8]) {
+    fn update_cache(&mut self, blk_idx: &BlockIndex, off: usize, buf: &[u8]) {
         if let Some(block) = self.data_blocks_dirty.get_mut(blk_idx) {
             // found in dirty list, just update it's content
             block.copy(off, buf);
@@ -295,7 +311,7 @@ impl LocalDiskCache {
         }
     }
 
-    pub(crate) fn truncate_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> bool {
+    fn truncate_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> bool {
         if let Some(block) = self.data_blocks_dirty.get_mut(&blk_idx) {
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
@@ -317,31 +333,18 @@ impl LocalDiskCache {
         false
     }
 
-    pub(crate) fn dirty_count(&self) -> usize {
+    fn dirty_count(&self) -> usize {
         self.data_blocks_dirty.len()
     }
 
-    pub(crate) fn get_dirty(&self) -> DirtyDataBlocks<'_> {
+    fn get_dirty(&self) -> DirtyDataBlocks<'_> {
         let b: BTreeMap<BlockIndex, &DataBlock> = self.data_blocks_dirty.iter()
                         .map(|(idx, blk)| (*idx, blk))
                         .collect();
         DirtyDataBlocks { inner: Some(b), owned: None }
     }
 
-    fn discard(&self, blk_idx: BlockIndex) {
-        let fd = self.file.as_raw_fd();
-        let offset = (blk_idx as usize * self.data_block_size) as libc::off_t;
-        let len = self.data_block_size as libc::off_t;
-        let ret = unsafe {
-            libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset, len)
-        };
-        if ret == -1 {
-            panic!("fallocate failed to punch hole at offset: {}, len: {}, error: {}",
-                offset, len, Error::last_os_error());
-        }
-    }
-
-    pub(crate) fn clear_dirty(&mut self) {
+    fn clear_dirty(&mut self) {
         while let Some((blk_idx, block)) = self.data_blocks_dirty.pop_first() {
             block.clear_dirty();
             block.unlock();
@@ -359,7 +362,7 @@ impl LocalDiskCache {
         }
     }
 
-    pub(crate) fn clear_data_blocks_cache(&mut self) {
+    fn clear_data_blocks_cache(&mut self) {
         if self.data_cache_blocks > 0 {
             self.data_blocks_cache.clear();
         }
