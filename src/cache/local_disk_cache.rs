@@ -58,7 +58,7 @@ impl LocalDiskCache {
                 std::ptr::null_mut::<libc::c_void>(),
                 size as libc::size_t,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 fd,
                 0,
             )
@@ -101,7 +101,7 @@ impl LocalDiskCache {
                 std::ptr::null_mut::<libc::c_void>(),
                 size as libc::size_t,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 fd,
                 0,
             )
@@ -165,7 +165,7 @@ impl LocalDiskCache {
 
     pub(crate) fn sync(&self) -> Result<()> {
         let ret = unsafe {
-            libc::msync(self.addr as *mut libc::c_void, self.size, libc::MS_SYNC)
+            libc::msync(self.addr as *mut libc::c_void, self.size, libc::MS_SYNC | libc::MS_INVALIDATE)
         };
         if ret != 0 {
             return Err(Error::last_os_error());
