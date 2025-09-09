@@ -214,4 +214,7 @@ impl Cache for MemCache {
             self.data_blocks_cache.clear();
         }
     }
+
+    fn shutdown(&self) {
+    }
 }

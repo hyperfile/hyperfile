@@ -27,6 +27,7 @@ pub(crate) trait Cache {
     fn get_dirty(&self) -> DirtyDataBlocks<'_>;
     fn clear_dirty(&mut self);
     fn clear_data_blocks_cache(&mut self);
+    fn shutdown(&self);
 }
 
 impl fmt::Display for Box<dyn Cache + Send> {

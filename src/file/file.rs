@@ -78,6 +78,7 @@ impl<T: Send + Clone, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
+        self.cache.shutdown();
     }
 }
 

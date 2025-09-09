@@ -28,6 +28,13 @@ impl fmt::Display for LocalDiskCache {
     }
 }
 
+impl Drop for LocalDiskCache {
+    fn drop(&mut self) {
+        self.sync().expect("local disk cache - failed to sync data");
+        self.close().expect("local disk cache - failed to close cache");
+    }
+}
+
 impl LocalDiskCache {
     pub(crate) fn new(file_path: impl AsRef<Path>, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
@@ -154,6 +161,33 @@ impl LocalDiskCache {
             panic!("fallocate failed to punch hole at offset: {}, len: {}, error: {}",
                 offset, len, Error::last_os_error());
         }
+    }
+
+    pub(crate) fn sync(&self) -> Result<()> {
+        let ret = unsafe {
+            libc::msync(self.addr as *mut libc::c_void, self.size, libc::MS_SYNC)
+        };
+        if ret != 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close(&self) -> Result<()> {
+        let ret = unsafe {
+            libc::munmap(self.addr as *mut libc::c_void, self.size)
+        };
+        if ret != 0 {
+            return Err(Error::last_os_error());
+        }
+        let fd = self.file.as_raw_fd();
+        let ret = unsafe {
+            libc::close(fd)
+        };
+        if ret != 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -363,5 +397,10 @@ impl Cache for LocalDiskCache {
         if self.data_cache_blocks > 0 {
             self.data_blocks_cache.clear();
         }
+    }
+
+    fn shutdown(&self) {
+        self.sync().expect("local disk cache - failed to sync data");
+        self.close().expect("local disk cache - failed to close cache");
     }
 }
