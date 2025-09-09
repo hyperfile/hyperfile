@@ -21,8 +21,8 @@ pub(crate) struct MemCache {
 
 impl fmt::Display for MemCache {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "  data dirty size: {}", self.data_blocks_dirty.len())?;
-        writeln!(f, "  data cache blocks: {}, data cache size: {}", self.data_cache_blocks, self.data_blocks_cache.len())
+        write!(f, "  data cache blocks limit: {}, data lru cache size: {}, data dirty size: {}",
+            self.data_cache_blocks, self.data_blocks_cache.len(), self.data_blocks_dirty.len())
     }
 }
 
