@@ -10,7 +10,7 @@ use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use reactor::TaskHandler;
-use btree_ondisk::{bmap::BMap, BlockLoader};
+use btree_ondisk::{bmap::BMap, BlockLoader, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
 #[cfg(feature = "wal")]
@@ -40,9 +40,9 @@ use super::{HyperTrait, DirtyDataBlocks};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
 
-pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
+pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> {
     pub(crate) staging: T,
-    pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>,
+    pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L, C>,
     pub(crate) bmap_ud: BMapUserData,
     pub(crate) cache: Box<dyn Cache + Send>,
     pub(crate) inode: Inode,
@@ -62,7 +62,7 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     pub(crate) flushing_segments: Arc<RwLock<HashMap<SegmentId, Weak<Pin<Box<Vec<u8>>>>>>>,
 }
 
-impl<T: Send + Clone, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T, L> {
+impl<T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> fmt::Display for HyperFile<'_, T, L, C> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "==== dump HyperFile ====")?;
         writeln!(f, "  {:?}", self.config)?;
@@ -72,7 +72,7 @@ impl<T: Send + Clone, L: BlockLoader<BlockPtr>> fmt::Display for HyperFile<'_, T
     }
 }
 
-impl<T: Send + Clone, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
+impl<T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> Drop for HyperFile<'_, T, L, C> {
     fn drop(&mut self) {
         #[cfg(feature = "reactor")]
         if let Some(rt) = self.rt.take() {
@@ -82,12 +82,18 @@ impl<T: Send + Clone, L: BlockLoader<BlockPtr>> Drop for HyperFile<'_, T, L> {
     }
 }
 
-impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
-    pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
+impl<'a, T, L, C> HyperFile<'a, T, L, C>
+    where
+        'a: 'static,
+        T: Staging<L> + SegmentReadWrite + Send + Clone + 'static,
+        L: BlockLoader<BlockPtr> + Clone + 'static,
+        C: NodeCache<BlockPtr> + Clone,
+{
+    pub async fn new(staging: T, meta_block_loader: L, node_cache: C, config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
     {
         let meta_config = config.meta.clone();
 
-        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader, node_cache);
         let bmap_ud = BMapUserData::new(BlockPtrFormat::MicroGroup);
         bmap.set_userdata(bmap_ud.as_u32());
 
@@ -166,21 +172,21 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     /// open a hyper file
     /// open by loading inode from staging,
     /// if inode is not found in staging, create hyper file from scratch
-    pub async fn open(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn open(staging: T, meta_block_loader: L, node_cache: C, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
-        Self::do_open(staging, meta_block_loader, config, flags, 0).await
+        Self::do_open(staging, meta_block_loader, node_cache, config, flags, 0).await
     }
 
     /// open a hyper file with cno for read-only
-    pub async fn open_cno(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
+    pub async fn open_cno(staging: T, meta_block_loader: L, node_cache: C, config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
     {
         if !flags.is_rdonly() {
             return Err(Error::new(ErrorKind::ReadOnlyFilesystem, "write access is not allowed for open specific cno"));
         }
-        Self::do_open(staging, meta_block_loader, config, flags, cno).await
+        Self::do_open(staging, meta_block_loader, node_cache, config, flags, cno).await
     }
 
-    async fn do_open(staging: T, meta_block_loader: L, mut config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
+    async fn do_open(staging: T, meta_block_loader: L, node_cache: C, mut config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
     {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let inode_state;
@@ -201,7 +207,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         // get back meta config from inode raw
         let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
         let b = raw_inode.i_bmap;
-        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L>::read(&b, meta_config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::read(&b, meta_config.meta_block_size, meta_block_loader, node_cache);
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());
 
         // if inode exists, we trust it
@@ -867,7 +873,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 }
 
-impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static, C: NodeCache<BlockPtr> + Clone> HyperFile<'a, T, L, C> {
     // we only care about incomplete blocks and not in dirty list
     // return:
     //   - vec of data block ptr we need to retrieve
@@ -1009,7 +1015,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 }
 
-impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static, C: NodeCache<BlockPtr> + Clone> HyperFile<'a, T, L, C> {
     // write in batch style, input blocks could be incomplete
     pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
         if blocks.len() == 0 {
@@ -1159,10 +1165,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 }
 
-impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
+impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
     where
         T: Staging<L> + SegmentReadWrite + Send + Clone + 'static,
         L: BlockLoader<BlockPtr> + Clone,
+        C: NodeCache<BlockPtr> + Clone,
 {
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
         BlockPtrFormat::encode(segid, offset, seq, &self.bmap_ud.blk_ptr_format)
@@ -1233,6 +1240,10 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
         self.bmap.get_block_loader()
     }
 
+    fn bmap_get_node_cache(&self) -> C {
+        self.bmap.get_node_cache()
+    }
+
     fn bmap_dirty(&self) -> bool {
         self.bmap.dirty()
     }
@@ -1253,13 +1264,13 @@ impl<T, L> HyperTrait<T, L, BlockPtr> for HyperFile<'_, T, L>
         self.bmap.clear_dirty()
     }
 
-    fn bmap_update(&mut self, bmap: BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>) {
+    fn bmap_update(&mut self, bmap: BMap<'_, BlockIndex, BlockPtr, BlockPtr, L, C>) {
         *&mut self.bmap = unsafe {
-            std::mem::transmute::<BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>, BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>>(bmap)
+            std::mem::transmute::<BMap<'_, BlockIndex, BlockPtr, BlockPtr, L, C>, BMap<'_, BlockIndex, BlockPtr, BlockPtr, L, C>>(bmap)
         };
     }
 
-    async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, BlockPtr, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<BlockPtr>> {
+    async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, BlockPtr, BlockPtr, L, C>, blk_idx: &BlockIndex) -> Result<Option<BlockPtr>> {
         bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await
     }
 

@@ -1,7 +1,7 @@
 //! IO function used by LocalSpawner reactor
 use std::io::{Result, Error, ErrorKind};
 use log::{debug, warn};
-use btree_ondisk::BlockLoader;
+use btree_ondisk::{BlockLoader, NodeCache};
 use tokio::task::JoinHandle;
 use crate::{BlockIndex, BlockPtr, BlockIndexIter};
 use crate::staging::Staging;
@@ -26,7 +26,13 @@ impl ImmOrJoinSize {
     }
 }
 
-impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static> HyperFile<'a, T, L> {
+impl<'a, T, L, C> HyperFile<'a, T, L, C>
+    where
+        'a: 'static,
+        T: Staging<L> + SegmentReadWrite + Send + Clone + 'static,
+        L: BlockLoader<BlockPtr> + Clone + 'static,
+        C: NodeCache<BlockPtr> + Clone,
+{
     fn spawn_load_data_block_read_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {
         debug!("spawn_load_data_block_read_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
             blk_id, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));

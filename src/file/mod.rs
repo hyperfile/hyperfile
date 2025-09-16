@@ -23,7 +23,7 @@ use std::sync::Weak;
 use std::pin::Pin;
 use log::{info, debug, warn};
 use tokio::sync::{OwnedSemaphorePermit, OwnedMutexGuard};
-use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue};
+use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use ::reactor::TaskHandler;
@@ -69,7 +69,7 @@ impl<'a> DirtyDataBlocks<'a> {
     }
 }
 
-pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone, V: Copy + Default + std::fmt::Display + NodeValue + 'static> {
+pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone, C: NodeCache<BlockPtr> + Clone, V: Copy + Default + std::fmt::Display + NodeValue + 'static> {
     // block ptr
     fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr;
     fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset);
@@ -89,13 +89,14 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     // bmap
     fn bmap_as_slice(&self) -> &[u8];
     fn bmap_get_block_loader(&self) -> L;
+    fn bmap_get_node_cache(&self) -> C;
     fn bmap_dirty(&self) -> bool;
     fn bmap_lookup_dirty(&self) -> Vec<BtreeNodeDirty<'_, BlockIndex, V, BlockPtr>>;
     fn bmap_assign_meta_node(&self, blk_ptr: BlockPtr, node: BtreeNodeDirty<'_, BlockIndex, V, BlockPtr>) -> impl Future<Output = Result<()>>;
     fn bmap_assign_data_node(&self, blk_idx: &BlockIndex, blk_ptr: BlockPtr) -> impl Future<Output = Result<()>>;
     fn bmap_clear_dirty(&mut self);
-    fn bmap_update<'a>(&mut self, bmap: BMap<'a, BlockIndex, V, BlockPtr, L>);
-    fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, V, BlockPtr, L>, blk_idx: &BlockIndex) -> impl Future<Output = Result<Option<V>>>;
+    fn bmap_update<'a>(&mut self, bmap: BMap<'a, BlockIndex, V, BlockPtr, L, C>);
+    fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, V, BlockPtr, L, C>, blk_idx: &BlockIndex) -> impl Future<Output = Result<Option<V>>>;
     fn bmap_set_cache_unlimited(&self) -> usize;
     fn bmap_set_cache_limit(&self, liimt: usize);
     // inode
@@ -185,9 +186,11 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         // get back block loader
         let meta_block_loader = self.bmap_get_block_loader();
+        // get back node cache
+        let node_cache = self.bmap_get_node_cache();
 
         let b = raw_inode.i_bmap;
-        let mut bmap = BMap::<BlockIndex, V, BlockPtr, L>::read(&b, self.config().meta.meta_block_size, meta_block_loader);
+        let mut bmap = BMap::<BlockIndex, V, BlockPtr, L, C>::read(&b, self.config().meta.meta_block_size, meta_block_loader, node_cache);
 
         let _permit = self.lock().await;
 
