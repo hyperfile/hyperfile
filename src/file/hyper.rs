@@ -1,15 +1,15 @@
 use std::io::{ErrorKind, Result};
 use aws_sdk_s3::Client;
-use btree_ondisk::NullNodeCache;
 use crate::config::HyperFileConfig;
 use crate::meta_loader::s3::S3BlockLoader;
 use crate::staging::{Staging, StagingIntercept, config::StagingConfig, s3::S3Staging};
+use crate::node_cache::localdisk::LocalDiskNodeCache;
 use super::file::HyperFile;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 
 pub struct Hyper<'a> {
-    pub(crate) inner: HyperFile<'a, S3Staging, S3BlockLoader, NullNodeCache>,
+    pub(crate) inner: HyperFile<'a, S3Staging, S3BlockLoader, LocalDiskNodeCache>,
 }
 
 impl<'a: 'static> Hyper<'a> {
@@ -32,8 +32,8 @@ impl<'a: 'static> Hyper<'a> {
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
-        let node_cache = NullNodeCache;
-        let file = HyperFile::<S3Staging, S3BlockLoader, NullNodeCache>::open(staging, loader, node_cache, file_config, flags).await?;
+        let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
+        let file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::open(staging, loader, node_cache, file_config, flags).await?;
         Ok(Self {
             inner: file,
         })
@@ -43,8 +43,8 @@ impl<'a: 'static> Hyper<'a> {
     {
         let staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
-        let node_cache = NullNodeCache;
-        let file = HyperFile::<S3Staging, S3BlockLoader, NullNodeCache>::new(staging, loader, node_cache, file_config, flags, mode).await?;
+        let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
+        let file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::new(staging, loader, node_cache, file_config, flags, mode).await?;
         Ok(Self {
             inner: file,
         })
@@ -55,8 +55,8 @@ impl<'a: 'static> Hyper<'a> {
         let mut staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         staging.interceptor(interceptor);
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
-        let node_cache = NullNodeCache;
-        let file = HyperFile::<S3Staging, S3BlockLoader, NullNodeCache>::new(staging, loader, node_cache, file_config, flags, mode).await?;
+        let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
+        let file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::new(staging, loader, node_cache, file_config, flags, mode).await?;
         Ok(Self {
             inner: file,
         })
@@ -65,13 +65,13 @@ impl<'a: 'static> Hyper<'a> {
     pub async fn stat_fast(client: Client, file_config: HyperFileConfig) -> Result<libc::stat>
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
-        HyperFile::<S3Staging, S3BlockLoader, NullNodeCache>::stat_fast(staging).await
+        HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::stat_fast(staging).await
     }
 
     pub async fn update_stat_fast(client: Client, file_config: HyperFileConfig, stat: &libc::stat) -> Result<libc::stat>
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
-        HyperFile::<S3Staging, S3BlockLoader, NullNodeCache>::update_stat_fast(staging, stat).await
+        HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::update_stat_fast(staging, stat).await
     }
 }
 

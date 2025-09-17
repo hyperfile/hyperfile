@@ -13,6 +13,7 @@ pub mod cache;
 pub(crate) mod s3commons;
 #[cfg(feature = "wal")]
 pub mod wal;
+pub(crate) mod node_cache;
 
 pub type BlockIndex = u64;
 pub type BlockPtr = u64;

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::meta_format::BlockPtrFormat;
 use crate::staging::config::StagingConfig;
 use crate::cache::config::HyperFileCacheConfig;
+use crate::node_cache::config::HyperFileNodeCacheConfig;
 #[cfg(feature = "wal")]
 use crate::wal::config::HyperFileWalConfig;
 use crate::*;
@@ -155,6 +156,8 @@ pub struct HyperFileConfig {
 	pub wal: HyperFileWalConfig,
     /// cache config for hyper file
     pub cache: HyperFileCacheConfig,
+    /// node cache config for hyper file
+    pub node_cache: HyperFileNodeCacheConfig,
 }
 
 pub struct HyperFileConfigBuilder {
