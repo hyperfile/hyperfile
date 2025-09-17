@@ -30,23 +30,23 @@ impl LocalDiskCacheConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub enum HyperFileCacheConfig {
+pub enum HyperFileDataCacheConfig {
     Memory(MemCacheConfig),
     LocalDisk(LocalDiskCacheConfig),
 }
 
-impl Default for HyperFileCacheConfig {
+impl Default for HyperFileDataCacheConfig {
     fn default() -> Self {
         Self::Memory(MemCacheConfig::default())
     }
 }
 
-impl HyperFileCacheConfig {
-    pub fn new_mem() -> HyperFileCacheConfig {
+impl HyperFileDataCacheConfig {
+    pub fn new_mem() -> HyperFileDataCacheConfig {
         Self::Memory(MemCacheConfig::default())
     }
 
-    pub fn new_local_disk(cache_dir: Option<&str>, cache_file_path: Option<&str>) -> HyperFileCacheConfig {
+    pub fn new_local_disk(cache_dir: Option<&str>, cache_file_path: Option<&str>) -> HyperFileDataCacheConfig {
         Self::LocalDisk(
             LocalDiskCacheConfig {
                 cache_dir: cache_dir.and_then(|s| Some(s.to_string())),
@@ -55,7 +55,7 @@ impl HyperFileCacheConfig {
         )
     }
 
-    pub fn new_local_disk_default() -> HyperFileCacheConfig {
+    pub fn new_local_disk_default() -> HyperFileDataCacheConfig {
         Self::new_local_disk(None, None)
     }
 }

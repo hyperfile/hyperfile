@@ -33,7 +33,7 @@ use crate::file::handler::FileContext;
 use crate::wal::{WalReadWrite, WalChunkDesc};
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::inode::OnDiskState;
-use crate::cache::Cache;
+use crate::data_cache::Cache;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
@@ -142,8 +142,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
-            cache: crate::cache::cache_from_config(
-                &config.cache,
+            cache: crate::data_cache::cache_from_config(
+                &config.data_cache,
                 0,
                 data_cache_blocks,
                 config.meta.data_block_size,
@@ -249,8 +249,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             staging: staging,
             bmap: bmap,
             bmap_ud: bmap_ud,
-            cache: crate::cache::cache_from_config(
-                &config.cache,
+            cache: crate::data_cache::cache_from_config(
+                &config.data_cache,
                 inode.size(),
                 data_cache_blocks,
                 config.meta.data_block_size,

@@ -3,7 +3,7 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use crate::meta_format::BlockPtrFormat;
 use crate::staging::config::StagingConfig;
-use crate::cache::config::HyperFileCacheConfig;
+use crate::data_cache::config::HyperFileDataCacheConfig;
 use crate::node_cache::config::HyperFileNodeCacheConfig;
 #[cfg(feature = "wal")]
 use crate::wal::config::HyperFileWalConfig;
@@ -154,8 +154,8 @@ pub struct HyperFileConfig {
     #[cfg(feature = "wal")]
 	/// wal config for hyper file
 	pub wal: HyperFileWalConfig,
-    /// cache config for hyper file
-    pub cache: HyperFileCacheConfig,
+    /// data cache config for hyper file
+    pub data_cache: HyperFileDataCacheConfig,
     /// node cache config for hyper file
     pub node_cache: HyperFileNodeCacheConfig,
 }
@@ -201,8 +201,13 @@ impl HyperFileConfigBuilder {
 		self
 	}
 
-	pub fn with_cache_config(mut self, cache: &HyperFileCacheConfig) -> Self {
-		self.config.cache = cache.to_owned();
+	pub fn with_data_cache_config(mut self, cache: &HyperFileDataCacheConfig) -> Self {
+		self.config.data_cache = cache.to_owned();
+		self
+	}
+
+	pub fn with_node_cache_config(mut self, cache: &HyperFileNodeCacheConfig) -> Self {
+		self.config.node_cache = cache.to_owned();
 		self
 	}
 

@@ -7,7 +7,7 @@ use std::io::Result;
 use crate::BlockIndex;
 use crate::buffer::DataBlock;
 use crate::file::DirtyDataBlocks;
-use self::config::HyperFileCacheConfig;
+use self::config::HyperFileDataCacheConfig;
 use self::{mem_cache::MemCache, local_disk_cache::LocalDiskCache};
 
 pub(crate) trait Cache {
@@ -36,12 +36,12 @@ impl fmt::Display for Box<dyn Cache + Send> {
     }
 }
 
-pub(crate) fn cache_from_config(config: &HyperFileCacheConfig, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Box<dyn Cache + Send>> {
+pub(crate) fn cache_from_config(config: &HyperFileDataCacheConfig, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Box<dyn Cache + Send>> {
     match config {
-        HyperFileCacheConfig::Memory(_) => {
+        HyperFileDataCacheConfig::Memory(_) => {
             Ok(Box::new(MemCache::new(data_cache_blocks, data_block_size)))
         },
-        HyperFileCacheConfig::LocalDisk(local) => {
+        HyperFileDataCacheConfig::LocalDisk(local) => {
             let cache = LocalDiskCache::open_or_create(local.full_file_path()?, size, data_cache_blocks, data_block_size)?;
             Ok(Box::new(cache))
         },
