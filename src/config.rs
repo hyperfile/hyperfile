@@ -164,6 +164,15 @@ pub struct HyperFileConfig {
     pub node_cache: HyperFileNodeCacheConfig,
 }
 
+impl HyperFileConfig {
+    pub fn to_json_string(&self, pretty: bool) -> String {
+        if pretty {
+            return serde_json::to_string_pretty(self).unwrap();
+        }
+        serde_json::to_string(self).unwrap()
+    }
+}
+
 pub struct HyperFileConfigBuilder {
 	pub(crate) config: HyperFileConfig,
 }
