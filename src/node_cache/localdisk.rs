@@ -27,10 +27,8 @@ pub enum LocalDiskNodeCacheOpenMode {
 
 impl Drop for LocalDiskNodeCache {
     fn drop(&mut self) {
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                self.close().await
-            })
+        futures::executor::block_on(async {
+            self.close().await
         });
     }
 }
@@ -90,6 +88,12 @@ impl<P: Send + Copy + Into<u64>> NodeCache<P> for LocalDiskNodeCache {
 
     fn get_stats(&self) -> NodeTieredCacheStats {
         self.stats.clone()
+    }
+
+    fn shutdown(&self) {
+        futures::executor::block_on(async {
+            self.close().await
+        });
     }
 }
 
