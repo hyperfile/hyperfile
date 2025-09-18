@@ -78,7 +78,6 @@ impl<T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> Drop for
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
-        self.cache.shutdown();
     }
 }
 
@@ -298,7 +297,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
-        self.flush().await
+        let segid = self.flush().await?;
+        self.cache.shutdown();
+        self.bmap.get_node_cache().shutdown();
+        Ok(segid)
     }
 
     pub fn stat(&self) -> libc::stat {
