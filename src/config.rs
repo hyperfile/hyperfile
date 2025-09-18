@@ -107,6 +107,8 @@ pub struct HyperFileRuntimeConfig {
     pub data_cache_dirty_max_bytes_threshold: usize,
     pub data_cache_dirty_max_blocks_threshold: usize,
     pub data_cache_dirty_max_flush_interval: u64,
+    // bmap node cache
+    pub node_cache_blocks: usize,
 }
 
 impl Default for HyperFileRuntimeConfig {
@@ -121,6 +123,7 @@ impl Default for HyperFileRuntimeConfig {
             data_cache_dirty_max_bytes_threshold: DEFAULT_MAX_DIRTY_DATA_BYTES_THRESHOLD,
             data_cache_dirty_max_blocks_threshold: DEFAULT_MAX_DIRTY_DATA_BLOCKS_THRESHOLD,
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
+            node_cache_blocks: DEFAULT_NODE_CACHE_BLOCKS,
         }
     }
 }
@@ -137,6 +140,7 @@ impl HyperFileRuntimeConfig {
             data_cache_dirty_max_bytes_threshold: DEFAULT_LARGE_MAX_DIRTY_DATA_BYTES_THRESHOLD,
             data_cache_dirty_max_blocks_threshold: DEFAULT_LARGE_MAX_DIRTY_DATA_BLOCKS_THRESHOLD,
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
+            node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
         }
     }
 }

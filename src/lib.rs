@@ -130,3 +130,6 @@ pub(crate)  const DEFAULT_FLUSH_RETRIES: usize = 3;
 pub(crate)  const DEFAULT_FLUSH_BACKOFF_SECS: u64 = 1;
 pub(crate)  const DEFAULT_PARTIAL_FLUSH_TIMEOUT: u64 = 5;
 pub(crate)  const DEFAULT_PARTIAL_FLUSH_CHECK_INTERVAL_SECS: u64 = 1;
+// count of bmap in memory node cache
+pub(crate) const DEFAULT_NODE_CACHE_BLOCKS: usize = 1024;
+pub(crate) const DEFAULT_MAX_NODE_CACHE_BLOCKS: usize = btree_ondisk::DEFAULT_CACHE_UNLIMITED;

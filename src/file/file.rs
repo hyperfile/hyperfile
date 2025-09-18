@@ -95,6 +95,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader, node_cache);
         let bmap_ud = BMapUserData::new(BlockPtrFormat::MicroGroup);
         bmap.set_userdata(bmap_ud.as_u32());
+        bmap.set_cache_limit(config.runtime.node_cache_blocks);
 
         let inode = Inode::default_file()
             .with_mode(&mode)
@@ -208,6 +209,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let b = raw_inode.i_bmap;
         let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::read(&b, meta_config.meta_block_size, meta_block_loader, node_cache);
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());
+        bmap.set_cache_limit(config.runtime.node_cache_blocks);
 
         // if inode exists, we trust it
 
