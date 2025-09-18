@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::{Error, ErrorKind, Result};
 use log::warn;
 use serde::{Deserialize, Serialize};
 use crate::meta_format::BlockPtrFormat;
@@ -165,6 +166,14 @@ pub struct HyperFileConfig {
 }
 
 impl HyperFileConfig {
+    pub fn from_json_string(s: &str) -> Result<Self> {
+        serde_json::from_str(s)
+            .map_err(|e| {
+                let err_msg = format!("{}", e);
+                Error::new(ErrorKind::InvalidInput, err_msg)
+            })
+    }
+
     pub fn to_json_string(&self, pretty: bool) -> String {
         if pretty {
             return serde_json::to_string_pretty(self).unwrap();
