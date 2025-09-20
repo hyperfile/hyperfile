@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 use tokio::sync::mpsc::error::TryRecvError as MpscTryRecvError;
 use tokio::sync::oneshot::error::TryRecvError as OneshotTryRecvError;
 use aws_sdk_s3::Client;
-use reactor::{LocalSpawner, TaskHandler};
+use hyperfile_reactor::{LocalSpawner, TaskHandler};
 use crate::config::{HyperFileConfig, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use super::hyper::Hyper;
 use super::flags::FileFlags;

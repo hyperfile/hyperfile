@@ -9,7 +9,7 @@ use std::time::{Instant, Duration};
 use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
 #[cfg(all(feature = "wal", feature = "reactor"))]
-use reactor::TaskHandler;
+use hyperfile_reactor::TaskHandler;
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
