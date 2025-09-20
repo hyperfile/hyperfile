@@ -7,7 +7,7 @@ use log::{warn, info};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 #[cfg(feature = "wal")]
 use tokio::sync::OwnedMutexGuard;
-use reactor::{Task, TaskHandler};
+use hyperfile_reactor::{Task, TaskHandler};
 use crate::SegmentId;
 #[cfg(feature = "wal")]
 use crate::inode::OnDiskState;

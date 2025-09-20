@@ -23,8 +23,8 @@ futures = "0.3.31"
 ulid = "1.2.1"
 foyer = "0.19.2"
 serde_json = "1.0.145"
-btree-ondisk = { version = "0.15.0", path = "../btree-ondisk", default-features = false, features = ["tokio-runtime"] }
-reactor = { version = "0.1.0", path = "../reactor", optional = true }
+btree-ondisk = { version = "0.16.0", default-features = false, features = ["tokio-runtime"] }
+hyperfile-reactor = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
 rand = "0.9.0"
@@ -39,6 +39,6 @@ wal = []
 concurrent-segment-build = []
 # concurrency control by range lock
 range-lock = ["dep:rangemap"]
-reactor = ["dep:reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
+reactor = ["dep:hyperfile-reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
 blocking = ["btree-ondisk/rc"]
 bench = ["dep:rand"]

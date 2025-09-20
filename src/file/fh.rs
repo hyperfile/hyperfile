@@ -1,7 +1,7 @@
 use std::io::Result;
 use tokio::sync::oneshot;
 use aws_sdk_s3::Client;
-use reactor::{LocalSpawner, TaskHandler};
+use hyperfile_reactor::{LocalSpawner, TaskHandler};
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use crate::staging::{s3::S3Staging, StagingIntercept};

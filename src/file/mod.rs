@@ -26,7 +26,7 @@ use tokio::sync::{OwnedSemaphorePermit, OwnedMutexGuard};
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 #[cfg(all(feature = "wal", feature = "reactor"))]
-use ::reactor::TaskHandler;
+use hyperfile_reactor::TaskHandler;
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::file::handler::FileContext;
 use crate::*;
