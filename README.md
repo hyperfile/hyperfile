@@ -1,3 +1,5 @@
+![Hyperfile - Random Read Write Object Format](./docs/assets/images/hyperfile-header.svg)
+
 # Hyperfile - aka Random Read Write Object Format
 
 A file-like interface abstraction layer provides random read and write capabilities for S3 (object storage).
