@@ -37,7 +37,11 @@ When flush happens, all modified(dirty) data blocks together with it's metadata 
 
 ### Copy-on-Write (CoW)
 
-Hyperfile never overwrite persisted data on S3, every new written segment will be assigned with a global sequentially increasing id.
+Hyperfile optimize storage space by using copy-on-write space allocation strategy, deferring data space allocation until first modification in block level granularity.
+
+### Continuous Snapshot
+
+Hyperfile never overwrite persisted data on S3, every new written segment will be assigned with a global sequentially increasing id identified as checkpoint.
 
 ### Log-Structured Characteristics
 
