@@ -144,6 +144,21 @@ impl HyperFileRuntimeConfig {
             node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
         }
     }
+
+    pub fn default_middle() -> Self {
+        Self {
+            forward_origin_concurrency: DEFAULT_FORWARD_ORIGIN_CONCURRENCY,
+            forward_origin_threshold: DEFAULT_FORWARD_ORIGIN_THRESHOLD,
+            forward_origin_chunk_size: DEFAULT_FORWARD_ORIGIN_CHUNK_SIZE,
+            segment_buffer_size: DEFAULT_MIDDLE_SEGMENT_BUFFER_SIZE,
+            segment_mpu_chunk_size: DEFAULT_SEGMENT_MPU_CHUNK_SIZE,
+            data_cache_blocks: DEFAULT_MIDDLE_DATA_CACHE_BLOCKS,
+            data_cache_dirty_max_bytes_threshold: DEFAULT_MIDDLE_MAX_DIRTY_DATA_BYTES_THRESHOLD,
+            data_cache_dirty_max_blocks_threshold: DEFAULT_MIDDLE_MAX_DIRTY_DATA_BLOCKS_THRESHOLD,
+            data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
+            node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
+        }
+    }
 }
 
 /// Central config per hyper file
