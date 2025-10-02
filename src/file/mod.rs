@@ -13,6 +13,7 @@ pub mod fh;
 pub mod tokio_wrapper;
 #[cfg(feature = "range-lock")]
 pub mod lock;
+mod state;
 
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
@@ -667,9 +668,13 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         while retries < DEFAULT_FLUSH_RETRIES {
             let lock = self.flush_lock().await;
             match self.flush_process().await {
-                Ok(segid) => { return Ok(segid) },
+                Ok(segid) => {
+                    self.flush_unlock(lock);
+                    return Ok(segid);
+                },
                 Err(err) => {
                     if err.kind() != ErrorKind::ResourceBusy {
+                        self.flush_unlock(lock);
                         return Err(err);
                     }
                     warn!("{err}");
