@@ -247,6 +247,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let off = req.offset;
         let len = req.buf.len();
 
+        // we need to stop world if flush is processing
+        if self.state.is_flushing() {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_read(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
+        }
+
         #[cfg(feature = "range-lock")]
         let range = off as u64..(off + len) as u64;
         #[cfg(feature = "range-lock")]
@@ -402,7 +410,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             #[cfg(feature = "wal")]
             if self.wal.is_none() {
                 self.flush().await?;
-            } else if let Err(_) = self.flush_lock.try_lock() {
+            } else if self.state.is_flushing() {
                 // if flushing is on going, let skip it
             } else {
                 let fh = req.fh;
@@ -506,7 +514,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             #[cfg(feature = "wal")]
             if self.wal.is_none() {
                 self.flush().await?;
-            } else if let Err(_) = self.flush_lock.try_lock() {
+            } else if self.state.is_flushing() {
                 // if flushing is on going, let skip it
             } else {
                 let fh = req.fh;
@@ -624,6 +632,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let buf = req.buf;
         let len = buf.len();
 
+        // we need to stop world if flush is processing
+        if self.state.is_flushing() {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
+        }
+
         #[cfg(feature = "range-lock")]
         let range = off as u64..(off + len) as u64;
         #[cfg(feature = "range-lock")]
@@ -655,6 +671,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub async fn spawn_write_zero(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
         let off = req.offset;
         let len = req.len;
+
+        // we need to stop world if flush is processing
+        if self.state.is_flushing() {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write_zero(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
+        }
 
         #[cfg(feature = "range-lock")]
         let range = off as u64..(off + len) as u64;

@@ -39,6 +39,7 @@ use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
+use super::state::State;
 
 pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> {
     pub(crate) staging: T,
@@ -49,7 +50,7 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     pub(crate) config: HyperFileConfig,
     pub(crate) max_dirty_blocks: usize,
     pub(crate) flags: HyperFileFlags,
-    pub(crate) last_flush: Instant,
+    pub(crate) state: State,
     pub(crate) sema: Arc<Semaphore>,
     pub(crate) flush_lock: Arc<Mutex<()>>,
     #[cfg(feature = "range-lock")]
@@ -152,7 +153,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             config: config,
             max_dirty_blocks: max_dirty_blocks,
             flags: flags,
-            last_flush: Instant::now(),
+            state: State::default(),
             sema: Arc::new(Semaphore::new(permits)),
             flush_lock: Arc::new(Mutex::new(())),
             #[cfg(feature = "reactor")]
@@ -260,7 +261,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             config: config,
             max_dirty_blocks: max_dirty_blocks,
             flags: flags,
-            last_flush: Instant::now(),
+            state: State::default(),
             sema: Arc::new(Semaphore::new(permits)),
             flush_lock: Arc::new(Mutex::new(())),
             #[cfg(feature = "reactor")]
@@ -592,7 +593,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         };
 
         let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
-        let last_flush_expired = self.last_flush.elapsed() >= Duration::from_millis(max_flush_interval);
+        let last_flush_expired = self.state.get_last_flush().elapsed() >= Duration::from_millis(max_flush_interval);
         if last_flush_expired || threshold_flush || sync_flush || direct_flush {
             return true;
         }
@@ -653,7 +654,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         self.restore_data_blocks_cache_limit();
         self.bmap_set_cache_limit(bmap_cache_limit);
         self.set_last_flush();
-        drop(lock);
+        self.flush_unlock(lock);
     }
 
     // starting wal flush recovery process by reloading inode from backend storage
@@ -661,20 +662,23 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     #[cfg(feature = "wal")]
     pub(crate) async fn wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
         debug!("wal_flush_recovery - started");
-        match self.do_wal_flush_recovery(lock).await {
+        match self.do_wal_flush_recovery().await {
             Ok(cno) => {
+                self.flush_unlock(lock);
                 if cno != 0 { return Ok(cno); }
                 warn!("wal_flush_recovery - return with cno 0");
             },
             Err(e) => {
+                self.flush_unlock(lock);
                 warn!("wal_flush_recovery - return with err {}", e);
             },
         }
         panic!("wal_flush_recovery - failed, please fix wal with offline tools");
     }
 
+    // handler flush lock in caller
     #[cfg(feature = "wal")]
-    async fn do_wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
+    async fn do_wal_flush_recovery(&mut self) -> Result<SegmentId> {
         let v = self.wal_list_segments().await?;
         let last_ondisk = self.inode().get_last_ondisk_cno();
         // filter out candidate segment id to playback
@@ -688,7 +692,6 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             assert!(cno == segid + 1);
         }
 
-        drop(lock);
         Ok(cno)
     }
 
@@ -1229,11 +1232,14 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
     }
 
     async fn flush_lock(&self) -> OwnedMutexGuard<()> {
-        self.flush_lock.clone().lock_owned().await
+        let lock = self.flush_lock.clone().lock_owned().await;
+        self.state.set_flushing();
+        lock
     }
 
     fn flush_unlock(&self, lock: OwnedMutexGuard<()>) {
         drop(lock);
+        self.state.clear_flushing();
     }
 
     fn bmap_as_slice(&self) -> &[u8] {
@@ -1297,7 +1303,7 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
     }
 
     fn set_last_flush(&mut self) {
-        self.last_flush = Instant::now();
+        self.state.set_last_flush();
     }
 
     fn inode(&self) -> &Inode {
