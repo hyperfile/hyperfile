@@ -568,33 +568,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // trigger flush because we meet memory threshold
         let threshold_flush = ndatadirty > self.max_dirty_blocks
             || (ndatadirty * data_block_size) > self.config.runtime.segment_buffer_size;
-        // trigger flush if file opened in O_SYNC
-        let sync_flush = self.flags.is_sync();
-        let sync_flush = if sync_flush {
+        // trigger immediate flush if file opened in O_DIRECT or O_SYNC or O_DSYNC
+        let immediate_flush = if self.flags.is_sync_flush_mode() {
             #[cfg(not(feature = "wal"))]
             { true }
             // in wal mode, we dont's need immediately flush
+            // unless wal is not configured
             #[cfg(feature = "wal")]
-            { false }
-        } else {
-            false
-        };
-
-        // trigger flush if file opened in O_DIRECT
-        let direct_flush = self.flags.is_direct();
-        let direct_flush = if direct_flush {
-            #[cfg(not(feature = "wal"))]
-            { true }
-            // in wal mode, we dont's need immediately flush
-            #[cfg(feature = "wal")]
-            { false }
+            { self.wal.is_none() }
         } else {
             false
         };
 
         let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
         let last_flush_expired = self.state.get_last_flush().elapsed() >= Duration::from_millis(max_flush_interval);
-        if last_flush_expired || threshold_flush || sync_flush || direct_flush {
+        if last_flush_expired || threshold_flush || immediate_flush {
             return true;
         }
         false

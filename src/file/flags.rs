@@ -11,6 +11,7 @@ pub struct HyperFileFlags {
     pub sync: bool,
     pub dsync: bool,
     pub direct: bool,
+    sync_flush_mode: bool,
 }
 
 impl HyperFileFlags {
@@ -35,6 +36,7 @@ impl HyperFileFlags {
             sync: f.is_sync(),
             dsync: f.is_dsync(),
             direct: f.is_direct(),
+            sync_flush_mode: f.is_direct() | f.is_sync() | f.is_dsync(),
         }
     }
 
@@ -60,6 +62,7 @@ impl HyperFileFlags {
             sync: true,
             dsync: true,
             direct: true,
+            sync_flush_mode: true,
         }
     }
 
@@ -85,6 +88,13 @@ impl HyperFileFlags {
 
     pub fn is_trunc(&self) -> bool {
         self.trunc
+    }
+
+    // according to hyperfile's nature behavior,
+    // direct || sync || dsync will be treated as sync_flush_mode ON
+    // which should trigger flush every write
+    pub fn is_sync_flush_mode(&self) -> bool {
+        self.sync_flush_mode
     }
 }
 
