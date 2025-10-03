@@ -28,6 +28,7 @@ impl State {
         self.last_flush = Instant::now();
     }
 
+    #[cfg(feature = "reactor")]
     pub(crate) fn is_flushing(&self) -> bool {
         self.flushing.load(Ordering::SeqCst)
     }
