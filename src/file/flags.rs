@@ -5,9 +5,11 @@ use log::warn;
 pub struct HyperFileFlags {
     pub read: bool,
     pub write: bool,
+    pub creat: bool,
     pub append: bool,
     pub trunc: bool,
     pub sync: bool,
+    pub dsync: bool,
     pub direct: bool,
 }
 
@@ -27,9 +29,11 @@ impl HyperFileFlags {
         Self {
             read: read,
             write: write,
+            creat: f.is_creat(),
             append: f.is_append(),
             trunc: f.is_trunc(),
             sync: f.is_sync(),
+            dsync: f.is_dsync(),
             direct: f.is_direct(),
         }
     }
@@ -50,9 +54,11 @@ impl HyperFileFlags {
         Self {
             read: true,
             write: true,
+            creat: true,
             append: true,
             trunc: true,
             sync: true,
+            dsync: true,
             direct: true,
         }
     }
@@ -61,12 +67,24 @@ impl HyperFileFlags {
         self.sync
     }
 
+    pub fn is_dsync(&self) -> bool {
+        self.dsync
+    }
+
     pub fn is_rdonly(&self) -> bool {
         self.read && !self.write && !self.append
     }
 
     pub fn is_direct(&self) -> bool {
         self.direct
+    }
+
+    pub fn is_append(&self) -> bool {
+        self.append
+    }
+
+    pub fn is_trunc(&self) -> bool {
+        self.trunc
     }
 }
 
@@ -100,6 +118,9 @@ impl fmt::Display for FileFlags {
         }
         if self.is_directory() {
             write!(f, " | O_DIRECTORY")?;
+        }
+        if self.is_dsync() {
+            write!(f, " | O_DSYNC")?;
         }
         if self.is_excl() {
             write!(f, " | O_EXCL")?;
@@ -186,6 +207,10 @@ impl FileFlags {
 
     pub fn is_directory(&self) -> bool {
         (self.0 & libc::O_DIRECTORY) == libc::O_DIRECTORY
+    }
+
+    pub fn is_dsync(&self) -> bool {
+        (self.0 & libc::O_DSYNC) == libc::O_DSYNC
     }
 
     pub fn is_excl(&self) -> bool {
