@@ -293,7 +293,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     pub async fn release(&mut self) -> Result<SegmentId> {
         #[cfg(feature = "wal")]
-        let Ok(_) = self.flush_lock.try_lock() else {
+        if self.state.is_flushing() {
             return Err(Error::new(ErrorKind::ResourceBusy, "flush is in-progress"));
         };
         #[cfg(feature = "reactor")]
@@ -562,6 +562,11 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub(crate) fn need_flush(&self) -> bool {
+        // skip if flush is ongoing
+        if self.state.is_flushing() {
+            return false;
+        }
+
         // check if dirty data bytes exceed segment buffer threshold
         let ndatadirty = self.cache.dirty_count();
         let data_block_size = self.config.meta.data_block_size;
