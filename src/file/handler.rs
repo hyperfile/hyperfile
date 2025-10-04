@@ -792,9 +792,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     }
                     res
                 } else {
-                    let res = self.inner.kick_wal_protected_flush_reactor(req.fh).await;
+                    let res = self.inner.kick_wal_protected_flush_reactor(req.fh.clone()).await;
                     if res.is_err() {
-                        warn!("kick wal flush failed {:?}", res);
+                        warn!("kick wal flush failed {:?}, requeue this request", res);
+                        let fh = req.fh.clone();
+                        let ctx = FileContext::reform_flush(req, resp);
+                        // move flush op to cb queue
+                        // so that flush op can run immediately after all inflight write op finished
+                        fh.send_cb(ctx);
+                        return;
                     }
                     res
                 };
