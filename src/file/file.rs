@@ -292,7 +292,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn release(&mut self) -> Result<SegmentId> {
-        #[cfg(feature = "wal")]
+        #[cfg(feature = "reactor")]
         if self.state.is_flushing() {
             return Err(Error::new(ErrorKind::ResourceBusy, "flush is in-progress"));
         };
