@@ -3,7 +3,7 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::io::{Result, ErrorKind};
 #[cfg(feature = "wal")]
-use log::{warn, info};
+use log::{warn, info, debug};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 #[cfg(feature = "wal")]
 use tokio::sync::OwnedMutexGuard;
@@ -794,7 +794,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 } else {
                     let res = self.inner.kick_wal_protected_flush_reactor(req.fh.clone()).await;
                     if res.is_err() {
-                        warn!("kick wal flush failed {:?}, requeue this request", res);
+                        debug!("kick wal flush failed {:?}, requeue this request", res);
                         let fh = req.fh.clone();
                         let ctx = FileContext::reform_flush(req, resp);
                         // move flush op to cb queue
@@ -821,7 +821,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 }
                 let res = self.inner.kick_wal_protected_flush_reactor(req.fh).await;
                 if res.is_err() {
-                    warn!("kick wal flush failed {:?}, ignore this flush request", res);
+                    debug!("kick wal flush failed {:?}, ignore this flush request", res);
                 }
                 let _ = resp.to_wal_flush();
             },
