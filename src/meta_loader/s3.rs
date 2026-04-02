@@ -48,7 +48,7 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
         Ok(Vec::new())
     }
 
-    fn from_new_path(self, new_path: &str) -> Self {
+    fn dup_from_new_path(self, new_path: &str) -> Self {
         let s3uri = S3Uri::parse(new_path).expect("input new path is not a valid s3 uri");
         let mut clone = self.clone();
         clone.bucket = s3uri.bucket.to_string();

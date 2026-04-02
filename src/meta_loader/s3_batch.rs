@@ -68,7 +68,7 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
             let meta_block = meta_block_slice.to_vec();
 
             // decode nonleaf node, get back all next level block ptr
-            let node = BtreeNode::<BlockIndex, BlockPtr, BlockPtr>::from_slice(&meta_block);
+            let node = BtreeNode::<BlockIndex, BlockPtr, BlockPtr>::from_slice_ref(&meta_block);
             // we only care about meta data nodes
             if node.get_level() > BTREE_NODE_LEVEL_MIN {
                 for idx in 0..node.get_nchild() {
@@ -118,7 +118,7 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
         Ok(Vec::new())
     }
 
-    fn from_new_path(self, new_path: &str) -> Self {
+    fn dup_from_new_path(self, new_path: &str) -> Self {
         let s3uri = S3Uri::parse(new_path).expect("input new path is not a valid s3 uri");
         let mut clone = self.clone();
         clone.bucket = s3uri.bucket.to_string();
