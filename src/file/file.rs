@@ -620,6 +620,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // should this flush be re-queue?
             return Err(Error::new(ErrorKind::ResourceBusy, "another flush is in-progress"));
         };
+        self.state.set_flushing();
         match self.wal_flush_process_reactor(fh, lock).await {
             Ok(segid) => {
                 return Ok(segid);
