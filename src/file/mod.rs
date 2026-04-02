@@ -415,6 +415,9 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             Err(e) => return Err((lock, e)),
         };
         if segid > 0 {
+            // manually unlock
+            self.set_last_flush();
+            self.flush_unlock(lock);
             return Ok(segid);
         }
         let (segwr, segid, raw_inode, dirty_meta_vec) = match self.flush_process_build_segment(dirty_data_blocks).await {
