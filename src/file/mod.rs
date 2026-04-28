@@ -191,7 +191,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let node_cache = self.bmap_get_node_cache();
 
         let b = raw_inode.i_bmap;
-        let mut bmap = BMap::<BlockIndex, V, BlockPtr, L, C>::read(&b, self.config().meta.meta_block_size, meta_block_loader, node_cache);
+        let mut bmap = BMap::<BlockIndex, V, BlockPtr, L, C>::read(&b, self.config().meta.meta_block_size, meta_block_loader, node_cache)?;
 
         let _permit = self.lock().await;
 
