@@ -16,6 +16,16 @@ pub trait StagingIntercept<Staging>: Send + Sync {
     }
     fn after_flush_inode(&self, staging: &Staging, payload: &[u8], flag: FlushInodeFlag) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + '_ + Send>>;
     fn after_remove_inode(&self, staging: &Staging) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + '_ + Send>>;
+
+    /// Called before `SegmentReadWrite::done` uploads the segment bytes.
+    ///
+    /// Returning `Err(_)` causes `done` to fail with that error, which is
+    /// useful for simulating segment-write failures in tests. Default is
+    /// no-op.
+    fn before_segment_done(&self, staging: &Staging, segid: crate::SegmentId, buf: &[u8], len: usize) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + '_ + Send>> {
+        let _ = (staging, segid, buf, len);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub trait Staging<L> {

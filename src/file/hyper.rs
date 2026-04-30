@@ -84,4 +84,34 @@ impl<'a: 'static> Hyper<'a> {
     pub fn with_staging_interceptor(&mut self, i: impl StagingIntercept<S3Staging> + 'static) {
         self.inner.staging_interceptor(i)
     }
+
+    /// Test-only: number of dirty data blocks currently in cache.
+    #[doc(hidden)]
+    pub fn dirty_block_count(&self) -> usize {
+        self.inner.dirty_block_count()
+    }
+
+    /// Test-only: whether inode has unflushed attr changes.
+    #[doc(hidden)]
+    pub fn is_attr_dirty(&self) -> bool {
+        self.inner.is_attr_dirty()
+    }
+
+    /// Test-only: whether bmap has dirty meta nodes.
+    #[doc(hidden)]
+    pub fn is_bmap_dirty(&self) -> bool {
+        self.inner.is_bmap_dirty()
+    }
+
+    /// Test-only: in-memory view of the last cno written to a segment.
+    #[doc(hidden)]
+    pub fn in_memory_last_cno(&self) -> u64 {
+        self.inner.in_memory_last_cno()
+    }
+
+    /// Test-only: in-memory view of the last cno persisted in the inode.
+    #[doc(hidden)]
+    pub fn in_memory_last_ondisk_cno(&self) -> u64 {
+        self.inner.in_memory_last_ondisk_cno()
+    }
 }

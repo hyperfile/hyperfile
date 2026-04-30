@@ -957,6 +957,36 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub fn staging_interceptor(&mut self, i: impl StagingIntercept<T> + 'static) {
         self.staging.interceptor(i);
     }
+
+    /// Test-only: number of dirty data blocks in the cache.
+    #[doc(hidden)]
+    pub fn dirty_block_count(&self) -> usize {
+        self.cache.dirty_count()
+    }
+
+    /// Test-only: whether the inode has pending attr-only changes.
+    #[doc(hidden)]
+    pub fn is_attr_dirty(&self) -> bool {
+        self.inode.is_attr_dirty()
+    }
+
+    /// Test-only: whether the bmap tree has dirty meta nodes.
+    #[doc(hidden)]
+    pub fn is_bmap_dirty(&self) -> bool {
+        self.bmap.dirty()
+    }
+
+    /// Test-only: last committed checkpoint number (in-memory value).
+    #[doc(hidden)]
+    pub fn in_memory_last_cno(&self) -> u64 {
+        self.inode.get_last_cno()
+    }
+
+    /// Test-only: last on-disk checkpoint number (in-memory tracking).
+    #[doc(hidden)]
+    pub fn in_memory_last_ondisk_cno(&self) -> u64 {
+        self.inode.get_last_ondisk_cno()
+    }
 }
 
 impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static, C: NodeCache<BlockPtr> + Clone> HyperFile<'a, T, L, C> {

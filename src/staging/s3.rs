@@ -284,6 +284,9 @@ impl segment::SegmentReadWrite for S3Staging {
     }
 
     async fn done(&self, segid: SegmentId, buf: &[u8], len: usize) -> Result<()> {
+        if let Some(i) = &self.interceptor {
+            let _ = i.before_segment_done(&self, segid, buf, len).await?;
+        }
         let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
         debug!("bufwr done s3://{}/{} {}", &self.bucket, &key, len);
         let (data, _) = buf.split_at(len);
