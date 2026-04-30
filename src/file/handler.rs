@@ -876,3 +876,446 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::ManuallyDrop;
+    use tokio::task::LocalSet;
+
+    // Minimal Task impl to obtain a real TaskHandler
+    struct DummyTask;
+    impl Task<FileContext<'static>> for DummyTask {
+        async fn handler(&mut self, _ctx: FileContext<'static>) {}
+    }
+
+    async fn make_handler() -> TaskHandler<FileContext<'static>> {
+        DummyTask.start()
+    }
+
+    // ==================== oneshot patterns ====================
+
+    #[test]
+    fn getattr_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let (ctx, rx) = FileContext::new_getattr();
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::GetAttr));
+            let _body = ManuallyDrop::into_inner(unsafe { req.body.getattr });
+            let stat: libc::stat = unsafe { std::mem::zeroed() };
+            resp.to_getattr().send(Ok(stat)).unwrap();
+            assert!(rx.await.unwrap().is_ok());
+        });
+    }
+
+    #[test]
+    fn setattr_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let stat_in: libc::stat = unsafe { std::mem::zeroed() };
+            let (ctx, rx) = FileContext::new_setattr(stat_in);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::SetAttr));
+            let body = ManuallyDrop::into_inner(unsafe { req.body.setattr });
+            assert_eq!(body.stat.st_size, 0);
+            let stat_out: libc::stat = unsafe { std::mem::zeroed() };
+            resp.to_setattr().send(Ok(stat_out)).unwrap();
+            assert!(rx.await.unwrap().is_ok());
+        });
+    }
+
+    #[test]
+    fn trunc_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let (ctx, rx) = FileContext::new_trunc(4096);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::Trunc));
+            let body = ManuallyDrop::into_inner(unsafe { req.body.trunc });
+            assert_eq!(body.offset, 4096);
+            resp.to_trunc().send(Ok(())).unwrap();
+            assert!(rx.await.unwrap().is_ok());
+        });
+    }
+
+    #[test]
+    fn last_cno_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let (ctx, rx) = FileContext::new_last_cno();
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::LastCno));
+            let _body = ManuallyDrop::into_inner(unsafe { req.body.last_cno });
+            resp.to_last_cno().send(42).unwrap();
+            assert_eq!(rx.await.unwrap(), 42);
+        });
+    }
+
+    // ==================== mpsc patterns ====================
+
+    #[test]
+    fn read_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let mut buf = vec![0u8; 100];
+            let buf_ref = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
+            let (ctx, _tx, mut rx) = FileContext::new_read(buf_ref, 0, fh);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::Read));
+            let body = ManuallyDrop::into_inner(unsafe { req.body.read });
+            assert_eq!(body.buf.len(), 100);
+            assert_eq!(body.offset, 0);
+            resp.to_read().send(Ok(100)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 100);
+        });
+    }
+
+    #[test]
+    fn write_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let data = [0xABu8; 200];
+            let data_ref = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+            let (ctx, _tx, mut rx) = FileContext::new_write(data_ref, 512, fh);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::Write));
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write });
+            assert_eq!(body.buf.len(), 200);
+            assert_eq!(body.buf[0], 0xAB);
+            assert_eq!(body.offset, 512);
+            resp.to_write().send(Ok(200)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 200);
+        });
+    }
+
+    #[test]
+    fn write_zero_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, _tx, mut rx) = FileContext::new_write_zero(1024, 4096, fh);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::WriteZero));
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write_zero });
+            assert_eq!(body.offset, 1024);
+            assert_eq!(body.len, 4096);
+            resp.to_write_zero().send(Ok(4096)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 4096);
+        });
+    }
+
+    // ==================== flush / release (oneshot + TaskHandler) ====================
+
+    #[test]
+    fn flush_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, rx) = FileContext::new_flush(fh);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::Flush));
+            let _body = ManuallyDrop::into_inner(unsafe { req.body.flush });
+            resp.to_flush().send(Ok(7)).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), 7);
+        });
+    }
+
+    #[test]
+    fn release_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, rx) = FileContext::new_release(fh);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::Release));
+            let _body = ManuallyDrop::into_inner(unsafe { req.body.release });
+            resp.to_release().send(Ok(99)).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), 99);
+        });
+    }
+
+    // ==================== batch patterns ====================
+
+    #[test]
+    fn write_aligned_batch_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let blocks = vec![
+                AlignedDataBlockWrapper::new(0, 4096, false),
+                AlignedDataBlockWrapper::new(1, 4096, true),
+            ];
+            let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::WriteAlignedBatch));
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write_aligned_batch });
+            assert_eq!(body.data_blocks.len(), 2);
+            assert!(!body.data_blocks[0].is_zero());
+            assert!(body.data_blocks[1].is_zero());
+            resp.to_write().send(Ok(8192)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 8192);
+        });
+    }
+
+    #[test]
+    fn write_batch_construct_take_respond() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let blocks = vec![BatchDataBlockWrapper::new(0, 4096, false)];
+            let (ctx, mut rx) = FileContext::new_write_batch(blocks);
+            let (req, resp) = ctx.take();
+            assert!(matches!(req.op, FileReqOp::WriteBatch));
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write_batch });
+            assert_eq!(body.data_blocks.len(), 1);
+            resp.to_write().send(Ok(4096)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 4096);
+        });
+    }
+
+    // ==================== clone_write_resp / clone_write_zero_resp ====================
+
+    #[test]
+    fn clone_write_resp_sends_on_cloned_channel() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            static BUF: [u8; 10] = [0u8; 10];
+            let (ctx, _tx, mut rx) = FileContext::new_write(&BUF, 0, fh);
+            let (_req, resp) = ctx.take();
+            let cloned = resp.clone_write_resp();
+            cloned.send(Ok(10)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 10);
+        });
+    }
+
+    #[test]
+    fn clone_write_zero_resp_sends_on_cloned_channel() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, _tx, mut rx) = FileContext::new_write_zero(0, 100, fh);
+            let (_req, resp) = ctx.take();
+            let cloned = resp.clone_write_zero_resp();
+            cloned.send(Ok(100)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 100);
+        });
+    }
+
+    // ==================== reform_* constructors ====================
+
+    #[test]
+    fn reform_read_preserves_data() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let mut buf = vec![0u8; 50];
+            let buf_ref = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
+            let (ctx, _tx, mut rx) = FileContext::new_read(buf_ref, 10, fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.read });
+            let ctx2 = FileContext::reform_read(body, resp);
+            let (req2, resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::Read));
+            let body2 = ManuallyDrop::into_inner(unsafe { req2.body.read });
+            assert_eq!(body2.offset, 10);
+            assert_eq!(body2.buf.len(), 50);
+            resp2.to_read().send(Ok(50)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 50);
+        });
+    }
+
+    #[test]
+    fn reform_write_preserves_data() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let data = [1u8; 30];
+            let data_ref = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+            let (ctx, _tx, mut rx) = FileContext::new_write(data_ref, 20, fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write });
+            let ctx2 = FileContext::reform_write(body, resp);
+            let (req2, resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::Write));
+            let body2 = ManuallyDrop::into_inner(unsafe { req2.body.write });
+            assert_eq!(body2.offset, 20);
+            assert_eq!(body2.buf[0], 1);
+            resp2.to_write().send(Ok(30)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 30);
+        });
+    }
+
+    #[test]
+    fn reform_write_zero_preserves_data() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, _tx, mut rx) = FileContext::new_write_zero(100, 200, fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write_zero });
+            let ctx2 = FileContext::reform_write_zero(body, resp);
+            let (req2, resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::WriteZero));
+            let body2 = ManuallyDrop::into_inner(unsafe { req2.body.write_zero });
+            assert_eq!(body2.offset, 100);
+            assert_eq!(body2.len, 200);
+            resp2.to_write_zero().send(Ok(200)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 200);
+        });
+    }
+
+    #[test]
+    fn reform_flush_preserves_channel() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, rx) = FileContext::new_flush(fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.flush });
+            let ctx2 = FileContext::reform_flush(body, resp);
+            let (req2, resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::Flush));
+            let _body2 = ManuallyDrop::into_inner(unsafe { req2.body.flush });
+            resp2.to_flush().send(Ok(5)).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), 5);
+        });
+    }
+
+    #[test]
+    fn reform_release_preserves_channel() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, rx) = FileContext::new_release(fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.release });
+            let ctx2 = FileContext::reform_release(body, resp);
+            let (req2, resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::Release));
+            let _body2 = ManuallyDrop::into_inner(unsafe { req2.body.release });
+            resp2.to_release().send(Ok(11)).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), 11);
+        });
+    }
+
+    // ==================== absorb_* constructors ====================
+
+    #[test]
+    fn write_absorb_sets_correct_op() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            static BUF: [u8; 10] = [0u8; 10];
+            let (ctx, _tx, mut rx) = FileContext::new_write(&BUF, 0, fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write });
+            let ctx2 = FileContext::write_absorb(body, resp);
+            let (req2, resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::WriteAbsorb));
+            let _body2 = ManuallyDrop::into_inner(unsafe { req2.body.write });
+            resp2.to_write().send(Ok(10)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 10);
+        });
+    }
+
+    #[test]
+    fn write_absorb_bh_sets_correct_op() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            static BUF: [u8; 10] = [0u8; 10];
+            let (ctx, _tx, _rx) = FileContext::new_write(&BUF, 0, fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write });
+            let ctx2 = FileContext::write_absorb_bh(body, resp);
+            let (req2, _resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::WriteAbsorbBh));
+        });
+    }
+
+    #[test]
+    fn write_zero_absorb_sets_correct_op() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, _tx, mut rx) = FileContext::new_write_zero(0, 100, fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write_zero });
+            let ctx2 = FileContext::write_zero_absorb(body, resp);
+            let (req2, resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::WriteZeroAbsorb));
+            let _body2 = ManuallyDrop::into_inner(unsafe { req2.body.write_zero });
+            resp2.to_write_zero().send(Ok(100)).await.unwrap();
+            assert_eq!(rx.recv().await.unwrap().unwrap(), 100);
+        });
+    }
+
+    #[test]
+    fn write_zero_absorb_bh_sets_correct_op() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            let (ctx, _tx, _rx) = FileContext::new_write_zero(0, 100, fh);
+            let (req, resp) = ctx.take();
+            let body = ManuallyDrop::into_inner(unsafe { req.body.write_zero });
+            let ctx2 = FileContext::write_zero_absorb_bh(body, resp);
+            let (req2, _resp2) = ctx2.take();
+            assert!(matches!(req2.op, FileReqOp::WriteZeroAbsorbBh));
+        });
+    }
+
+    // ==================== error path ====================
+
+    #[test]
+    fn getattr_error_response() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let (ctx, rx) = FileContext::new_getattr();
+            let (_req, resp) = ctx.take();
+            resp.to_getattr().send(Err(std::io::Error::new(ErrorKind::NotFound, "not found"))).unwrap();
+            let result = rx.await.unwrap();
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::NotFound);
+        });
+    }
+
+    #[test]
+    fn write_error_response() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let fh = make_handler().await;
+            static BUF: [u8; 1] = [0u8; 1];
+            let (ctx, _tx, mut rx) = FileContext::new_write(&BUF, 0, fh);
+            let (_req, resp) = ctx.take();
+            resp.to_write().send(Err(std::io::Error::new(ErrorKind::Other, "fail"))).await.unwrap();
+            let result = rx.recv().await.unwrap();
+            assert!(result.is_err());
+        });
+    }
+}
