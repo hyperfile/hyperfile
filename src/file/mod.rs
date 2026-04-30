@@ -312,29 +312,25 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         {
 
         const TARGET_CHUNKS: usize = 50;
-        let mut joins = Vec::new();
         let data_blocks = dirty_data_blocks.data()
                         .into_iter()
                         .map(|(_, block)| block)
                         .collect::<Vec<&DataBlock>>();
-        // calc per chunk count based on target chunks
-        let chunk_count = data_blocks.len() / (TARGET_CHUNKS - 1);
-        let mut chunks = Vec::new();
-        let mut remains = data_blocks;
-        // turn flat data_blocks vec into vec of Vec<DataBlock>
-        while remains.len() > 0 {
-            let split_off = if remains.len() >= chunk_count {
-                remains.split_off(chunk_count)
-            } else {
-                remains.split_off(remains.len())
-            };
-            chunks.push(remains);
-            remains = split_off;
-        }
-        // spawn chunks
-        for chunk in chunks {
-            let j = segwr.spawn_append(chunk);
-            joins.push(j);
+        // Split `data_blocks` into up to TARGET_CHUNKS chunks.
+        //
+        // Using ceil-div here is deliberate: floor-div of
+        // `len / (TARGET_CHUNKS - 1)` yields 0 whenever
+        // `len < TARGET_CHUNKS - 1`, and a `split_off(0)` loop
+        // with chunk_size=0 never terminates. Ceil-div also
+        // guarantees chunk_size >= 1 for any non-empty input,
+        // so the number of chunks is at most TARGET_CHUNKS.
+        let mut joins = Vec::new();
+        if !data_blocks.is_empty() {
+            let chunk_size = data_blocks.len().div_ceil(TARGET_CHUNKS);
+            for chunk in data_blocks.chunks(chunk_size) {
+                let j = segwr.spawn_append(chunk.to_vec());
+                joins.push(j);
+            }
         }
 
         // wait all spawn append completed
