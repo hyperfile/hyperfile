@@ -218,3 +218,239 @@ impl Cache for MemCache {
     fn shutdown(&self) {
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_cache() -> MemCache {
+        MemCache::new(4, 4096) // 4 cache slots, 4KiB blocks
+    }
+
+    // --- insert / get ---
+
+    #[test]
+    fn insert_and_get() {
+        let mut cache = new_cache();
+        let mut blk = DataBlock::new(0, 4096);
+        blk.copy(0, &[0xAA]);
+        cache.insert(0, blk);
+        let got = cache.get(&0).unwrap();
+        assert_eq!(got.as_slice()[0], 0xAA);
+    }
+
+    #[test]
+    fn get_missing_returns_none() {
+        let mut cache = new_cache();
+        assert!(cache.get(&99).is_none());
+    }
+
+    // --- dirty tracking ---
+
+    #[test]
+    fn insert_goes_to_dirty() {
+        let mut cache = new_cache();
+        cache.insert(0, DataBlock::new(0, 4096));
+        assert_eq!(cache.dirty_count(), 1);
+    }
+
+    #[test]
+    fn dirty_count_and_get_dirty() {
+        let mut cache = new_cache();
+        cache.insert(0, DataBlock::new(0, 4096));
+        cache.insert(5, DataBlock::new(5, 4096));
+        assert_eq!(cache.dirty_count(), 2);
+        let dirty = cache.get_dirty();
+        assert_eq!(dirty.len(), 2);
+    }
+
+    #[test]
+    fn clear_dirty_moves_should_cache_to_lru() {
+        let mut cache = new_cache();
+        let mut blk = DataBlock::new(0, 4096);
+        blk.set_should_cache();
+        cache.insert(0, blk);
+        assert_eq!(cache.dirty_count(), 1);
+
+        cache.clear_dirty();
+        assert_eq!(cache.dirty_count(), 0);
+        // block should now be in LRU cache, accessible via get
+        assert!(cache.get(&0).is_some());
+    }
+
+    #[test]
+    fn clear_dirty_discards_non_cacheable() {
+        let mut cache = new_cache();
+        cache.insert(0, DataBlock::new(0, 4096)); // no set_should_cache
+        cache.clear_dirty();
+        assert_eq!(cache.dirty_count(), 0);
+        assert!(cache.get(&0).is_none());
+    }
+
+    // --- write_prepare ---
+
+    #[test]
+    fn write_prepare_full_block_no_retrieve() {
+        let mut cache = new_cache();
+        // writing a full block at offset 0 should not need retrieval
+        let need = cache.write_prepare(0, 4096);
+        assert!(need.is_empty());
+    }
+
+    #[test]
+    fn write_prepare_partial_block_needs_retrieve() {
+        let mut cache = new_cache();
+        // writing 100 bytes at offset 10 — partial block 0
+        let need = cache.write_prepare(10, 100);
+        assert_eq!(need, vec![0]);
+    }
+
+    #[test]
+    fn write_prepare_partial_block_in_dirty_no_retrieve() {
+        let mut cache = new_cache();
+        cache.insert(0, DataBlock::new(0, 4096));
+        // block 0 already dirty, partial write should not need retrieve
+        let need = cache.write_prepare(10, 100);
+        assert!(need.is_empty());
+    }
+
+    #[test]
+    fn write_prepare_cross_block() {
+        let mut cache = new_cache();
+        // write 100 bytes crossing block 0→1 boundary at offset 4090
+        let need = cache.write_prepare(4090, 100);
+        // both block 0 and block 1 are partial and not cached
+        assert_eq!(need, vec![0, 1]);
+    }
+
+    // --- update_cache ---
+
+    #[test]
+    fn update_cache_creates_block_if_missing() {
+        let mut cache = new_cache();
+        cache.update_cache(&0, 0, &[1, 2, 3]);
+        assert_eq!(cache.dirty_count(), 1);
+        let blk = cache.get(&0).unwrap();
+        assert_eq!(&blk.as_slice()[0..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn update_cache_updates_existing_dirty() {
+        let mut cache = new_cache();
+        cache.insert(0, DataBlock::new(0, 4096));
+        cache.update_cache(&0, 10, &[0xFF; 4]);
+        let blk = cache.get(&0).unwrap();
+        assert_eq!(&blk.as_slice()[10..14], &[0xFF; 4]);
+    }
+
+    // --- truncate ---
+
+    #[test]
+    fn truncate_dirty_block() {
+        let mut cache = new_cache();
+        let mut blk = DataBlock::new(0, 4096);
+        blk.copy(0, &[0xFF; 4096]);
+        cache.insert(0, blk);
+
+        let found = cache.truncate_data_block(&0, 100);
+        assert!(found);
+        let blk = cache.get(&0).unwrap();
+        // first 100 bytes preserved
+        assert_eq!(blk.as_slice()[99], 0xFF);
+        // rest zeroed
+        assert!(blk.as_slice()[100..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn truncate_missing_block() {
+        let mut cache = new_cache();
+        assert!(!cache.truncate_data_block(&99, 0));
+    }
+
+    // --- contains / get_mut ---
+
+    #[test]
+    fn contains_promotes_from_cache_to_dirty() {
+        let mut cache = new_cache();
+        // put block in LRU cache via clear_dirty path
+        let mut blk = DataBlock::new(0, 4096);
+        blk.set_should_cache();
+        cache.insert(0, blk);
+        cache.clear_dirty();
+        assert_eq!(cache.dirty_count(), 0);
+
+        // contains should promote it back to dirty
+        assert!(cache.contains(&0));
+        assert_eq!(cache.dirty_count(), 1);
+    }
+
+    #[test]
+    fn get_mut_promotes_from_cache_to_dirty() {
+        let mut cache = new_cache();
+        let mut blk = DataBlock::new(0, 4096);
+        blk.set_should_cache();
+        cache.insert(0, blk);
+        cache.clear_dirty();
+
+        let blk = cache.get_mut(&0).unwrap();
+        blk.copy(0, &[0xBB]);
+        assert_eq!(cache.dirty_count(), 1);
+    }
+
+    // --- remove ---
+
+    #[test]
+    fn remove_from_dirty() {
+        let mut cache = new_cache();
+        cache.insert(0, DataBlock::new(0, 4096));
+        let removed = cache.remove(&0);
+        assert!(removed.is_some());
+        assert_eq!(cache.dirty_count(), 0);
+    }
+
+    // --- eviction ---
+
+    #[test]
+    fn lru_eviction() {
+        let mut cache = MemCache::new(2, 4096); // only 2 LRU slots
+        // fill LRU via clear_dirty
+        for i in 0..3 {
+            let mut blk = DataBlock::new(i, 4096);
+            blk.set_should_cache();
+            cache.insert(i, blk);
+        }
+        cache.clear_dirty();
+        // LRU has capacity 2, so block 0 should have been evicted
+        assert!(cache.get(&0).is_none());
+        assert!(cache.get(&2).is_some());
+    }
+
+    // --- new_block ---
+
+    #[test]
+    fn new_block_correct_size() {
+        let cache = new_cache();
+        let blk = cache.new_block(7);
+        assert_eq!(blk.index(), 7);
+        assert_eq!(blk.size(), 4096);
+    }
+
+    // --- set_unlimited / restore_limit ---
+
+    #[test]
+    fn set_unlimited_and_restore() {
+        let mut cache = MemCache::new(2, 4096);
+        cache.set_unlimited();
+        // should be able to insert many without eviction
+        for i in 0..100 {
+            let mut blk = DataBlock::new(i, 4096);
+            blk.set_should_cache();
+            cache.insert(i, blk);
+        }
+        cache.clear_dirty();
+        assert!(cache.get(&0).is_some());
+
+        cache.restore_limit();
+        // after restore, capacity is back to 2 — next operations may evict
+    }
+}

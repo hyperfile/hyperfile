@@ -565,3 +565,194 @@ impl BatchDataBlockWrapper {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- AllocDataBlock ---
+
+    #[test]
+    fn alloc_data_block_zeroed() {
+        let blk = AllocDataBlock::new(4096);
+        assert!(blk.as_slice().iter().all(|&b| b == 0));
+        assert_eq!(blk.as_slice().len(), 4096);
+    }
+
+    #[test]
+    fn alloc_data_block_write_read() {
+        let blk = AllocDataBlock::new(4096);
+        blk.as_mut_slice()[0] = 0xAB;
+        blk.as_mut_slice()[4095] = 0xCD;
+        assert_eq!(blk.as_slice()[0], 0xAB);
+        assert_eq!(blk.as_slice()[4095], 0xCD);
+    }
+
+    // --- DataBlock ---
+
+    #[test]
+    fn data_block_new_and_size() {
+        let blk = DataBlock::new(5, 8192);
+        assert_eq!(blk.index(), 5);
+        assert_eq!(blk.size(), 8192);
+        assert!(!blk.is_dirty());
+    }
+
+    #[test]
+    fn data_block_copy_and_copy_out() {
+        let mut blk = DataBlock::new(0, 4096);
+        let data = [1u8, 2, 3, 4];
+        blk.copy(100, &data);
+        let mut out = [0u8; 4];
+        blk.copy_out(100, &mut out);
+        assert_eq!(out, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn data_block_dirty_flag() {
+        let blk = DataBlock::new(0, 4096);
+        assert!(!blk.is_dirty());
+        blk.set_dirty();
+        assert!(blk.is_dirty());
+        blk.clear_dirty();
+        assert!(!blk.is_dirty());
+    }
+
+    #[test]
+    fn data_block_should_cache_flag() {
+        let mut blk = DataBlock::new(0, 4096);
+        assert!(!blk.is_should_cache());
+        blk.set_should_cache();
+        assert!(blk.is_should_cache());
+    }
+
+    #[test]
+    fn data_block_dup() {
+        let mut blk = DataBlock::new(3, 4096);
+        blk.copy(0, &[0xAA; 4096]);
+        let dup = blk.dup();
+        assert_eq!(dup.index(), 3);
+        assert_eq!(dup.size(), 4096);
+        assert_eq!(dup.as_slice()[0], 0xAA);
+        assert_eq!(dup.as_slice()[4095], 0xAA);
+        // dup should be independent
+        assert_ne!(blk.uid(), dup.uid());
+    }
+
+    #[test]
+    fn data_block_as_slice() {
+        let blk = DataBlock::new(0, 4096);
+        assert_eq!(blk.as_slice().len(), 4096);
+        assert_eq!(blk.as_mut_slice().len(), 4096);
+    }
+
+    // --- ZeroDataBlock ---
+
+    #[test]
+    fn zero_data_block_properties() {
+        let zb = ZeroDataBlock::new(10, 4096);
+        assert_eq!(zb.index(), 10);
+        assert_eq!(zb.size(), 4096);
+    }
+
+    // --- AlignedDataBlockWrapper ---
+
+    #[test]
+    fn aligned_wrapper_data() {
+        let w = AlignedDataBlockWrapper::new(0, 4096, false);
+        assert!(!w.is_zero());
+        assert_eq!(w.size(), 4096);
+        assert_eq!(w.index(), 0);
+    }
+
+    #[test]
+    fn aligned_wrapper_zero() {
+        let w = AlignedDataBlockWrapper::new(1, 4096, true);
+        assert!(w.is_zero());
+        assert_eq!(w.index(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "no slice on zero data block")]
+    fn aligned_wrapper_zero_no_slice() {
+        let w = AlignedDataBlockWrapper::new(0, 4096, true);
+        let _ = w.as_slice();
+    }
+
+    // --- BatchDataBlockWrapper ---
+
+    #[test]
+    fn batch_wrapper_full_block() {
+        let w = BatchDataBlockWrapper::new(0, 4096, false);
+        assert!(w.is_full_block());
+        assert!(!w.is_zero());
+        assert_eq!(w.offset(), 0);
+        assert_eq!(w.len(), 4096);
+    }
+
+    #[test]
+    fn batch_wrapper_zero_block() {
+        let w = BatchDataBlockWrapper::new(0, 4096, true);
+        assert!(w.is_full_block());
+        assert!(w.is_zero());
+    }
+
+    #[test]
+    fn batch_wrapper_partial_block() {
+        let w = BatchDataBlockWrapper::new_partial_block(5, 4096, 100, 200, false);
+        assert!(!w.is_full_block());
+        assert!(!w.is_zero());
+        assert_eq!(w.index(), 5);
+        assert_eq!(w.size(), 4096);
+        assert_eq!(w.offset(), 100);
+        assert_eq!(w.len(), 200);
+        assert_eq!(w.as_slice().len(), 200);
+    }
+
+    #[test]
+    fn batch_wrapper_partial_zero() {
+        let w = BatchDataBlockWrapper::new_partial_block(0, 4096, 0, 100, true);
+        assert!(!w.is_full_block());
+        assert!(w.is_zero());
+    }
+
+    #[test]
+    fn batch_wrapper_merge_partial_into_data() {
+        let mut full = BatchDataBlockWrapper::new(0, 4096, false);
+        // write known data into full block
+        full.as_mut_slice().fill(0);
+
+        let part = BatchDataBlockWrapper::new_partial_block(0, 4096, 10, 4, false);
+        part.as_mut_slice().copy_from_slice(&[1, 2, 3, 4]);
+
+        full.merge_partial(&part);
+        assert_eq!(&full.as_slice()[10..14], &[1, 2, 3, 4]);
+        assert_eq!(full.as_slice()[0], 0); // untouched
+    }
+
+    #[test]
+    fn batch_wrapper_merge_zero_partial_into_data() {
+        let mut full = BatchDataBlockWrapper::new(0, 4096, false);
+        full.as_mut_slice().fill(0xFF);
+
+        let part = BatchDataBlockWrapper::new_partial_block(0, 4096, 0, 10, true);
+        full.merge_partial(&part);
+        // first 10 bytes should be zeroed
+        assert!(full.as_slice()[..10].iter().all(|&b| b == 0));
+        assert_eq!(full.as_slice()[10], 0xFF);
+    }
+
+    #[test]
+    fn batch_wrapper_merge_partial_into_zero() {
+        let mut full = BatchDataBlockWrapper::new(0, 4096, true);
+        let part = BatchDataBlockWrapper::new_partial_block(0, 4096, 0, 4, false);
+        part.as_mut_slice().copy_from_slice(&[0xAA; 4]);
+
+        full.merge_partial(&part);
+        // should have been promoted to Data
+        assert!(!full.is_zero());
+        assert_eq!(&full.as_slice()[0..4], &[0xAA; 4]);
+        // rest should be zero
+        assert!(full.as_slice()[4..].iter().all(|&b| b == 0));
+    }
+}

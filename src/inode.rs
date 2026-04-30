@@ -383,3 +383,322 @@ pub enum FlushInodeFlag {
     Delete = 3,
     Unkown = 255,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- from_raw / to_raw round-trip ---
+
+    #[test]
+    fn from_raw_to_raw_round_trip() {
+        let mut raw = InodeRaw::default();
+        raw.i_ino = 42;
+        raw.i_size = 65536;
+        raw.i_blocks = 128;
+        raw.i_uid = 1000;
+        raw.i_gid = 1000;
+        raw.i_mode = libc::S_IFREG | 0o644;
+        raw.i_nlink = 2;
+        raw.i_last_seq = 10;
+        raw.i_last_cno = 10;
+        raw.i_atime = 1000;
+        raw.i_atime_nsec = 500;
+        raw.i_mtime = 2000;
+        raw.i_mtime_nsec = 600;
+        raw.i_ctime = 3000;
+        raw.i_ctime_nsec = 700;
+        raw.i_meta_config = HyperFileMetaConfig::default().as_u32();
+        raw.i_bmap[0] = 0xAB;
+
+        let inode = Inode::from_raw(&raw, None);
+        let bmap: BMapRawType = [0xAB; 56]; // different bmap to verify it's passed through
+        let raw2 = inode.to_raw(bmap);
+
+        assert_eq!(raw2.i_ino, 42);
+        assert_eq!(raw2.i_size, 65536);
+        assert_eq!(raw2.i_blocks, 128);
+        assert_eq!(raw2.i_uid, 1000);
+        assert_eq!(raw2.i_gid, 1000);
+        assert_eq!(raw2.i_mode, libc::S_IFREG | 0o644);
+        assert_eq!(raw2.i_nlink, 2);
+        assert_eq!(raw2.i_last_seq, 10);
+        assert_eq!(raw2.i_last_cno, 10);
+        assert_eq!(raw2.i_atime, 1000);
+        assert_eq!(raw2.i_atime_nsec, 500);
+        assert_eq!(raw2.i_bmap[0], 0xAB); // from the bmap arg, not original
+    }
+
+    #[test]
+    fn from_raw_sets_ondisk_cno() {
+        let mut raw = InodeRaw::default();
+        raw.i_last_cno = 77;
+        let inode = Inode::from_raw(&raw, None);
+        assert_eq!(inode.get_last_ondisk_cno(), 77);
+        assert!(!inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn from_raw_with_ondisk_state() {
+        let od = OnDiskState { checksum: "abc".into(), timestamp: 123 };
+        let raw = InodeRaw::default();
+        let inode = Inode::from_raw(&raw, Some(od));
+        let state = inode.get_ondisk_state().as_ref().unwrap();
+        assert_eq!(state.checksum, "abc");
+        assert_eq!(state.timestamp, 123);
+    }
+
+    // --- default_file / default_dir ---
+
+    #[test]
+    fn default_file_properties() {
+        let inode = Inode::default_file();
+        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(inode.i_uid, 1000);
+        assert_eq!(inode.i_gid, 1000);
+        assert_eq!(inode.i_nlink, 1);
+        assert!(inode.is_attr_dirty()); // ctime was set
+        assert!(inode.i_ctime > 0);
+    }
+
+    #[test]
+    fn default_dir_properties() {
+        let inode = Inode::default_dir();
+        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(inode.i_uid, 1000);
+        assert_eq!(inode.i_nlink, 1);
+    }
+
+    // --- set_size ---
+
+    #[test]
+    fn set_size_basic() {
+        let mut inode = Inode::default_file();
+        inode.i_attr_dirty = false;
+        inode.set_size(4096);
+        assert_eq!(inode.size(), 4096);
+        assert_eq!(inode.i_blocks, 8); // 4096 / 512
+        assert!(inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn set_size_zero() {
+        let mut inode = Inode::default_file();
+        inode.set_size(0);
+        assert_eq!(inode.size(), 0);
+        assert_eq!(inode.i_blocks, 0);
+    }
+
+    #[test]
+    fn set_size_not_512_aligned() {
+        let mut inode = Inode::default_file();
+        inode.set_size(1); // 1 byte → ceil(1/512) = 1 block
+        assert_eq!(inode.i_blocks, 1);
+        inode.set_size(512); // exactly 512 → 1 block
+        assert_eq!(inode.i_blocks, 1);
+        inode.set_size(513); // 513 → 2 blocks
+        assert_eq!(inode.i_blocks, 2);
+    }
+
+    // --- extend_size (sparse) ---
+
+    #[test]
+    fn extend_size_does_not_change_blocks() {
+        let mut inode = Inode::default_file();
+        inode.i_blocks = 8;
+        inode.i_attr_dirty = false;
+        inode.extend_size(1048576);
+        assert_eq!(inode.size(), 1048576);
+        assert_eq!(inode.i_blocks, 8); // unchanged
+        assert!(inode.is_attr_dirty());
+    }
+
+    // --- update_blocks (sparse) ---
+
+    #[test]
+    fn update_blocks_positive() {
+        let mut inode = Inode::default_file();
+        inode.i_blocks = 0;
+        inode.i_attr_dirty = false;
+        inode.update_blocks(4096); // +4096 bytes → +8 blocks
+        assert_eq!(inode.i_blocks, 8);
+        assert!(inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn update_blocks_negative() {
+        let mut inode = Inode::default_file();
+        inode.i_blocks = 16;
+        inode.i_attr_dirty = false;
+        inode.update_blocks(-4096); // -4096 bytes → -8 blocks
+        assert_eq!(inode.i_blocks, 8);
+        assert!(inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn update_blocks_zero_no_change() {
+        let mut inode = Inode::default_file();
+        inode.i_blocks = 10;
+        inode.i_attr_dirty = false;
+        inode.update_blocks(0);
+        assert_eq!(inode.i_blocks, 10);
+        assert!(!inode.is_attr_dirty());
+    }
+
+    // --- to_stat ---
+
+    #[test]
+    fn to_stat_fields() {
+        let mut inode = Inode::default_file();
+        inode.i_ino = 99;
+        inode.i_size = 8192;
+        inode.i_blocks = 16;
+        inode.i_uid = 500;
+        inode.i_gid = 600;
+        inode.i_atime = 1000;
+        inode.i_atime_nsec = 111;
+        inode.i_mtime = 2000;
+        inode.i_mtime_nsec = 222;
+        inode.i_ctime = 3000;
+        inode.i_ctime_nsec = 333;
+
+        let stat = inode.to_stat(1, 2);
+        assert_eq!(stat.st_dev, 1);
+        assert_eq!(stat.st_rdev, 2);
+        assert_eq!(stat.st_ino, 99);
+        assert_eq!(stat.st_size, 8192);
+        assert_eq!(stat.st_blocks, 16);
+        assert_eq!(stat.st_uid, 500);
+        assert_eq!(stat.st_gid, 600);
+        assert_eq!(stat.st_mode, inode.i_mode);
+        assert_eq!(stat.st_atime, 1000);
+        assert_eq!(stat.st_atime_nsec, 111);
+        assert_eq!(stat.st_mtime, 2000);
+        assert_eq!(stat.st_mtime_nsec, 222);
+        assert_eq!(stat.st_ctime, 3000);
+        assert_eq!(stat.st_ctime_nsec, 333);
+        // blksize should be data_block_size from default meta config
+        assert_eq!(stat.st_blksize as usize, HyperFileMetaConfig::default().data_block_size);
+    }
+
+    // --- update_stat ---
+
+    #[test]
+    fn update_stat_round_trip() {
+        let mut inode = Inode::default_file();
+        inode.i_attr_dirty = false;
+        let mut stat = inode.to_stat(0, 0);
+        stat.st_uid = 999;
+        stat.st_gid = 888;
+        stat.st_size = 12345;
+        inode.update_stat(&stat);
+        assert_eq!(inode.i_uid, 999);
+        assert_eq!(inode.i_gid, 888);
+        assert_eq!(inode.size(), 12345);
+        assert!(inode.is_attr_dirty());
+    }
+
+    // --- time updates ---
+
+    #[test]
+    fn update_atime_sets_timestamp() {
+        let mut inode = Inode::default_file();
+        inode.i_atime = 0;
+        inode.i_attr_dirty = false;
+        inode.update_atime();
+        assert!(inode.i_atime > 0);
+        assert!(inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn update_mtime_sets_timestamp() {
+        let mut inode = Inode::default_file();
+        inode.i_mtime = 0;
+        inode.i_attr_dirty = false;
+        inode.update_mtime();
+        assert!(inode.i_mtime > 0);
+        assert!(inode.is_attr_dirty());
+    }
+
+    // --- seq / cno ---
+
+    #[test]
+    fn get_next_seq_increments() {
+        let mut inode = Inode::default_file();
+        assert_eq!(inode.get_last_seq(), 0);
+        assert_eq!(inode.get_next_seq(), 1);
+        assert_eq!(inode.get_next_seq(), 2);
+        assert_eq!(inode.get_last_seq(), 2);
+    }
+
+    #[test]
+    fn is_flushing_logic() {
+        let mut inode = Inode::default_file();
+        inode.i_last_cno = 5;
+        inode.i_last_ondisk_cno = 5;
+        assert!(!inode.is_flushing());
+        inode.i_last_cno = 6;
+        assert!(inode.is_flushing());
+    }
+
+    // --- with_mode ---
+
+    #[test]
+    fn with_mode_preserves_file_type_when_mode_has_none() {
+        let inode = Inode::default_file()
+            .with_mode(&HyperFileMode::from_mode(FileMode::from(0o755)));
+        // file type should remain S_IFREG since mode had no file type bits
+        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(inode.i_mode & !libc::S_IFMT, 0o755);
+    }
+
+    #[test]
+    fn with_mode_overrides_file_type_when_set() {
+        let inode = Inode::default_file()
+            .with_mode(&HyperFileMode::from_mode(FileMode::from(libc::S_IFDIR | 0o755)));
+        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFDIR);
+    }
+
+    // --- meta_config round-trip ---
+
+    #[test]
+    fn meta_config_round_trip() {
+        let cfg = HyperFileMetaConfig::new(56, 8192, 65536, crate::meta_format::BlockPtrFormat::MicroGroup);
+        let inode = Inode::default_file().with_meta_config(&cfg);
+        let recovered = inode.meta_config();
+        assert_eq!(recovered, cfg);
+    }
+
+    // --- from_origin ---
+
+    #[test]
+    fn from_origin_sets_size_and_blocks() {
+        let cfg = HyperFileMetaConfig::default();
+        let inode = Inode::from_origin(10240, &cfg);
+        assert_eq!(inode.size(), 10240);
+        assert_eq!(inode.i_blocks, 10240 / 512);
+    }
+
+    // --- clear_attr_dirty ---
+
+    #[test]
+    fn clear_attr_dirty() {
+        let mut inode = Inode::default_file();
+        assert!(inode.is_attr_dirty());
+        inode.clear_attr_dirty();
+        assert!(!inode.is_attr_dirty());
+    }
+
+    // --- ondisk_state ---
+
+    #[test]
+    fn ondisk_state_set_get() {
+        let mut inode = Inode::default_file();
+        assert!(inode.get_ondisk_state().is_none());
+        let od = OnDiskState { checksum: "x".into(), timestamp: 1 };
+        inode.set_ondisk_state(Some(od));
+        assert!(inode.get_ondisk_state().is_some());
+        inode.set_ondisk_state(None);
+        assert!(inode.get_ondisk_state().is_none());
+    }
+}

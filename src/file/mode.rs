@@ -60,3 +60,53 @@ impl FileMode {
         (self.0 & libc::S_IFDIR) == libc::S_IFDIR
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_mode_default_file() {
+        let m = FileMode::default_file();
+        assert!(m.is_reg());
+        assert!(!m.is_dir());
+    }
+
+    #[test]
+    fn file_mode_default_dir() {
+        let m = FileMode::default_dir();
+        assert!(m.is_dir());
+        assert!(!m.is_reg());
+    }
+
+    #[test]
+    fn file_mode_from_raw() {
+        let m = FileMode::from(libc::S_IFREG | 0o755);
+        assert!(m.is_reg());
+        assert!(!m.is_dir());
+    }
+
+    #[test]
+    fn hyper_file_mode_to_u32_round_trip() {
+        let fm = FileMode::from(libc::S_IFREG | 0o644);
+        let hm = HyperFileMode::from_mode(fm);
+        let val = hm.to_u32();
+        assert_eq!(val & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(val & !libc::S_IFMT, 0o644);
+    }
+
+    #[test]
+    fn hyper_file_mode_permissions_only() {
+        let fm = FileMode::from(0o755); // no file type bits
+        let hm = HyperFileMode::from_mode(fm);
+        assert_eq!(hm.to_u32() & libc::S_IFMT, 0);
+        assert_eq!(hm.to_u32() & !libc::S_IFMT, 0o755);
+    }
+
+    #[test]
+    fn file_mode_display() {
+        let m = FileMode::default_file();
+        let s = format!("{}", m);
+        assert!(s.contains("S_IFREG"));
+    }
+}

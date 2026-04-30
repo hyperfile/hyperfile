@@ -141,3 +141,69 @@ impl StagingConfig {
         Self::from_staging_root(staging_uri, origin_key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_s3_staging_basic() {
+        let cfg = StagingConfig::new_s3_staging("mybucket", "dir/file.dat", "staging", None);
+        assert_eq!(cfg.root_uri, "s3://mybucket/staging/dir/file.dat");
+        assert_eq!(cfg.inode_file_uri, "s3://mybucket/staging/dir/file.dat/inode");
+        assert_eq!(cfg.typ, StagingType::S3);
+    }
+
+    #[test]
+    fn new_s3_staging_custom_inode() {
+        let cfg = StagingConfig::new_s3_staging("b", "key", "root", Some("meta"));
+        assert_eq!(cfg.inode_file_uri, "s3://b/root/key/meta");
+    }
+
+    #[test]
+    fn new_s3_staging_leading_slash_origin() {
+        let cfg = StagingConfig::new_s3_staging("b", "/key", "root", None);
+        assert_eq!(cfg.root_uri, "s3://b/root/key");
+    }
+
+    #[test]
+    fn new_s3_staging_trailing_slash_root() {
+        let cfg = StagingConfig::new_s3_staging("b", "key", "root/", None);
+        assert_eq!(cfg.root_uri, "s3://b/root/key");
+    }
+
+    #[test]
+    fn new_s3_uri_basic() {
+        let cfg = StagingConfig::new_s3_uri("s3://bucket/path/to/file", None);
+        assert_eq!(cfg.root_uri, "s3://bucket/path/to/file");
+        assert_eq!(cfg.inode_file_uri, "s3://bucket/path/to/file/inode");
+    }
+
+    #[test]
+    fn new_s3_uri_trailing_slash() {
+        let cfg = StagingConfig::new_s3_uri("s3://bucket/path/", None);
+        assert_eq!(cfg.root_uri, "s3://bucket/path");
+    }
+
+    #[test]
+    fn from_staging_root_basic() {
+        let cfg = StagingConfig::from_staging_root("s3://bucket/staging", "myfile");
+        assert_eq!(cfg.root_uri, "s3://bucket/staging/myfile");
+        assert_eq!(cfg.inode_file_uri, "s3://bucket/staging/myfile/inode");
+    }
+
+    #[test]
+    fn from_staging_root_trailing_slash() {
+        let cfg = StagingConfig::from_staging_root("s3://bucket/staging/", "myfile");
+        assert_eq!(cfg.root_uri, "s3://bucket/staging/myfile");
+        assert_eq!(cfg.inode_file_uri, "s3://bucket/staging/myfile/inode");
+    }
+
+    #[test]
+    fn derive_replaces_key() {
+        let cfg = StagingConfig::new_s3_uri("s3://bucket/old_key", None);
+        let derived = cfg.derive("old_key", "new_key");
+        assert_eq!(derived.root_uri, "s3://bucket/new_key");
+        assert!(derived.inode_file_uri.contains("new_key"));
+    }
+}

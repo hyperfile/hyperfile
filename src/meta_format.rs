@@ -149,3 +149,132 @@ impl BlockPtrFormat {
         segid as SegmentId
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- from_u8 ---
+
+    #[test]
+    fn from_u8_known_variants() {
+        assert_eq!(BlockPtrFormat::from_u8(0), BlockPtrFormat::Nop);
+        assert_eq!(BlockPtrFormat::from_u8(1), BlockPtrFormat::Flat);
+        assert_eq!(BlockPtrFormat::from_u8(2), BlockPtrFormat::MicroGroup);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unkown block ptr format")]
+    fn from_u8_invalid() {
+        BlockPtrFormat::from_u8(3);
+    }
+
+    // --- sentinel values ---
+
+    #[test]
+    fn zero_block_sentinel() {
+        let z = BlockPtrFormat::new_zero_block();
+        assert!(BlockPtrFormat::is_zero_block(&z));
+        assert!(!BlockPtrFormat::is_zero_block(&0));
+        assert!(!BlockPtrFormat::is_dummy_value(&z));
+    }
+
+    #[test]
+    fn dummy_value_sentinel() {
+        let d = BlockPtrFormat::dummy_value();
+        assert!(BlockPtrFormat::is_dummy_value(&d));
+        assert!(!BlockPtrFormat::is_dummy_value(&0));
+        assert!(!BlockPtrFormat::is_zero_block(&d));
+    }
+
+    #[test]
+    fn invalid_value_sentinel() {
+        let iv = BlockPtrFormat::invalid_value();
+        assert!(BlockPtrFormat::is_invalid_value(&iv));
+        assert_eq!(iv, BlockPtr::MIN);
+    }
+
+    // --- Flat encode/decode round-trip ---
+
+    #[test]
+    fn flat_round_trip_basic() {
+        let segid: SegmentId = 1;
+        let offset: SegmentOffset = 4096;
+        let ptr = BlockPtrFormat::encode(segid, offset, 0, &BlockPtrFormat::Flat);
+        assert!(BlockPtrFormat::is_on_staging(&ptr));
+        let (dec_segid, dec_offset) = BlockPtrFormat::decode(&ptr, &BlockPtrFormat::Flat);
+        assert_eq!(dec_segid, segid);
+        assert_eq!(dec_offset, offset);
+    }
+
+    #[test]
+    fn flat_round_trip_large_segid() {
+        let segid: SegmentId = 0x3FFF_FFFF; // max 30-bit segid
+        let offset: SegmentOffset = 0xFFFF_FFFF; // max 32-bit offset
+        let ptr = BlockPtrFormat::encode(segid, offset, 0, &BlockPtrFormat::Flat);
+        let (dec_segid, dec_offset) = BlockPtrFormat::decode(&ptr, &BlockPtrFormat::Flat);
+        assert_eq!(dec_segid, segid);
+        assert_eq!(dec_offset, offset as usize);
+    }
+
+    #[test]
+    fn flat_round_trip_zero() {
+        let ptr = BlockPtrFormat::encode(0, 0, 0, &BlockPtrFormat::Flat);
+        assert!(BlockPtrFormat::is_on_staging(&ptr));
+        let (dec_segid, dec_offset) = BlockPtrFormat::decode(&ptr, &BlockPtrFormat::Flat);
+        assert_eq!(dec_segid, 0);
+        assert_eq!(dec_offset, 0);
+    }
+
+    // --- MicroGroup encode/decode round-trip ---
+
+    #[test]
+    fn micro_group_round_trip_basic() {
+        // offset must be 4KiB aligned for MicroGroup
+        let segid: SegmentId = 5;
+        let offset: SegmentOffset = 8192; // 2 * 4KiB
+        let seq = 32; // seq >= 16 to produce group_id >= 1
+        let ptr = BlockPtrFormat::encode(segid, offset, seq, &BlockPtrFormat::MicroGroup);
+        assert!(BlockPtrFormat::is_on_staging(&ptr));
+        let (dec_segid, dec_offset) = BlockPtrFormat::decode(&ptr, &BlockPtrFormat::MicroGroup);
+        assert_eq!(dec_segid, segid);
+        assert_eq!(dec_offset, offset);
+    }
+
+    #[test]
+    fn micro_group_round_trip_zero_offset() {
+        let ptr = BlockPtrFormat::encode(1, 0, 0, &BlockPtrFormat::MicroGroup);
+        let (dec_segid, dec_offset) = BlockPtrFormat::decode(&ptr, &BlockPtrFormat::MicroGroup);
+        assert_eq!(dec_segid, 1);
+        assert_eq!(dec_offset, 0);
+    }
+
+    #[test]
+    fn micro_group_group_id() {
+        let seq = 48; // group_id = 48 >> 4 = 3
+        let ptr = BlockPtrFormat::encode(1, 4096, seq, &BlockPtrFormat::MicroGroup);
+        assert_eq!(BlockPtrFormat::decode_micro_group_id(&ptr), 3);
+    }
+
+    // --- decode_segid (format-independent) ---
+
+    #[test]
+    fn decode_segid_consistent_across_formats() {
+        let segid: SegmentId = 42;
+        let flat_ptr = BlockPtrFormat::encode(segid, 4096, 0, &BlockPtrFormat::Flat);
+        let mg_ptr = BlockPtrFormat::encode(segid, 4096, 0, &BlockPtrFormat::MicroGroup);
+        assert_eq!(BlockPtrFormat::decode_segid(&flat_ptr), segid);
+        assert_eq!(BlockPtrFormat::decode_segid(&mg_ptr), segid);
+    }
+
+    // --- Nop ---
+
+    #[test]
+    fn nop_encode_decode() {
+        let ptr = BlockPtrFormat::encode(99, 1234, 0, &BlockPtrFormat::Nop);
+        assert_eq!(ptr, 0);
+        let (s, o) = BlockPtrFormat::decode(&ptr, &BlockPtrFormat::Nop);
+        assert_eq!(s, 0);
+        assert_eq!(o, 0);
+    }
+}

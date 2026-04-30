@@ -252,3 +252,66 @@ impl HyperFileConfigBuilder {
 		self.config.clone()
 	}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_config_default_round_trip() {
+        let cfg = HyperFileMetaConfig::default();
+        let encoded = cfg.as_u32();
+        let decoded = HyperFileMetaConfig::from_u32(encoded);
+        assert_eq!(cfg, decoded);
+    }
+
+    #[test]
+    fn meta_config_custom_round_trip() {
+        let cfg = HyperFileMetaConfig::new(56, 8192, 65536, BlockPtrFormat::MicroGroup);
+        let encoded = cfg.as_u32();
+        let decoded = HyperFileMetaConfig::from_u32(encoded);
+        assert_eq!(decoded.root_size, 56);
+        assert_eq!(decoded.meta_block_size, 8192);
+        assert_eq!(decoded.data_block_size, 65536);
+        assert_eq!(decoded.block_ptr_format, BlockPtrFormat::MicroGroup);
+    }
+
+    #[test]
+    fn meta_config_enforces_min_sizes() {
+        // Passing values below minimum should be clamped up
+        let cfg = HyperFileMetaConfig::new(56, 1, 1, BlockPtrFormat::Flat);
+        assert!(cfg.meta_block_size >= MIN_META_BLOCK_SIZE);
+        assert!(cfg.data_block_size >= MIN_DATA_BLOCK_SIZE);
+    }
+
+    #[test]
+    fn meta_config_power_of_two_alignment() {
+        // 5000 is not power-of-two; should be rounded down to 4096
+        let cfg = HyperFileMetaConfig::new(56, 5000, 5000, BlockPtrFormat::Flat);
+        assert_eq!(cfg.meta_block_size, 4096);
+        assert_eq!(cfg.data_block_size, 4096);
+    }
+
+    #[test]
+    fn meta_config_json_round_trip() {
+        let cfg = HyperFileConfig::default();
+        let json = cfg.to_json_string(false);
+        let decoded = HyperFileConfig::from_json_string(&json).unwrap();
+        assert_eq!(cfg, decoded);
+    }
+
+    #[test]
+    fn meta_config_json_pretty() {
+        let cfg = HyperFileConfig::default();
+        let json = cfg.to_json_string(true);
+        assert!(json.contains('\n'));
+        let decoded = HyperFileConfig::from_json_string(&json).unwrap();
+        assert_eq!(cfg, decoded);
+    }
+
+    #[test]
+    fn meta_config_from_invalid_json() {
+        let result = HyperFileConfig::from_json_string("not json");
+        assert!(result.is_err());
+    }
+}

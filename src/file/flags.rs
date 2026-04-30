@@ -263,3 +263,145 @@ impl FileFlags {
         (self.0 & libc::O_TRUNC) == libc::O_TRUNC
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- FileFlags constructors ---
+
+    #[test]
+    fn file_flags_rdonly() {
+        let f = FileFlags::rdonly();
+        assert!(f.is_rdonly());
+        assert!(!f.is_wronly());
+        assert!(!f.is_rdwr());
+    }
+
+    #[test]
+    fn file_flags_wronly() {
+        let f = FileFlags::wronly();
+        assert!(f.is_wronly());
+        assert!(!f.is_rdonly());
+        assert!(!f.is_rdwr());
+    }
+
+    #[test]
+    fn file_flags_rdwr() {
+        let f = FileFlags::rdwr();
+        assert!(f.is_rdwr());
+        assert!(!f.is_rdonly());
+        assert!(!f.is_wronly());
+    }
+
+    // --- FileFlags combined ---
+
+    #[test]
+    fn file_flags_combined() {
+        let f = FileFlags::from(libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND);
+        assert!(f.is_rdwr());
+        assert!(f.is_creat());
+        assert!(f.is_trunc());
+        assert!(f.is_append());
+        assert!(!f.is_direct());
+        assert!(!f.is_sync());
+    }
+
+    #[test]
+    fn file_flags_direct_sync_dsync() {
+        let f = FileFlags::from(libc::O_WRONLY | libc::O_DIRECT | libc::O_SYNC | libc::O_DSYNC);
+        assert!(f.is_wronly());
+        assert!(f.is_direct());
+        assert!(f.is_sync());
+        assert!(f.is_dsync());
+    }
+
+    // --- HyperFileFlags from FileFlags ---
+
+    #[test]
+    fn hyper_flags_from_rdonly() {
+        let hf = HyperFileFlags::from_flags(FileFlags::rdonly());
+        assert!(hf.read);
+        assert!(!hf.write);
+        assert!(hf.is_rdonly());
+        assert!(!hf.is_sync_flush_mode());
+    }
+
+    #[test]
+    fn hyper_flags_from_rdwr() {
+        let hf = HyperFileFlags::from_flags(FileFlags::rdwr());
+        assert!(hf.read);
+        assert!(hf.write);
+        assert!(!hf.is_rdonly());
+    }
+
+    #[test]
+    fn hyper_flags_from_wronly() {
+        let hf = HyperFileFlags::from_flags(FileFlags::wronly());
+        assert!(!hf.read);
+        assert!(hf.write);
+    }
+
+    #[test]
+    fn hyper_flags_creat_trunc_append() {
+        let f = FileFlags::from(libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.creat);
+        assert!(hf.is_trunc());
+        assert!(hf.is_append());
+    }
+
+    #[test]
+    fn hyper_flags_sync_flush_mode_from_direct() {
+        let f = FileFlags::from(libc::O_WRONLY | libc::O_DIRECT);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.is_direct());
+        assert!(hf.is_sync_flush_mode());
+    }
+
+    #[test]
+    fn hyper_flags_sync_flush_mode_from_sync() {
+        let f = FileFlags::from(libc::O_WRONLY | libc::O_SYNC);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.is_sync());
+        assert!(hf.is_sync_flush_mode());
+    }
+
+    #[test]
+    fn hyper_flags_sync_flush_mode_from_dsync() {
+        let f = FileFlags::from(libc::O_WRONLY | libc::O_DSYNC);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.is_dsync());
+        assert!(hf.is_sync_flush_mode());
+    }
+
+    // --- HyperFileFlags convenience constructors ---
+
+    #[test]
+    fn hyper_flags_rdonly_constructor() {
+        let hf = HyperFileFlags::rdonly();
+        assert!(hf.is_rdonly());
+        assert!(!hf.write);
+    }
+
+    #[test]
+    fn hyper_flags_wronly_constructor() {
+        let hf = HyperFileFlags::wronly();
+        assert!(hf.write);
+        assert!(!hf.read);
+    }
+
+    #[test]
+    fn hyper_flags_all() {
+        let hf = HyperFileFlags::all();
+        assert!(hf.read);
+        assert!(hf.write);
+        assert!(hf.creat);
+        assert!(hf.is_append());
+        assert!(hf.is_trunc());
+        assert!(hf.is_sync());
+        assert!(hf.is_dsync());
+        assert!(hf.is_direct());
+        assert!(hf.is_sync_flush_mode());
+    }
+}

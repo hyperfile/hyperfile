@@ -352,3 +352,102 @@ impl<T> Writer<T> {
         self.ss.blocks.push(SegmentBlockDesc { blkidx: *blkidx, blkptr: *blkptr });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_segment_sum(ndatablk: usize) -> SegmentSum {
+        let mut hdr = SegmentHeader::new();
+        hdr.s_cno = 7;
+        hdr.s_ino = 1;
+        hdr.s_meta_blk_shift = 12;
+        hdr.s_data_blk_shift = 12;
+        hdr.s_nmetablk = 2;
+        hdr.s_ndatablk = ndatablk as u32;
+        let blocks: Vec<SegmentBlockDesc> = (0..ndatablk)
+            .map(|i| SegmentBlockDesc { blkidx: i as u64, blkptr: 0x4000_0001_0000_0000 + i as u64 })
+            .collect();
+        SegmentSum { hdr, blocks }
+    }
+
+    #[test]
+    fn segment_sum_write_read_round_trip() {
+        let ndatablk = 3;
+        let mut ss = make_segment_sum(ndatablk);
+        let inode = InodeRaw::default();
+        let ss_bytes = ss.update(0xDEAD, &inode);
+
+        let mut buf = vec![0u8; ss_bytes];
+        ss.write_to(&mut buf);
+
+        let restored = SegmentSum::from_slice(&buf);
+        assert_eq!(restored.hdr.s_magic, 0x48465353);
+        assert_eq!(restored.hdr.s_cno, 7);
+        assert_eq!(restored.hdr.s_nmetablk, 2);
+        assert_eq!(restored.hdr.s_ndatablk, ndatablk as u32);
+        assert_eq!(restored.hdr.s_chksum, 0xDEAD);
+        assert_eq!(restored.hdr.s_bytes, ss_bytes as u32);
+        assert_eq!(restored.blocks.len(), ndatablk);
+        for i in 0..ndatablk {
+            assert_eq!(restored.blocks[i].blkidx, i as u64);
+            assert_eq!(restored.blocks[i].blkptr, 0x4000_0001_0000_0000 + i as u64);
+        }
+    }
+
+    #[test]
+    fn segment_sum_zero_data_blocks() {
+        let mut ss = make_segment_sum(0);
+        let inode = InodeRaw::default();
+        let ss_bytes = ss.update(0, &inode);
+
+        let mut buf = vec![0u8; ss_bytes];
+        ss.write_to(&mut buf);
+
+        let restored = SegmentSum::from_slice(&buf);
+        assert_eq!(restored.hdr.s_ndatablk, 0);
+        assert!(restored.blocks.is_empty());
+    }
+
+    #[test]
+    fn segment_sum_calc_staging_off() {
+        let ss = make_segment_sum(2);
+        // aligned_ss_bytes for header + 2 block entries should be 4096 (fits in one page)
+        let aligned = ss.hdr.aligned_ss_bytes();
+        // meta blocks: 2 * (1 << 12) = 8192
+        // data block 0 offset: aligned + 8192 + 0 * 4096
+        assert_eq!(ss.calc_staging_off(0), aligned + 8192);
+        assert_eq!(ss.calc_staging_off(1), aligned + 8192 + 4096);
+    }
+
+    #[test]
+    #[should_panic(expected = "too small")]
+    fn segment_sum_from_slice_too_small() {
+        SegmentSum::from_slice(&[0u8; 10]);
+    }
+
+    #[test]
+    fn segid_to_staging_file_id_format() {
+        assert_eq!(Segment::segid_to_staging_file_id(1), "0000000001");
+        assert_eq!(Segment::segid_to_staging_file_id(9999999999), "9999999999");
+    }
+
+    #[test]
+    fn writer_calc_ss_aligned_bytes() {
+        // calc_ss_aligned_bytes logic: (hdr + n*entry + 4095) >> 12 << 12
+        let hdr_sz = std::mem::size_of::<SegmentHeader>();
+        let entry_sz = std::mem::size_of::<SegmentBlockEntryRaw>();
+
+        // 0 data blocks: just header, should align to 4096
+        let raw = hdr_sz;
+        let expected = (raw + 4095) >> 12 << 12;
+        assert_eq!(expected, 4096);
+
+        // many blocks that push past 4096
+        let n = (4096 - hdr_sz) / entry_sz + 1;
+        let raw = hdr_sz + n * entry_sz;
+        let expected = (raw + 4095) >> 12 << 12;
+        assert!(expected > 4096);
+        assert_eq!(expected % 4096, 0);
+    }
+}

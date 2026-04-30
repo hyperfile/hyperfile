@@ -45,3 +45,47 @@ impl<'a> S3Uri<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_valid_uri() {
+        let uri = S3Uri::parse("s3://my-bucket/path/to/key").unwrap();
+        assert_eq!(uri.bucket, "my-bucket");
+        assert_eq!(uri.key, "path/to/key");
+    }
+
+    #[test]
+    fn parse_uppercase_scheme() {
+        let uri = S3Uri::parse("S3://bucket/key").unwrap();
+        assert_eq!(uri.bucket, "bucket");
+        assert_eq!(uri.key, "key");
+    }
+
+    #[test]
+    fn parse_missing_scheme() {
+        let err = S3Uri::parse("http://bucket/key").unwrap_err();
+        assert_eq!(err.to_string(), "S3 Uri must start with s3:// or S3://");
+    }
+
+    #[test]
+    fn parse_missing_key() {
+        let err = S3Uri::parse("s3://bucket/").unwrap_err();
+        assert_eq!(err.to_string(), "Missing key from S3 Uri");
+    }
+
+    #[test]
+    fn parse_bucket_only() {
+        let err = S3Uri::parse("s3://bucket").unwrap_err();
+        assert_eq!(err.to_string(), "Incomplete S3 Uri");
+    }
+
+    #[test]
+    fn parse_nested_key() {
+        let uri = S3Uri::parse("s3://b/a/b/c/d").unwrap();
+        assert_eq!(uri.bucket, "b");
+        assert_eq!(uri.key, "a/b/c/d");
+    }
+}
+

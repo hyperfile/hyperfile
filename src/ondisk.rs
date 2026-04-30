@@ -166,3 +166,87 @@ impl SegmentHeader {
         (self.s_bytes as usize + 4096 - 1) >> 12 << 12
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- InodeRaw ---
+
+    #[test]
+    fn inode_raw_size() {
+        // InodeRaw is #[repr(C, align(8))] — verify it stays stable
+        assert_eq!(std::mem::size_of::<InodeRaw>(), 160);
+    }
+
+    #[test]
+    fn inode_raw_round_trip_via_slice() {
+        let mut raw = InodeRaw::default();
+        raw.i_ino = 42;
+        raw.i_size = 1024 * 1024;
+        raw.i_blocks = 2048;
+        raw.i_uid = 1000;
+        raw.i_gid = 1000;
+        raw.i_mode = 0o100644;
+        raw.i_last_seq = 99;
+        raw.i_last_cno = 99;
+        raw.i_bmap[0] = 0xAB;
+        raw.i_bmap[55] = 0xCD;
+
+        let bytes = raw.as_u8_slice().to_vec();
+        let restored = InodeRaw::from_u8_slice(&bytes);
+
+        assert_eq!(restored.i_ino, 42);
+        assert_eq!(restored.i_size, 1024 * 1024);
+        assert_eq!(restored.i_blocks, 2048);
+        assert_eq!(restored.i_uid, 1000);
+        assert_eq!(restored.i_gid, 1000);
+        assert_eq!(restored.i_mode, 0o100644);
+        assert_eq!(restored.i_last_seq, 99);
+        assert_eq!(restored.i_last_cno, 99);
+        assert_eq!(restored.i_bmap[0], 0xAB);
+        assert_eq!(restored.i_bmap[55], 0xCD);
+    }
+
+    #[test]
+    fn inode_raw_as_mut_u8_slice() {
+        let mut raw = InodeRaw::default();
+        let slice = raw.as_mut_u8_slice();
+        assert_eq!(slice.len(), std::mem::size_of::<InodeRaw>());
+        // writing to the slice should modify the struct
+        slice[0] = 0xFF;
+        assert_eq!(raw.as_u8_slice()[0], 0xFF);
+    }
+
+    #[test]
+    fn inode_raw_default_is_zeroed() {
+        let raw = InodeRaw::default();
+        assert!(raw.as_u8_slice().iter().all(|&b| b == 0));
+    }
+
+    // --- SegmentHeader ---
+
+    #[test]
+    fn segment_header_new_has_magic() {
+        let hdr = SegmentHeader::new();
+        assert_eq!(hdr.s_magic, 0x48465353); // "HFSS"
+    }
+
+    #[test]
+    fn segment_header_aligned_ss_bytes() {
+        let mut hdr = SegmentHeader::new();
+        hdr.s_bytes = 100; // less than 4096
+        assert_eq!(hdr.aligned_ss_bytes(), 4096);
+        hdr.s_bytes = 4096;
+        assert_eq!(hdr.aligned_ss_bytes(), 4096);
+        hdr.s_bytes = 4097;
+        assert_eq!(hdr.aligned_ss_bytes(), 8192);
+    }
+
+    // --- SegmentBlockEntryRaw ---
+
+    #[test]
+    fn segment_block_entry_size() {
+        assert_eq!(std::mem::size_of::<SegmentBlockEntryRaw>(), 16);
+    }
+}
