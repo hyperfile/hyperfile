@@ -3,12 +3,30 @@
 This directory holds Hyperfile's test suite. Tests are organized by what
 they exercise and what dependencies they require.
 
+## Layout
+
+```
+tests/
+├── README.md                          ← this file
+├── common/
+│   └── mod.rs                         ← shared fixtures and interceptors
+├── integration_s3_smoke.rs            ← happy-path create/write/read/truncate
+├── integration_s3_rollback.rs         ← rollback (exposure + correctness)
+├── integration_s3_contract.rs         ← flush contract (invariant) tests
+└── integration_s3_concurrent.rs       ← multi-instance concurrency
+```
+
+`common/mod.rs` is not itself a test binary. It is consumed by each
+`integration_s3_*.rs` file via `mod common; use common::*;`. Cargo
+compiles each integration_s3_*.rs as its own test binary; `common/mod.rs`
+is shared source among them.
+
 ## Test categories
 
 | Category | Location | Dependencies | Default run |
 | --- | --- | --- | --- |
-| Unit tests | inline in `src/**/*.rs` (under `#[cfg(test)]` modules) | None | Yes |
-| S3 integration tests | `tests/integration_s3.rs` | Real S3 bucket + AWS credentials | No (opt-in via `--ignored`) |
+| Unit tests | inline in `src/**/*.rs` (`#[cfg(test)]` modules) | None | Yes |
+| S3 integration tests | `tests/integration_s3_*.rs` | Real S3 bucket + AWS credentials | No (opt-in via `--ignored`) |
 
 All unit tests must pass on every build. Integration tests are marked
 `#[ignore]` so they don't run under plain `cargo test`; they must be
@@ -25,13 +43,13 @@ No credentials, no network. Should complete in well under a second.
 As of the latest commit there are approximately 195 unit tests across
 modules like `meta_format`, `ondisk`, `segment`, `config`, `buffer`,
 `inode`, `data_cache::mem_cache`, `file::flags`, `file::mode`,
-`file::handler`, etc.
+`file::handler`, `file::lock` (under the `range-lock` feature), etc.
 
 ## Running S3 integration tests
 
 Integration tests run against a real S3 bucket (or S3 Express One Zone
 directory bucket). They exercise end-to-end scenarios that cannot be
-meaningfully mocked, such as optimistic concurrency, conditional writes,
+meaningfully mocked: optimistic concurrency, conditional writes,
 partial-flush recovery, and MPU semantics.
 
 ### Prerequisites
@@ -50,28 +68,40 @@ partial-flush recovery, and MPU semantics.
 | `HYPERFILE_TEST_BUCKET` | `<your-bucket>` | Name of the bucket to write to. |
 | `HYPERFILE_TEST_REGION` | `<your-region>` | AWS region for the client. |
 
-### Running the whole suite
+### Running all integration suites
 
 ```bash
 HYPERFILE_TEST_BUCKET=<your-bucket> \
 HYPERFILE_TEST_REGION=<your-region> \
-cargo test --release --test integration_s3 \
-    -- --ignored --test-threads=1
+cargo test --release --tests -- --ignored --test-threads=1
 ```
 
 `--test-threads=1` is important: the tests share a bucket prefix and
-concurrent execution can cause listing / cleanup interference. Plus
-several tests deliberately race themselves, so running multiple tests
-in parallel adds noise that is hard to diagnose.
+concurrent execution can cause listing / cleanup interference. Several
+tests also deliberately race themselves; adding extra parallelism
+obscures their state.
 
-### Running a single test
+### Running one suite
+
+Each file is its own `--test` target:
+
+```bash
+HYPERFILE_TEST_BUCKET=<your-bucket> \
+HYPERFILE_TEST_REGION=<your-region> \
+cargo test --release --test integration_s3_smoke -- --ignored --test-threads=1
+```
+
+Substitute `integration_s3_rollback`, `integration_s3_contract`, or
+`integration_s3_concurrent` for the other suites.
+
+### Running one test
 
 Pass the test name (or a substring) before the `--`:
 
 ```bash
 HYPERFILE_TEST_BUCKET=<your-bucket> \
 HYPERFILE_TEST_REGION=<your-region> \
-cargo test --release --test integration_s3 \
+cargo test --release --test integration_s3_concurrent \
     concurrent_two_writers_fail_fast_policy \
     -- --ignored --test-threads=1 --nocapture
 ```
@@ -82,60 +112,81 @@ output from the test show up even when the assertion passes.
 ### Compiling only (no run)
 
 ```bash
-cargo test --release --test integration_s3 --no-run
+cargo test --release --tests --no-run
 ```
 
 Useful in CI or when iterating on a test without paying for S3 calls.
 
 ### Enabling debug logs
 
-Use `RUST_LOG` to see Hyperfile's internal debug traces — this is
-especially useful when a concurrency / rollback test exposes a subtle
-ordering issue.
+Use `RUST_LOG` to see Hyperfile's internal debug traces — especially
+useful when a concurrency / rollback test exposes a subtle ordering
+issue.
 
 ```bash
 RUST_LOG=hyperfile=debug \
 HYPERFILE_TEST_BUCKET=... HYPERFILE_TEST_REGION=... \
-cargo test --release --test integration_s3 <name> \
+cargo test --release --test integration_s3_concurrent <name> \
     -- --ignored --test-threads=1 --nocapture
 ```
 
-## Integration test organization (`tests/integration_s3.rs`)
+## Integration test suites
 
-The file is split into sections, each focused on one behavior area.
-When adding a new group, prefer adding to an existing section if it
-fits; otherwise create a new section with a banner comment that
-explains what invariants it covers.
+### `integration_s3_smoke`
 
-Current sections:
+Happy-path end-to-end round trips. Create, write, flush, release,
+reopen, read, truncate (extend and shrink). Runs in ~0.5 s.
 
-1. **Test fixture and setup** — `TestFile` RAII struct, `make_client`,
-   env-driven bucket/region config.
-2. **Fault-injection helpers** — `StagingIntercept` implementations
-   like `FailOnFlushInode`, `AlwaysFailFlushInode`,
-   `AlwaysFailSegmentDone`, `ResourceBusyOnceFlushInode`,
-   `FailOtherNoRetry`. See "Adding a new interceptor" below.
-3. **Smoke tests** — happy path end-to-end round trips.
-4. **Rollback exposure tests** — flush always fails, verifies the
-   pre-flush persisted state is preserved.
-5. **Rollback correctness tests** — flush fails once (transient);
-   verifies that retries or release-time flushes do not silently
-   commit.
-6. **Contract (invariant) tests** — use `#[doc(hidden)]` getters on
-   `Hyper` (e.g. `dirty_block_count`, `is_bmap_dirty`) to assert the
-   internal state is consistent after flush success / failure /
-   rollback.
-7. **Concurrent-writer / concurrent-reader tests (A group)** — two
-   `Hyper` instances on the same URI, exercising S3 OCC semantics
-   under the default `RetryLastWriterWins` policy. One test covers the
-   `FailFast` policy.
+### `integration_s3_rollback`
+
+Two groups:
+
+1. **Rollback exposure** (`rollback_exposure_*`): always-fail
+   interceptor; verifies that when flush permanently fails, the
+   persisted state is unchanged and reopen recovers cleanly.
+2. **Rollback correctness** (`rollback_correctness_*`): fail-once
+   interceptor; verifies that a single transient flush failure is not
+   silently committed by subsequent retries or release-time flushes.
+   Covers every mutation API (write / truncate extend / truncate
+   shrink / write_zero / write_aligned_batch / write_batch).
+
+Runs in ~45 s (multiple FlushOnce retry cycles that each take a few
+seconds of AWS timeouts).
+
+### `integration_s3_contract`
+
+Uses `#[doc(hidden)]` getters on `Hyper` (dirty_block_count,
+is_attr_dirty, is_bmap_dirty, cno tracking) to assert that flush
+invariants hold after success, after rollback, after segment-upload
+failure, and along the retry path (retries `ResourceBusy`, does not
+retry `ErrorKind::Other`).
+
+Runs in ~7 s.
+
+### `integration_s3_concurrent`
+
+Multi-instance concurrency:
+
+- `concurrent_two_writers_optimistic_cc`: default
+  `RetryLastWriterWins` policy, two writers race on the same URI.
+- `concurrent_read_while_writer_flushes`: reader observes
+  self-consistent checkpoints while writer churns.
+- `concurrent_writer_a_fails_writer_b_succeeds`: writer A injected
+  failure, writer B succeeds.
+- `concurrent_two_writers_fail_fast_policy`: `FlushConflictPolicy::
+  FailFast`; exactly one writer wins, the other returns
+  `ErrorKind::AlreadyExists`.
+
+See `docs/concurrency.md` for the full behavior model.
+
+Runs in ~27 s.
 
 ## Adding a new interceptor
 
-To inject a fault not yet covered, implement
-`StagingIntercept<S3Staging>` with overrides only for the hook you
-need. All methods have default no-op implementations, so a minimal
-interceptor is a few lines:
+Shared interceptors live in `tests/common/mod.rs`. To inject a fault
+not yet covered, implement `StagingIntercept<S3Staging>` with overrides
+only for the hook you need. All methods have default no-op
+implementations, so a minimal interceptor is a few lines:
 
 ```rust
 #[derive(Clone)]
@@ -166,36 +217,53 @@ Available hook points (see `src/staging/mod.rs`):
 - `before_segment_done` — can return `Err` to make a segment upload
   fail.
 
-Install with `Hyper::with_staging_interceptor(interceptor.clone())`
-after opening, before performing the operation.
+Put the new interceptor in `tests/common/mod.rs` so every suite can
+use it. Install in a test with `Hyper::with_staging_interceptor(i.clone())`
+after opening.
 
 ## Adding a new integration test
 
-1. Pick the right section or create a new one.
-2. Use `#[tokio::test]` + `#[ignore]` so the test is excluded from the
+1. Pick the right suite or add a new `integration_s3_<name>.rs` file
+   (and update this README's Layout table).
+2. Top of file: `mod common; use common::*;` plus whatever hyperfile
+   imports you need.
+3. Use `#[tokio::test]` + `#[ignore]` so the test is excluded from the
    default `cargo test` run.
-3. Start with a `TestFile::new(&client).await` and call
+4. Start with a `TestFile::new(&client).await` and call
    `tf.cleanup(&client).await` at the very end (do NOT rely on Drop —
    see the comment on `TestFile` for why).
-4. For tests that need a specific runtime config (e.g. to pick a
+5. For tests that need a specific runtime config (e.g. a
    `FlushConflictPolicy`), construct a `HyperFileRuntimeConfig` and
    open via `Hyper::fs_open_opt`.
-5. Always call `let _ = hyper.fs_release().await` before dropping the
+6. Always call `let _ = hyper.fs_release().await` before dropping the
    `Hyper`, even on the error path — `release` runs internal flush
    cleanup.
-6. If the test is concurrent, use `tokio::join!` over plain futures,
+7. If the test is concurrent, use `tokio::join!` over plain futures,
    not `tokio::spawn` — `Hyper` is `Send` but not `Sync`, so its
    futures can't be scheduled across tokio worker threads.
-7. Prefer printing diagnostic info with `println!` and `--nocapture`
+8. Prefer printing diagnostic info with `println!` and `--nocapture`
    over stuffing detail into assertion messages.
+
+## Adding a new suite
+
+If a new category of tests doesn't fit into the existing four,
+create `tests/integration_s3_<category>.rs`:
+
+1. Start with the same header pattern as existing suites (module-level
+   doc comment explaining the group, `mod common; use common::*;`,
+   imports).
+2. Add a row to the "Layout" table and a section under "Integration
+   test suites" describing what it covers.
+3. A new test binary is automatically picked up by `cargo test --tests`;
+   no Cargo.toml changes required.
 
 ## Cleanup and orphaned objects
 
 `TestFile::cleanup` uses `Hyper::fs_unlink`, which issues a prefix list
 plus batch delete. If a test crashes between `TestFile::new` and
-`cleanup`, the created objects will remain in the bucket. They are
-harmless (each run uses a unique ULID-based prefix) but if they
-accumulate you can nuke them with:
+`cleanup`, the created objects remain in the bucket. They are harmless
+(each run uses a unique ULID-based prefix) but can accumulate. Nuke
+them with:
 
 ```bash
 aws s3 rm s3://$HYPERFILE_TEST_BUCKET/hyperfile-test/ --recursive \
@@ -206,6 +274,6 @@ aws s3 rm s3://$HYPERFILE_TEST_BUCKET/hyperfile-test/ --recursive \
 
 - [`docs/concurrency.md`](../docs/concurrency.md) — how
   `FlushConflictPolicy` and S3 OCC interact; reference for the
-  concurrency tests.
+  concurrency suite.
 - [`docs/posix.md`](../docs/posix.md) — POSIX semantics, sync mode
   behavior.
