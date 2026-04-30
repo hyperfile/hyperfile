@@ -13,10 +13,91 @@ same S3 URI they are **independent**: there is no shared memory and no
 in-process coordination between them. All synchronization happens
 through S3's conditional write semantics.
 
-Within a single `Hyper` instance, writes are serialized by an internal
-semaphore (permits = 1) unless the `range-lock` feature is enabled.
-Concurrency bugs at this layer are not the subject of this doc; here we
-focus on the multi-instance case.
+Within a single `Hyper` instance, how writes are serialized depends on
+the access mode (direct vs reactor) and whether the `range-lock`
+feature is enabled. See the next section.
+
+## Access modes and locking
+
+Hyperfile supports two programming models against the same core engine:
+
+- **Direct API** — `Hyper::fs_write`, `fs_truncate`, `fs_write_zero`,
+  etc. Each method takes `&mut self`. Concurrent invocations from a
+  single `Hyper` are prevented at compile time by the Rust borrow
+  checker.
+- **Reactor API** — `HyperFileHandler` / `HyperFileTokio`. A
+  `LocalSpawner` runs a handler loop that receives `FileReq` messages
+  through a channel. Multiple tasks can send requests into the handler
+  concurrently.
+
+These two modes use different runtime-locking strategies.
+
+### Direct API locking
+
+Every write/truncate path acquires an `OwnedSemaphorePermit` from
+`HyperFile::sema` before touching bmap or cache. The permit count is:
+
+| File flags | `range-lock` feature | Semaphore permits | Effective serialization |
+| --- | --- | --- | --- |
+| `rdonly` | either | `MAX_PERMITS` | None (reads are safe to parallelize) |
+| `rdwr` / `wronly` | off (default) | **1** | Writes inside a `Hyper` are serialized |
+| `rdwr` / `wronly` | on | `MAX_PERMITS` | None from the semaphore |
+
+In the direct API the `&mut self` borrow checker already prevents
+concurrent invocation of mutating methods from a single `Hyper`, so
+serialization is mostly redundant; the semaphore exists for the cases
+where `acquire_owned()` is held across an await point that yields to
+another task in the same runtime.
+
+When the `range-lock` feature is on, the semaphore is intentionally
+loosened to `MAX_PERMITS` because the reactor API (below) takes over
+serialization at the range level. **The direct API does not itself
+acquire a range-lock** — the `range_lock` field on `HyperFile` is only
+consulted by the reactor handler.
+
+### Reactor API locking
+
+The reactor handler processes one request at a time in the per-handler
+task, but the request itself can spawn additional work
+(`spawn_read` / `spawn_write` / `spawn_write_zero`) that runs as
+independent tokio tasks. These spawned tasks can be in flight
+concurrently for non-overlapping byte ranges, and concurrency is bounded
+by the `range-lock` feature:
+
+- **`range-lock` off (default)**: the per-file semaphore has 1 permit,
+  so spawned writes are serialized even though they run as separate
+  tasks. No range-level parallelism.
+- **`range-lock` on**: the semaphore has `MAX_PERMITS`, but every
+  spawned read/write path first calls `RangeLock::try_lock` on the
+  byte range it will touch (aligned to `data_block_size`). If the
+  range overlaps an in-flight lock the request is requeued onto the
+  high-priority queue and retried later. Non-overlapping ranges run in
+  parallel.
+
+Flush interacts with this: the handler checks
+`range_lock.is_locked()` before kicking a flush so flush never races
+with an in-flight write.
+
+### Why two modes, why two strategies
+
+The direct API is the simplest integration point: call a method, await,
+check the result. It benefits from Rust's borrow rules; an additional
+runtime lock would add overhead without catching new bugs.
+
+The reactor API exists to let independent callers (e.g. the FUSE
+kernel pushing many outstanding requests in parallel, or an NFS-style
+server) share one `Hyper` instance without having to serialize at the
+user-code layer. Range-level locking is what enables that sharing —
+the range-lock feature is effectively *the* reason the reactor API is
+useful for highly parallel workloads.
+
+### Summary
+
+- If you program against `Hyper` directly: leave `range-lock` off. The
+  borrow checker + default semaphore already give you safe semantics.
+- If you use `HyperFileHandler` / `HyperFileTokio` and want parallel
+  per-range writes, enable `range-lock`. Otherwise leave it off for
+  simpler serialization.
 
 ## S3 optimistic concurrency control (OCC)
 
