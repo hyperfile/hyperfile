@@ -4,7 +4,6 @@ use aws_sdk_s3::Client;
 use crate::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
 use crate::config::{HyperFileConfig, HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
-use super::HyperTrait;
 use super::hyper::Hyper;
 use super::flags::{HyperFileFlags, FileFlags};
 use super::mode::{HyperFileMode, FileMode};
@@ -163,7 +162,7 @@ impl<'a: 'static> Hyper<'a> {
     pub async fn fs_flush(&mut self) -> Result<u64>
     {
         debug!("fs_flush - ");
-        self.inner.flush().await
+        self.inner.flush_with_rollback().await
     }
 
     pub async fn fs_truncate(&mut self, offset: usize) -> Result<()>

@@ -656,3 +656,245 @@ async fn rollback_exposure_write_flush_fails() {
 
     tf.cleanup(&client).await;
 }
+
+// --------------------------------------------------------------------
+// Rollback CORRECTNESS tests (FailOnce — expose silent commits)
+// --------------------------------------------------------------------
+//
+// These tests use FailOnFlushInode::at(1), so the FIRST flush_inode
+// call fails but subsequent attempts succeed. This simulates the
+// realistic case where a transient failure happens mid-operation.
+//
+// Without a proper rollback in write/truncate/write_zero, the
+// sequence of events is:
+//   1. Operation mutates in-memory inode (e.g. set_size).
+//   2. Operation calls flush() → flush_inode #1 fails → returns Err.
+//   3. Caller sees Err and assumes the operation didn't commit.
+//   4. Caller eventually calls fs_release() → flush() → flush_inode #2
+//      succeeds → the mutated in-memory state is committed.
+//
+// That is the silent-commit bug these tests are designed to expose.
+
+/// Truncate-extend + a single transient flush failure. After release,
+/// the persisted size MUST remain the original — otherwise we have
+/// committed a "failed" operation.
+#[tokio::test]
+#[ignore]
+async fn rollback_correctness_truncate_extend_single_flush_fails() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let original_size = 1024usize;
+    let payload: Vec<u8> = (0..original_size).map(|i| (i & 0xFF) as u8).collect();
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Fail exactly the first flush_inode; subsequent attempts succeed.
+    let interceptor = FailOnFlushInode::at(1);
+    let truncate_result = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await
+            .expect("open");
+        hyper.with_staging_interceptor(interceptor.clone());
+        let r = hyper.fs_truncate(8192).await;
+        let _rel = hyper.fs_release().await;
+        r
+    };
+
+    assert!(
+        truncate_result.is_err(),
+        "expected truncate to fail, got {:?}",
+        truncate_result
+    );
+    println!(
+        "[correctness_truncate_extend] truncate={:?} calls={}",
+        truncate_result,
+        interceptor.call_count()
+    );
+
+    let persisted_size = {
+        let hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        hyper.fs_getattr().expect("getattr").st_size as usize
+    };
+    println!(
+        "[correctness_truncate_extend] persisted_size={}",
+        persisted_size
+    );
+
+    // INVARIANT: a failed truncate must NOT change the persisted size.
+    assert_eq!(
+        persisted_size, original_size,
+        "failed truncate silently committed: expected size {}, got {}",
+        original_size, persisted_size
+    );
+
+    tf.cleanup(&client).await;
+}
+
+/// Truncate-shrink + single flush failure. Besides size, we also verify
+/// that all original blocks are still readable — bmap.truncate() destroys
+/// in-memory mappings before flush, so without rollback the first block
+/// can appear corrupted.
+#[tokio::test]
+#[ignore]
+async fn rollback_correctness_truncate_shrink_single_flush_fails() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let original_size = 16 * 1024usize;
+    let payload: Vec<u8> = (0..original_size).map(|i| (i & 0xFF) as u8).collect();
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let interceptor = FailOnFlushInode::at(1);
+    let truncate_result = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await
+            .expect("open");
+        hyper.with_staging_interceptor(interceptor.clone());
+        let r = hyper.fs_truncate(4096).await;
+        let _rel = hyper.fs_release().await;
+        r
+    };
+
+    assert!(
+        truncate_result.is_err(),
+        "expected truncate to fail, got {:?}",
+        truncate_result
+    );
+    println!(
+        "[correctness_truncate_shrink] truncate={:?} calls={}",
+        truncate_result,
+        interceptor.call_count()
+    );
+
+    let (persisted_size, first_ok, last_ok) = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        let size = hyper.fs_getattr().expect("getattr").st_size as usize;
+
+        let mut b0 = vec![0u8; 4096];
+        let r0 = hyper.fs_read(0, &mut b0).await;
+        let first_ok = r0.is_ok() && b0 == payload[..4096];
+
+        let last_ok = if size >= 16 * 1024 {
+            let mut b3 = vec![0u8; 4096];
+            let r3 = hyper.fs_read(12 * 1024, &mut b3).await;
+            Some(r3.is_ok() && b3 == payload[12 * 1024..16 * 1024])
+        } else {
+            None
+        };
+        (size, first_ok, last_ok)
+    };
+    println!(
+        "[correctness_truncate_shrink] size={} first_ok={} last_ok={:?}",
+        persisted_size, first_ok, last_ok
+    );
+
+    // INVARIANTS after a failed shrink:
+    //   1. persisted size unchanged.
+    //   2. all blocks of the original file still readable.
+    assert_eq!(
+        persisted_size, original_size,
+        "failed shrink silently committed: size expected {}, got {}",
+        original_size, persisted_size
+    );
+    assert!(first_ok, "first block corrupted after failed shrink");
+    assert_eq!(
+        last_ok,
+        Some(true),
+        "last block unreadable after failed shrink — data lost"
+    );
+
+    tf.cleanup(&client).await;
+}
+
+/// Write + single flush failure. After release, the persisted file MUST
+/// still be empty (0 bytes), not the 11 bytes we attempted to write.
+#[tokio::test]
+#[ignore]
+async fn rollback_correctness_write_single_flush_fails() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let interceptor = FailOnFlushInode::at(1);
+    let (write_result, flush_result) = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await
+            .expect("open");
+        hyper.with_staging_interceptor(interceptor.clone());
+        let wr = hyper.fs_write(0, b"hello world").await;
+        let fl = hyper.fs_flush().await;
+        let _rel = hyper.fs_release().await;
+        (wr, fl)
+    };
+
+    println!(
+        "[correctness_write] write={:?} flush={:?} calls={}",
+        write_result,
+        flush_result,
+        interceptor.call_count()
+    );
+    assert!(
+        flush_result.is_err(),
+        "expected flush to fail, got write={:?} flush={:?}",
+        write_result,
+        flush_result
+    );
+
+    let persisted_size = {
+        let hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        hyper.fs_getattr().expect("getattr").st_size as usize
+    };
+    println!("[correctness_write] persisted_size={}", persisted_size);
+
+    // INVARIANT: a failed write+flush must not commit the data.
+    assert_eq!(
+        persisted_size, 0,
+        "failed write silently committed: expected 0, got {}",
+        persisted_size
+    );
+
+    tf.cleanup(&client).await;
+}

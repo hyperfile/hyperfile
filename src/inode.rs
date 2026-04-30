@@ -372,6 +372,60 @@ impl Inode {
     pub fn set_ondisk_state(&mut self, od_state: Option<OnDiskState>) {
         self.i_ondisk_state = od_state;
     }
+
+    /// Snapshot mutable attr-related fields so a failed operation can roll
+    /// back the in-memory inode to its pre-operation state. Combine with
+    /// `restore_state` to form a scope guard for mutations done by
+    /// write/write_zero/truncate before flush.
+    pub fn save_state(&self) -> InodeSnapshot {
+        InodeSnapshot {
+            i_size: self.i_size,
+            i_blocks: self.i_blocks,
+            i_mtime: self.i_mtime,
+            i_mtime_nsec: self.i_mtime_nsec,
+            i_attr_dirty: self.i_attr_dirty,
+        }
+    }
+
+    /// Restore fields saved by `save_state`. Intended to be called only on
+    /// the failure path when the caller also refreshes bmap from persisted
+    /// inode to undo any bmap mutations.
+    pub fn restore_state(&mut self, snap: &InodeSnapshot) {
+        self.i_size = snap.i_size;
+        self.i_blocks = snap.i_blocks;
+        self.i_mtime = snap.i_mtime;
+        self.i_mtime_nsec = snap.i_mtime_nsec;
+        self.i_attr_dirty = snap.i_attr_dirty;
+    }
+
+    /// Restore mutable attr-related fields from a raw on-disk inode.
+    /// Used by the failure-path rollback to bring in-memory state back
+    /// in sync with persisted state. Does NOT touch read-only identity
+    /// fields (ino, uid, gid, mode, nlink) because those are not mutated
+    /// by the code paths that require rollback.
+    pub fn restore_attr_from_raw(&mut self, raw: &InodeRaw) {
+        self.i_size = raw.i_size;
+        self.i_blocks = raw.i_blocks;
+        self.i_mtime = raw.i_mtime;
+        self.i_mtime_nsec = raw.i_mtime_nsec;
+        self.i_atime = raw.i_atime;
+        self.i_atime_nsec = raw.i_atime_nsec;
+        self.i_ctime = raw.i_ctime;
+        self.i_ctime_nsec = raw.i_ctime_nsec;
+        self.i_attr_dirty = false;
+    }
+}
+
+/// Snapshot of the mutable inode fields affected by write / truncate
+/// before flush. Produced by `Inode::save_state`, applied by
+/// `Inode::restore_state` on the failure path.
+#[derive(Debug, Clone)]
+pub struct InodeSnapshot {
+    i_size: u64,
+    i_blocks: u64,
+    i_mtime: u64,
+    i_mtime_nsec: u32,
+    i_attr_dirty: bool,
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -700,5 +754,47 @@ mod tests {
         assert!(inode.get_ondisk_state().is_some());
         inode.set_ondisk_state(None);
         assert!(inode.get_ondisk_state().is_none());
+    }
+
+    // --- save_state / restore_state ---
+
+    #[test]
+    fn save_restore_state_round_trip() {
+        let mut inode = Inode::default_file();
+        inode.set_size(4096);
+        inode.i_mtime = 1000;
+        inode.i_mtime_nsec = 500;
+        inode.i_attr_dirty = false;
+
+        let snap = inode.save_state();
+
+        // Mutate all the fields tracked by the snapshot.
+        inode.set_size(8192);
+        inode.update_mtime();
+        assert_ne!(inode.size(), 4096);
+        assert!(inode.is_attr_dirty());
+
+        // Restore and verify.
+        inode.restore_state(&snap);
+        assert_eq!(inode.size(), 4096);
+        assert_eq!(inode.i_blocks, 8);
+        assert_eq!(inode.i_mtime, 1000);
+        assert_eq!(inode.i_mtime_nsec, 500);
+        assert!(!inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn save_restore_preserves_original_attr_dirty() {
+        let mut inode = Inode::default_file();
+        inode.i_attr_dirty = true;
+        let snap = inode.save_state();
+
+        inode.clear_attr_dirty();
+        inode.set_size(123);
+        assert!(inode.is_attr_dirty());
+
+        inode.restore_state(&snap);
+        // attr_dirty should be restored to true (original value).
+        assert!(inode.is_attr_dirty());
     }
 }

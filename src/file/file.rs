@@ -400,6 +400,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let fn_start = Instant::now();
         let len = buf.len();
         debug!("WRITE - off: {}, buf len: {}", off, len);
+
         let v = self.write_prepare(off, len);
         let fetched = self.write_retrieve(v).await?;
         for block in fetched.into_iter() {
@@ -440,10 +441,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
-        // TODO: rollback to old size if flush failed
         drop(permit);
 
-        let _flushed = self.try_flush().await?;
+        if let Err(e) = self.try_flush().await {
+            let _ = self.rollback_from_persisted().await;
+            return Err(e);
+        }
         let _ = fn_start;
         Ok(bytes_write)
     }
@@ -452,6 +455,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let fn_start = Instant::now();
         debug!("WRITE ZERO - off: {}, len: {}", off, len);
+
         let v = self.write_prepare(off, len);
         let fetched = self.write_retrieve(v).await?;
         for block in fetched.into_iter() {
@@ -508,10 +512,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             self.cache.set_size(off + len);
         }
         self.inode.update_mtime();
-        // TODO: rollback to old size if flush failed
         drop(permit);
 
-        let _flushed = self.try_flush().await?;
+        if let Err(e) = self.try_flush().await {
+            let _ = self.rollback_from_persisted().await;
+            return Err(e);
+        }
         let _ = fn_start;
         Ok(bytes_write)
     }
@@ -530,6 +536,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let data_block_size = self.config.meta.data_block_size;
+
         let mut bytes_write = 0;
         for block_wrapper in blocks.iter() {
             let blk_idx = block_wrapper.index();
@@ -557,7 +564,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
         self.inode.update_mtime();
         drop(permit);
-        let _flushed = self.try_flush().await?;
+        if let Err(e) = self.try_flush().await {
+            let _ = self.rollback_from_persisted().await;
+            return Err(e);
+        }
         Ok(bytes_write)
     }
 
@@ -595,6 +605,71 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Explicit flush with rollback-on-failure semantics.
+    ///
+    /// `HyperTrait::flush()` commits all pending in-memory mutations to
+    /// staging. If it fails, in-memory state still reflects the mutations
+    /// that never made it to disk, diverging from the persisted state. This
+    /// wrapper rolls the in-memory state back to what's persisted on
+    /// failure, so callers that observe `Err` also see an in-memory state
+    /// that matches reality.
+    ///
+    /// Users exercise this via `fs_flush` / `fh_flush`.
+    pub async fn flush_with_rollback(&mut self) -> Result<SegmentId> {
+        match self.flush().await {
+            Ok(segid) => Ok(segid),
+            Err(e) => {
+                let _ = self.rollback_from_persisted().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Roll back the in-memory state of this file to match what's persisted
+    /// on staging. Used by the failure path of write/truncate/write_zero/flush
+    /// to undo in-memory mutations when the flush fails. Steps:
+    ///   1. Reload persisted inode and rebuild bmap from it.
+    ///   2. Replace self.inode fields with the persisted values, preserving
+    ///      read-only attrs like ino/uid/gid/mode/nlink which aren't mutated
+    ///      by these code paths.
+    ///   3. Reset bookkeeping (last_seq, ondisk_state) to the reloaded values
+    ///      so subsequent operations see a consistent state.
+    ///   4. Discard dirty data blocks and cached read blocks.
+    ///
+    /// Best-effort: if reloading the persisted inode itself fails, this
+    /// function returns the error without attempting further recovery. The
+    /// caller should propagate the original flush error regardless.
+    pub(crate) async fn rollback_from_persisted(&mut self) -> Result<()> {
+        // 1. reload persisted inode + rebuild bmap
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let inode_state = self.staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
+        let b = raw_inode.i_bmap;
+        let meta_block_loader = self.staging.to_block_loader();
+        let node_cache = self.bmap.get_node_cache();
+        let new_bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::read(
+            &b,
+            self.config.meta.meta_block_size,
+            meta_block_loader,
+            node_cache,
+        )?;
+        new_bmap.set_cache_limit(self.config.runtime.node_cache_blocks);
+
+        // 2. commit fresh bmap + inode fields from persisted state
+        self.bmap = new_bmap;
+        self.inode.restore_attr_from_raw(&raw_inode);
+        self.inode.i_last_seq = raw_inode.i_last_seq;
+        self.inode.i_last_cno = raw_inode.i_last_cno;
+        self.inode.set_last_ondisk_cno(raw_inode.i_last_cno);
+        self.inode.set_ondisk_state(inode_state);
+        self.cache.set_size(self.inode.size());
+
+        // 3. discard in-memory dirty / cached data
+        self.cache.clear_dirty();
+        self.cache.clear_data_blocks_cache();
+
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -808,7 +883,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 debug!("truncate - no bmap and data changed, update file attr only");
             }
             drop(permit);
-            self.flush().await?;
+            if let Err(e) = self.flush().await {
+                let _ = self.rollback_from_persisted().await;
+                return Err(e);
+            }
             return Ok(());
         }
 
@@ -820,7 +898,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             self.inode.update_mtime();
             debug!("truncate - extend file size with no bmap change, update file attr only");
             drop(permit);
-            self.flush().await?;
+            if let Err(e) = self.flush().await {
+                let _ = self.rollback_from_persisted().await;
+                return Err(e);
+            }
             return Ok(());
         }
 
@@ -830,19 +911,28 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // if need to shrink bmap
         if let Err(e) = self.bmap.truncate(&tgt_blk_idx).await {
             if e.kind() != ErrorKind::NotFound {
+                // bmap.truncate may have partially mutated the in-memory tree
+                // even when returning error. Roll back to persisted state.
+                let _ = self.rollback_from_persisted().await;
                 return Err(e);
             }
             // NotFound is fine, let's continue
         }
         if new_size > 0 {
             let tgt_blk_idx = tgt_blk_idx - 1;
-            let _ = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await?;
+            if let Err(e) = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await {
+                let _ = self.rollback_from_persisted().await;
+                return Err(e);
+            }
         }
         self.inode.set_size(new_size);
         self.cache.set_size(new_size);
         self.inode.update_mtime();
         drop(permit);
-        self.flush().await?;
+        if let Err(e) = self.flush().await {
+            let _ = self.rollback_from_persisted().await;
+            return Err(e);
+        }
         Ok(())
     }
 
