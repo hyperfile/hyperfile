@@ -319,4 +319,244 @@ mod tests {
     fn segment_block_entry_size() {
         assert_eq!(std::mem::size_of::<SegmentBlockEntryRaw>(), 16);
     }
+
+    #[test]
+    fn segment_block_entry_round_trip() {
+        let entry = SegmentBlockEntryRaw { e_blkidx: 0xDEAD_BEEF_CAFE_BABE, e_blkptr: 0x1234_5678_9ABC_DEF0 };
+        let mut buf = [0u8; 16];
+        entry.write_to(&mut buf);
+        let decoded = SegmentBlockEntryRaw::read_from(&buf);
+        assert_eq!(decoded.e_blkidx, entry.e_blkidx);
+        assert_eq!(decoded.e_blkptr, entry.e_blkptr);
+    }
+
+    #[test]
+    fn segment_block_entry_round_trip_zero() {
+        let entry = SegmentBlockEntryRaw::new();
+        let mut buf = [0u8; 16];
+        entry.write_to(&mut buf);
+        let decoded = SegmentBlockEntryRaw::read_from(&buf);
+        assert_eq!(decoded.e_blkidx, 0);
+        assert_eq!(decoded.e_blkptr, 0);
+    }
+
+    #[test]
+    fn segment_block_entry_write_accepts_oversized_buf() {
+        let entry = SegmentBlockEntryRaw { e_blkidx: 7, e_blkptr: 42 };
+        let mut buf = [0u8; 32]; // bigger than 16 is fine
+        entry.write_to(&mut buf);
+        assert_eq!(&buf[16..], &[0u8; 16]); // tail untouched
+    }
+
+    #[test]
+    #[should_panic(expected = "SegmentBlockEntryRaw::write_to buf len")]
+    fn segment_block_entry_write_panics_on_short_buf() {
+        let entry = SegmentBlockEntryRaw::new();
+        let mut buf = [0u8; 10];
+        entry.write_to(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "SegmentBlockEntryRaw::read_from buf len")]
+    fn segment_block_entry_read_panics_on_short_buf() {
+        SegmentBlockEntryRaw::read_from(&[0u8; 10]);
+    }
+
+    // --- SegmentHeader write_to / read_from ---
+
+    #[test]
+    fn segment_header_write_read_round_trip() {
+        let mut hdr = SegmentHeader::new();
+        hdr.s_cno = 42;
+        hdr.s_ino = 7;
+        hdr.s_nmetablk = 3;
+        hdr.s_ndatablk = 5;
+        hdr.s_meta_blk_shift = 12;
+        hdr.s_data_blk_shift = 12;
+        hdr.s_next = 100;
+        hdr.s_bytes = 4096;
+        hdr.s_chksum = 0xABCDu32;
+        hdr.s_flags = 0x42;
+        hdr.s_inode.i_ino = 77;
+        hdr.s_inode.i_size = 8192;
+
+        let mut buf = vec![0u8; SegmentHeader::size()];
+        hdr.write_to(&mut buf);
+        let decoded = SegmentHeader::read_from(&buf);
+
+        assert_eq!(decoded.s_cno, 42);
+        assert_eq!(decoded.s_ino, 7);
+        assert_eq!(decoded.s_nmetablk, 3);
+        assert_eq!(decoded.s_ndatablk, 5);
+        assert_eq!(decoded.s_next, 100);
+        assert_eq!(decoded.s_bytes, 4096);
+        assert_eq!(decoded.s_chksum, 0xABCDu32);
+        assert_eq!(decoded.s_flags, 0x42);
+        assert_eq!(decoded.s_magic, hdr.s_magic);
+        assert_eq!(decoded.s_inode.i_ino, 77);
+        assert_eq!(decoded.s_inode.i_size, 8192);
+    }
+
+    #[test]
+    fn segment_header_read_accepts_oversized_buf() {
+        let hdr = SegmentHeader::new();
+        let mut buf = vec![0u8; SegmentHeader::size() * 2];
+        hdr.write_to(&mut buf);
+        // read_from should still work on the oversized buffer by reading
+        // only the first `size()` bytes.
+        let decoded = SegmentHeader::read_from(&buf);
+        assert_eq!(decoded.s_magic, hdr.s_magic);
+    }
+
+    #[test]
+    #[should_panic(expected = "SegmentHeader::write_to buf len")]
+    fn segment_header_write_panics_on_short_buf() {
+        let hdr = SegmentHeader::new();
+        let mut buf = vec![0u8; SegmentHeader::size() - 1];
+        hdr.write_to(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "SegmentHeader::read_from buf len")]
+    fn segment_header_read_panics_on_short_buf() {
+        let buf = vec![0u8; 10];
+        SegmentHeader::read_from(&buf);
+    }
+
+    // --- Layout stability tests ---
+    //
+    // These tests pin down the on-disk byte layout so that accidental
+    // field reordering or type changes are caught at test time rather
+    // than producing unreadable segments in production.
+
+    #[test]
+    fn segment_header_size_is_208_no_padding() {
+        // Sum of explicit field sizes:
+        //   4 (s_magic) + 4 (s_chksum) + 4 (s_bytes) + 2 (s_flags)
+        //   + 1 (s_meta_blk_shift) + 1 (s_data_blk_shift) + 8 (s_next)
+        //   + 160 (s_inode: InodeRaw) + 8 (s_ino) + 8 (s_cno)
+        //   + 4 (s_nmetablk) + 4 (s_ndatablk)
+        //   + 0 (s_blocks: [_; 0])
+        // = 208
+        let fields_sum: usize = 4 + 4 + 4 + 2 + 1 + 1 + 8 + 160 + 8 + 8 + 4 + 4;
+        assert_eq!(
+            std::mem::size_of::<SegmentHeader>(),
+            fields_sum,
+            "SegmentHeader has padding — on-disk format may be unstable"
+        );
+        assert_eq!(std::mem::size_of::<SegmentHeader>(), 208);
+        assert_eq!(std::mem::align_of::<SegmentHeader>(), 8);
+    }
+
+    #[test]
+    fn segment_block_entry_byte_layout() {
+        // Field offsets on disk must be stable:
+        //   bytes 0..8:  e_blkidx (u64, native endian)
+        //   bytes 8..16: e_blkptr (u64, native endian)
+        let entry = SegmentBlockEntryRaw {
+            e_blkidx: 0x0102_0304_0506_0708,
+            e_blkptr: 0x1122_3344_5566_7788,
+        };
+        let mut buf = [0u8; 16];
+        entry.write_to(&mut buf);
+        assert_eq!(&buf[0..8], &0x0102_0304_0506_0708u64.to_ne_bytes());
+        assert_eq!(&buf[8..16], &0x1122_3344_5566_7788u64.to_ne_bytes());
+    }
+
+    #[test]
+    fn segment_block_entry_preserves_high_bits() {
+        // BlockPtr encodes staging/location bits in the high part of the
+        // u64 (bit 62 = staging flag, bits 32-61 = segid). We must not
+        // silently truncate or re-order those bits.
+        let entry = SegmentBlockEntryRaw {
+            e_blkidx: u64::MAX,
+            e_blkptr: 0xC000_0000_1234_5678, // top 2 bits set + offset
+        };
+        let mut buf = [0u8; 16];
+        entry.write_to(&mut buf);
+        let decoded = SegmentBlockEntryRaw::read_from(&buf);
+        assert_eq!(decoded.e_blkidx, u64::MAX);
+        assert_eq!(decoded.e_blkptr, 0xC000_0000_1234_5678);
+    }
+
+    #[test]
+    fn segment_header_byte_layout_key_offsets() {
+        // Verify key field offsets in the serialized layout. This doubles
+        // as a change-detector: if anyone reorders fields, this test will
+        // fail and point at the exact offset that shifted.
+        let mut hdr = SegmentHeader::new();
+        hdr.s_magic = 0x4847_4647; // "GFGH" backwards
+        hdr.s_chksum = 0xDEAD_BEEF;
+        hdr.s_bytes = 0x1234_5678;
+        hdr.s_flags = 0xABCD;
+        hdr.s_meta_blk_shift = 0x13;
+        hdr.s_data_blk_shift = 0x14;
+        hdr.s_next = 0x7777_7777_7777_7777;
+
+        let mut buf = vec![0u8; SegmentHeader::size()];
+        hdr.write_to(&mut buf);
+
+        // Offsets follow #[repr(C)] layout with 8-byte alignment.
+        assert_eq!(&buf[0..4], &0x4847_4647u32.to_ne_bytes(), "s_magic");
+        assert_eq!(&buf[4..8], &0xDEAD_BEEFu32.to_ne_bytes(), "s_chksum");
+        assert_eq!(&buf[8..12], &0x1234_5678u32.to_ne_bytes(), "s_bytes");
+        assert_eq!(&buf[12..14], &0xABCDu16.to_ne_bytes(), "s_flags");
+        assert_eq!(buf[14], 0x13, "s_meta_blk_shift");
+        assert_eq!(buf[15], 0x14, "s_data_blk_shift");
+        assert_eq!(&buf[16..24], &0x7777_7777_7777_7777u64.to_ne_bytes(), "s_next");
+        // s_inode starts at offset 24 (160 bytes)
+        // s_ino at offset 184, s_cno at 192, s_nmetablk at 200, s_ndatablk at 204
+    }
+
+    #[test]
+    fn segment_header_inode_fields_round_trip() {
+        // The nested InodeRaw takes 160 bytes inside SegmentHeader. Verify
+        // that all its important fields survive the serialize/deserialize cycle.
+        let mut hdr = SegmentHeader::new();
+        hdr.s_inode.i_ino = 99;
+        hdr.s_inode.i_size = 1_048_576;
+        hdr.s_inode.i_blocks = 2048;
+        hdr.s_inode.i_uid = 1001;
+        hdr.s_inode.i_gid = 1002;
+        hdr.s_inode.i_mode = libc::S_IFREG | 0o644;
+        hdr.s_inode.i_nlink = 3;
+        hdr.s_inode.i_last_seq = 42;
+        hdr.s_inode.i_last_cno = 42;
+        hdr.s_inode.i_bmap[0] = 0xAA;
+        hdr.s_inode.i_bmap[55] = 0xBB; // last byte of bmap
+
+        let mut buf = vec![0u8; SegmentHeader::size()];
+        hdr.write_to(&mut buf);
+        let decoded = SegmentHeader::read_from(&buf);
+
+        assert_eq!(decoded.s_inode.i_ino, 99);
+        assert_eq!(decoded.s_inode.i_size, 1_048_576);
+        assert_eq!(decoded.s_inode.i_blocks, 2048);
+        assert_eq!(decoded.s_inode.i_uid, 1001);
+        assert_eq!(decoded.s_inode.i_gid, 1002);
+        assert_eq!(decoded.s_inode.i_mode, libc::S_IFREG | 0o644);
+        assert_eq!(decoded.s_inode.i_nlink, 3);
+        assert_eq!(decoded.s_inode.i_last_seq, 42);
+        assert_eq!(decoded.s_inode.i_last_cno, 42);
+        assert_eq!(decoded.s_inode.i_bmap[0], 0xAA);
+        assert_eq!(decoded.s_inode.i_bmap[55], 0xBB);
+    }
+
+    #[test]
+    fn segment_header_write_is_idempotent() {
+        // Two consecutive write_to calls on the same header must produce
+        // byte-identical output. This validates that padding (if any) is
+        // deterministic, since a checksum computed over `buf` must be stable.
+        let mut hdr = SegmentHeader::new();
+        hdr.s_cno = 7;
+        hdr.s_ino = 3;
+        hdr.s_bytes = 4096;
+        hdr.s_inode.i_size = 1234;
+
+        let mut buf1 = vec![0u8; SegmentHeader::size()];
+        let mut buf2 = vec![0u8; SegmentHeader::size()];
+        hdr.write_to(&mut buf1);
+        hdr.write_to(&mut buf2);
+        assert_eq!(buf1, buf2, "write_to is not byte-identical on repeat");
+    }
 }

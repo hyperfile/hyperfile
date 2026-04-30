@@ -420,6 +420,99 @@ mod tests {
     }
 
     #[test]
+    fn segment_sum_write_to_oversized_buf() {
+        // Over-sized buffer is fine — only the needed prefix bytes are written.
+        let ndatablk = 2;
+        let mut ss = make_segment_sum(ndatablk);
+        let inode = InodeRaw::default();
+        let ss_bytes = ss.update(0, &inode);
+
+        let mut buf = vec![0xFFu8; ss_bytes * 2]; // bigger than needed
+        ss.write_to(&mut buf);
+
+        // Tail beyond ss_bytes must remain untouched (still 0xFF).
+        assert!(buf[ss_bytes..].iter().all(|&b| b == 0xFF));
+
+        // Prefix must decode correctly.
+        let restored = SegmentSum::from_slice(&buf[..ss_bytes]);
+        assert_eq!(restored.blocks.len(), ndatablk);
+    }
+
+    #[test]
+    #[should_panic(expected = "too small")]
+    fn segment_sum_write_to_too_small_for_entries() {
+        // Buffer big enough for header but not entries — must panic BEFORE
+        // any bytes are written. Prevents the partial-write bug the old
+        // implementation had.
+        let ndatablk = 3;
+        let mut ss = make_segment_sum(ndatablk);
+        let inode = InodeRaw::default();
+        let _ = ss.update(0, &inode);
+
+        let hdrsz = std::mem::size_of::<SegmentHeader>();
+        let mut buf = vec![0u8; hdrsz]; // exactly header size, no room for entries
+        ss.write_to(&mut buf);
+    }
+
+    #[test]
+    fn segment_sum_many_blocks_crossing_4kib() {
+        // SegmentHeader is 208 bytes. With 16-byte entries, (4096 - 208) / 16 = 242
+        // entries fit within the first 4 KiB. Use 500 entries so the serialized
+        // SegmentSum spans multiple 4 KiB pages and exercises the offset math.
+        let ndatablk = 500;
+        let mut ss = make_segment_sum(ndatablk);
+        let inode = InodeRaw::default();
+        let ss_bytes = ss.update(0, &inode);
+        assert!(ss_bytes > 4096, "test should span multiple 4KiB pages");
+
+        let mut buf = vec![0u8; ss_bytes];
+        ss.write_to(&mut buf);
+
+        let restored = SegmentSum::from_slice(&buf);
+        assert_eq!(restored.blocks.len(), ndatablk);
+        for i in 0..ndatablk {
+            assert_eq!(restored.blocks[i].blkidx, i as u64);
+            assert_eq!(restored.blocks[i].blkptr, 0x4000_0001_0000_0000 + i as u64);
+        }
+    }
+
+    #[test]
+    fn segment_sum_write_is_idempotent() {
+        // Two consecutive write_to calls must produce byte-identical output.
+        // This is essential for any future checksum computation.
+        let ndatablk = 10;
+        let mut ss = make_segment_sum(ndatablk);
+        let inode = InodeRaw::default();
+        let ss_bytes = ss.update(0xCAFE, &inode);
+
+        let mut buf1 = vec![0u8; ss_bytes];
+        let mut buf2 = vec![0u8; ss_bytes];
+        ss.write_to(&mut buf1);
+        ss.write_to(&mut buf2);
+        assert_eq!(buf1, buf2, "SegmentSum::write_to is not byte-identical on repeat");
+    }
+
+    #[test]
+    fn segment_sum_round_trip_reserialize_matches() {
+        // write -> read -> write should produce byte-identical output to
+        // the original write. This verifies the serialization is truly
+        // reversible without any lossy conversions.
+        let ndatablk = 5;
+        let mut ss = make_segment_sum(ndatablk);
+        let inode = InodeRaw::default();
+        let ss_bytes = ss.update(0xBEEF, &inode);
+
+        let mut buf1 = vec![0u8; ss_bytes];
+        ss.write_to(&mut buf1);
+
+        let ss2 = SegmentSum::from_slice(&buf1);
+        let mut buf2 = vec![0u8; ss_bytes];
+        ss2.write_to(&mut buf2);
+
+        assert_eq!(buf1, buf2, "round-trip write-read-write mismatch");
+    }
+
+    #[test]
     fn segid_to_staging_file_id_format() {
         assert_eq!(Segment::segid_to_staging_file_id(1), "0000000001");
         assert_eq!(Segment::segid_to_staging_file_id(9999999999), "9999999999");
