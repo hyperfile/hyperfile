@@ -333,6 +333,41 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             }
         }
 
+        // NOTE: the wait loop below is a CPU-bound busy-wait, not
+        // an async wait. It keeps the caller's runtime pinned on
+        // one core while the spawn_blocking workers make progress
+        // on the blocking pool. That's tolerable on a multi-threaded
+        // runtime (other workers remain free), and happens to work
+        // on the reactor's current-thread runtime only because we
+        // spawn onto the blocking pool (decoupled from the runtime's
+        // worker).
+        //
+        // Known limitation: a panic inside the spawn_blocking
+        // closure is silently swallowed. `is_finished()` returns
+        // true for both "completed" and "panicked" handles, and we
+        // drop the JoinHandle without calling `.await` or inspecting
+        // its JoinError. For the current workload (memcpy into a
+        // pre-sized buffer) a panic shouldn't happen, but this is
+        // load-bearing only by accident.
+        //
+        // Replace with `tokio::task::JoinSet` when any of the
+        // following becomes true:
+        //   - panics in the copy closure need to surface as flush
+        //     errors (today they're swallowed);
+        //   - flush latency matters and the spinning core becomes a
+        //     measurable cost;
+        //   - we move the flush path to a single-threaded runtime
+        //     with no blocking pool.
+        //
+        // Sketch of the replacement:
+        //   let mut set = JoinSet::new();
+        //   for chunk in data_blocks.chunks(chunk_size) {
+        //       set.spawn_blocking(move || { /* copy */ });
+        //   }
+        //   while let Some(res) = set.join_next().await {
+        //       res.map_err(|e| /* JoinError -> our Error */)?;
+        //   }
+
         // wait all spawn append completed
         while let Some(res) = joins.pop() {
             let join = res?;
