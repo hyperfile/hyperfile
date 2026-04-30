@@ -23,6 +23,7 @@ use aws_sdk_s3::Client;
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
 use hyperfile::file::mode::FileMode;
+use hyperfile::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use hyperfile::inode::FlushInodeFlag;
 use hyperfile::staging::StagingIntercept;
 use hyperfile::staging::s3::S3Staging;
@@ -1412,6 +1413,245 @@ async fn contract_flush_does_not_retry_on_other_error() {
     println!(
         "[no_retry_on_other] flush={:?} interceptor_calls={}",
         flush_res, interceptor.call_count()
+    );
+
+    tf.cleanup(&client).await;
+}
+
+// --------------------------------------------------------------------
+// Rollback correctness tests for the remaining write variants
+// --------------------------------------------------------------------
+//
+// rollback_from_persisted is wired into write/write_zero/truncate/
+// write_aligned_batch/write_batch, but integration tests only exercised
+// write and truncate so far. The three tests below close the gap.
+
+/// fs_write_zero extends the file with a sparse region of zeros. With a
+/// single transient flush_inode failure, the operation must return Err
+/// and leave the persisted file unchanged.
+#[tokio::test]
+#[ignore]
+async fn rollback_correctness_write_zero_single_flush_fails() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let original_size = 4096usize;
+    let payload: Vec<u8> = (0..original_size).map(|i| (i & 0xFF) as u8).collect();
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Fail only the first flush_inode; if rollback works, the zero-fill
+    // extension must not be visible after reopen.
+    //
+    // Note: fs_write_zero returns Ok for the buffered write; the actual
+    // flush happens later. We call fs_flush explicitly so the injected
+    // failure surfaces at a well-defined point.
+    let interceptor = FailOnFlushInode::at(1);
+    let (write_zero_result, flush_result) = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await
+            .expect("open");
+        hyper.with_staging_interceptor(interceptor.clone());
+        // Extend from 4 KiB to 12 KiB with zeros.
+        let wr = hyper.fs_write_zero(original_size, 8192).await;
+        let fr = hyper.fs_flush().await;
+        let _rel = hyper.fs_release().await;
+        (wr, fr)
+    };
+
+    // write_zero itself may return Ok (data buffered); flush must fail.
+    assert!(
+        flush_result.is_err(),
+        "expected flush after write_zero to fail, got wr={:?} flush={:?}",
+        write_zero_result, flush_result,
+    );
+    println!(
+        "[correctness_write_zero] write_zero={:?} flush={:?} calls={}",
+        write_zero_result,
+        flush_result,
+        interceptor.call_count(),
+    );
+
+    // Reopen, verify size and original bytes.
+    let (persisted_size, body_ok) = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        let size = hyper.fs_getattr().expect("getattr").st_size as usize;
+        let mut buf = vec![0u8; original_size];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+        (size, buf == payload)
+    };
+
+    assert_eq!(
+        persisted_size, original_size,
+        "write_zero silently committed: expected size {}, got {}",
+        original_size, persisted_size,
+    );
+    assert!(body_ok, "original bytes corrupted after failed write_zero");
+
+    tf.cleanup(&client).await;
+}
+
+/// fs_write_aligned_batch writes a mix of data and zero blocks at 4 KiB
+/// alignment. A single flush_inode failure must leave the file empty.
+#[tokio::test]
+#[ignore]
+async fn rollback_correctness_write_aligned_batch_single_flush_fails() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Start from an empty persisted file.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let interceptor = FailOnFlushInode::at(1);
+    let (batch_result, flush_result) = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await
+            .expect("open");
+        hyper.with_staging_interceptor(interceptor.clone());
+
+        // Three 4 KiB blocks: data, zero, data. Exercises both code paths.
+        let block0 = AlignedDataBlockWrapper::new(0, 4096, false);
+        block0.as_mut_slice().fill(0xAA);
+        let block1 = AlignedDataBlockWrapper::new(1, 4096, true); // zero
+        let block2 = AlignedDataBlockWrapper::new(2, 4096, false);
+        block2.as_mut_slice().fill(0xCC);
+        let blocks = vec![block0, block1, block2];
+
+        let br = hyper.fs_write_aligned_batch(blocks).await;
+        let fr = hyper.fs_flush().await;
+        let _rel = hyper.fs_release().await;
+        (br, fr)
+    };
+
+    assert!(
+        flush_result.is_err(),
+        "expected flush after write_aligned_batch to fail, got batch={:?} flush={:?}",
+        batch_result, flush_result,
+    );
+    println!(
+        "[correctness_aligned_batch] batch={:?} flush={:?} calls={}",
+        batch_result,
+        flush_result,
+        interceptor.call_count(),
+    );
+
+    // Reopen, file must still be empty.
+    let persisted_size = {
+        let hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        hyper.fs_getattr().expect("getattr").st_size as usize
+    };
+    assert_eq!(
+        persisted_size, 0,
+        "write_aligned_batch silently committed: expected 0, got {}",
+        persisted_size,
+    );
+
+    tf.cleanup(&client).await;
+}
+
+/// fs_write_batch with a partial block over an existing file. A single
+/// flush_inode failure must leave the original data unchanged, and the
+/// size must not shift.
+#[tokio::test]
+#[ignore]
+async fn rollback_correctness_write_batch_single_flush_fails() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let original_size = 4096usize;
+    let payload: Vec<u8> = (0..original_size).map(|i| (i & 0xFF) as u8).collect();
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let interceptor = FailOnFlushInode::at(1);
+    let (batch_result, flush_result) = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await
+            .expect("open");
+        hyper.with_staging_interceptor(interceptor.clone());
+
+        // Partial block: block 0, offset 100, len 200 — overwrites 200
+        // bytes in the middle of the already-persisted block.
+        let part = BatchDataBlockWrapper::new_partial_block(
+            0, 4096, 100, 200, false,
+        );
+        part.as_mut_slice().fill(0xFF);
+        let blocks = vec![part];
+
+        let br = hyper.fs_write_batch(blocks).await;
+        let fr = hyper.fs_flush().await;
+        let _rel = hyper.fs_release().await;
+        (br, fr)
+    };
+
+    assert!(
+        flush_result.is_err(),
+        "expected flush after write_batch to fail, got batch={:?} flush={:?}",
+        batch_result, flush_result,
+    );
+    println!(
+        "[correctness_batch] batch={:?} flush={:?} calls={}",
+        batch_result,
+        flush_result,
+        interceptor.call_count(),
+    );
+
+    // Reopen, verify size and bytes intact.
+    let (persisted_size, body_ok) = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        let size = hyper.fs_getattr().expect("getattr").st_size as usize;
+        let mut buf = vec![0u8; original_size];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+        (size, buf == payload)
+    };
+
+    assert_eq!(
+        persisted_size, original_size,
+        "write_batch silently changed size: expected {}, got {}",
+        original_size, persisted_size,
+    );
+    assert!(
+        body_ok,
+        "write_batch silently modified original bytes",
     );
 
     tf.cleanup(&client).await;
