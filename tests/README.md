@@ -7,19 +7,26 @@ they exercise and what dependencies they require.
 
 ```
 tests/
-├── README.md                          ← this file
+├── README.md                                ← this file
 ├── common/
-│   └── mod.rs                         ← shared fixtures and interceptors
-├── integration_s3_smoke.rs            ← happy-path create/write/read/truncate
-├── integration_s3_rollback.rs         ← rollback (exposure + correctness)
-├── integration_s3_contract.rs         ← flush contract (invariant) tests
-└── integration_s3_concurrent.rs       ← multi-instance concurrency
+│   └── mod.rs                               ← direct-API fixtures, interceptors
+├── common_reactor/
+│   └── mod.rs                               ← reactor spawner helper
+├── integration_s3_smoke.rs                  ← happy-path create/write/read/truncate
+├── integration_s3_rollback.rs               ← rollback (exposure + correctness)
+├── integration_s3_contract.rs               ← flush contract (invariant) tests
+├── integration_s3_concurrent.rs             ← multi-instance concurrency
+├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
+├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
+├── integration_reactor_s3_wal.rs            ← reactor + wal
+└── integration_reactor_s3_all_features.rs   ← reactor + wal + range-lock
 ```
 
-`common/mod.rs` is not itself a test binary. It is consumed by each
-`integration_s3_*.rs` file via `mod common; use common::*;`. Cargo
-compiles each integration_s3_*.rs as its own test binary; `common/mod.rs`
-is shared source among them.
+`common/mod.rs` and `common_reactor/mod.rs` are not themselves test
+binaries. They are consumed by each `integration_*_s3_*.rs` file via
+`mod common; use common::*;` (and optionally `mod common_reactor; use
+common_reactor::*;`). Cargo compiles each integration_*_s3_*.rs as its
+own test binary; the common modules are shared source among them.
 
 ## Test categories
 
@@ -180,6 +187,108 @@ Multi-instance concurrency:
 See `docs/concurrency.md` for the full behavior model.
 
 Runs in ~27 s.
+
+### `integration_reactor_s3_smoke`
+
+Reactor-mode smoke (`HyperFileHandler` and `HyperFileTokio`). Same
+shape as `integration_s3_smoke` but each test uses a `LocalSpawner`
+and goes through the request/response channel. Covers read, write,
+truncate extend/shrink, flush, getattr, setattr, as well as the
+tokio `AsyncRead`/`AsyncWrite`/`AsyncSeek` surface.
+
+Feature requirement: `reactor` (default).
+
+Runs in ~1 s.
+
+### `integration_reactor_s3_range_lock`
+
+Multi-task concurrency on a **single** file handle (via
+`HyperFileHandler::clone`). Validates that under `range-lock` the
+reactor serializes overlapping byte ranges and lets disjoint ranges
+proceed in parallel, and that flush waits for in-flight writes.
+
+Feature requirement: `reactor` + `range-lock`.
+
+Run with:
+```bash
+cargo test --features range-lock --test integration_reactor_s3_range_lock \
+    -- --ignored --test-threads=1
+```
+
+### `integration_reactor_s3_wal`
+
+Smokes the WAL path: create + write + flush + reopen round trip with
+`HyperFileWalConfig` pointing at a sibling `<uri>/wal/` prefix. Also
+verifies that reopen after a second flush does not observe stale WAL
+state.
+
+Feature requirement: `reactor` + `wal`.
+
+**Note**: tests use `#[tokio::test(flavor = "multi_thread")]` because
+`S3Wal::from_uri` calls `tokio::task::block_in_place`, which is not
+valid on a current-thread runtime.
+
+Run with:
+```bash
+cargo test --features wal --test integration_reactor_s3_wal \
+    -- --ignored --test-threads=1
+```
+
+### `integration_reactor_s3_all_features`
+
+Maximum-feature smoke: reactor + wal + range-lock enabled together.
+Covers the most complex feature combination that still works reliably
+with the reactor's current-thread runtime.
+
+Feature requirement: `reactor` + `wal` + `range-lock`.
+
+**Known gap**: enabling `concurrent-segment-build` on top of `wal`
+causes a deadlock in the reactor's current-thread runtime because
+`flush_process_build_segment` busy-polls `JoinHandle::is_finished()`
+without yielding. The segment-build path needs to be await-ified
+before a full-feature variant can be added.
+
+Run with:
+```bash
+cargo test --features "wal range-lock" \
+    --test integration_reactor_s3_all_features \
+    -- --ignored --test-threads=1
+```
+
+## Feature matrix
+
+The reactor suites exercise different feature combinations. When
+iterating on a feature flag, run only the relevant suite:
+
+| Feature combination | Suite |
+| --- | --- |
+| `reactor` only (default) | `integration_reactor_s3_smoke` |
+| `reactor` + `range-lock` | `integration_reactor_s3_range_lock` |
+| `reactor` + `wal` | `integration_reactor_s3_wal` |
+| `reactor` + `wal` + `range-lock` | `integration_reactor_s3_all_features` |
+| `reactor` + `concurrent-segment-build` | ― (not yet covered; see gap note) |
+
+To validate a release candidate, run every combination once:
+
+```bash
+# default
+cargo test --test integration_reactor_s3_smoke -- --ignored --test-threads=1
+
+# + range-lock
+cargo test --features range-lock --test integration_reactor_s3_range_lock \
+    -- --ignored --test-threads=1
+
+# + wal
+cargo test --features wal --test integration_reactor_s3_wal \
+    -- --ignored --test-threads=1
+
+# + both
+cargo test --features "wal range-lock" \
+    --test integration_reactor_s3_all_features \
+    -- --ignored --test-threads=1
+```
+
+Plus all the direct-API suites (`integration_s3_*`).
 
 ## Adding a new interceptor
 
