@@ -301,24 +301,18 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         // write out root node to staging file
         let _start = Instant::now();
-        file_off = 0;
         for n in &dirty_meta_vec {
-            let node_size = n.size();
             let _ = segwr.append(n.as_slice())?;
-            file_off += node_size;
         }
         #[cfg(not(feature = "concurrent-segment-build"))]
         for (_, n) in dirty_data_blocks.data().iter() {
-            let block_size = n.size();
             let _ = segwr.append(n.as_slice())?;
-            file_off += block_size;
         }
         #[cfg(feature = "concurrent-segment-build")]
         {
 
         const TARGET_CHUNKS: usize = 50;
         let mut joins = Vec::new();
-        let block_size = self.config().meta.data_block_size;
         let data_blocks = dirty_data_blocks.data()
                         .into_iter()
                         .map(|(_, block)| block)
@@ -339,10 +333,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         }
         // spawn chunks
         for chunk in chunks {
-            let chunk_count = chunk.len();
             let j = segwr.spawn_append(chunk);
             joins.push(j);
-            file_off += block_size * chunk_count;
         }
 
         // wait all spawn append completed
@@ -617,16 +609,11 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         // write out root node to staging file
         let _start = Instant::now();
-        file_off = 0;
         for n in &dirty_meta_vec {
-            let node_size = n.size();
             let _ = segwr.append(n.as_slice())?;
-            file_off += node_size;
         }
         for (_, n) in dirty_data_blocks.data().iter() {
-            let block_size = n.size();
             let _ = segwr.append(n.as_slice())?;
-            file_off += block_size;
         }
         let _ = _start.elapsed();
 
