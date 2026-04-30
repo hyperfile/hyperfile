@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::alloc::GlobalAlloc;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::BlockIndex;
 use crate::utils;
 
@@ -125,7 +126,7 @@ const DATA_BLOCK_FLAG_SHOULD_CACHE: u64 = 0x4;
 pub struct DataBlock {
     data: AlignedDataBlock,
     index: BlockIndex,
-    flags: u64,
+    flags: AtomicU64,
 }
 
 impl DataBlock {
@@ -137,7 +138,7 @@ impl DataBlock {
         Self {
             data: AlignedDataBlock::Alloc(Box::pin(AllocDataBlock::new(size))),
             index: index,
-            flags: 0,
+            flags: AtomicU64::new(0),
         }
     }
 
@@ -145,7 +146,7 @@ impl DataBlock {
         Self {
             data: AlignedDataBlock::Mmap(MmapDataBlock::new(ptr, size)),
             index: index,
-            flags: 0,
+            flags: AtomicU64::new(0),
         }
     }
 
@@ -154,7 +155,7 @@ impl DataBlock {
         let n = Self {
             data: AlignedDataBlock::Alloc(Box::pin(AllocDataBlock::new(self.size()))),
             index: self.index(),
-            flags: self.flags,
+            flags: AtomicU64::new(self.flags.load(Ordering::Relaxed)),
         };
         self.copy_out(0, n.as_mut_slice());
         n
@@ -226,51 +227,35 @@ impl DataBlock {
     }
 
     pub fn set_dirty(&self) {
-        let flags = self.flags | DATA_BLOCK_FLAG_DIRTY;
-        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
-        unsafe {
-            std::ptr::write_volatile(ptr, flags);
-        }
+        self.flags.fetch_or(DATA_BLOCK_FLAG_DIRTY, Ordering::Release);
     }
 
     pub fn clear_dirty(&self) {
-        let flags = self.flags & !DATA_BLOCK_FLAG_DIRTY;
-        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
-        unsafe {
-            std::ptr::write_volatile(ptr, flags);
-        }
+        self.flags.fetch_and(!DATA_BLOCK_FLAG_DIRTY, Ordering::Release);
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.flags & DATA_BLOCK_FLAG_DIRTY == DATA_BLOCK_FLAG_DIRTY
+        self.flags.load(Ordering::Acquire) & DATA_BLOCK_FLAG_DIRTY != 0
     }
 
     pub fn set_locked(&self) {
-        let flags = self.flags | DATA_BLOCK_FLAG_MMAP_LOCKED;
-        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
-        unsafe {
-            std::ptr::write_volatile(ptr, flags);
-        }
+        self.flags.fetch_or(DATA_BLOCK_FLAG_MMAP_LOCKED, Ordering::Release);
     }
 
     pub fn clear_locked(&self) {
-        let flags = self.flags & !DATA_BLOCK_FLAG_MMAP_LOCKED;
-        let ptr = std::ptr::addr_of!(self.flags) as *mut u64;
-        unsafe {
-            std::ptr::write_volatile(ptr, flags);
-        }
+        self.flags.fetch_and(!DATA_BLOCK_FLAG_MMAP_LOCKED, Ordering::Release);
     }
 
     pub fn is_locked(&self) -> bool {
-        self.flags & DATA_BLOCK_FLAG_MMAP_LOCKED == DATA_BLOCK_FLAG_MMAP_LOCKED
+        self.flags.load(Ordering::Acquire) & DATA_BLOCK_FLAG_MMAP_LOCKED != 0
     }
 
-    pub fn set_should_cache(&mut self) {
-        self.flags |= DATA_BLOCK_FLAG_SHOULD_CACHE;
+    pub fn set_should_cache(&self) {
+        self.flags.fetch_or(DATA_BLOCK_FLAG_SHOULD_CACHE, Ordering::Release);
     }
 
     pub fn is_should_cache(&self) -> bool {
-        self.flags & DATA_BLOCK_FLAG_SHOULD_CACHE == DATA_BLOCK_FLAG_SHOULD_CACHE
+        self.flags.load(Ordering::Acquire) & DATA_BLOCK_FLAG_SHOULD_CACHE != 0
     }
 
     pub fn lock(&self) {
@@ -620,7 +605,7 @@ mod tests {
 
     #[test]
     fn data_block_should_cache_flag() {
-        let mut blk = DataBlock::new(0, 4096);
+        let blk = DataBlock::new(0, 4096);
         assert!(!blk.is_should_cache());
         blk.set_should_cache();
         assert!(blk.is_should_cache());

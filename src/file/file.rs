@@ -889,7 +889,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
                     debug!("retrive block ptr {} for block index {}", self.blk_ptr_decode_display(&blk_ptr), blk_idx);
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     let buf = block.as_mut_slice();
                     if !BlockPtrFormat::is_zero_block(&blk_ptr) {
@@ -902,7 +902,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     output.push(block);
                 },
@@ -1075,7 +1075,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         for blk_idx in v_need_retrieve {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
@@ -1086,7 +1086,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     if e.kind() != ErrorKind::NotFound {
                         return Err(e);
                     }
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     fetched.push(block);
                 },

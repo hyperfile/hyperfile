@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn clear_dirty_moves_should_cache_to_lru() {
         let mut cache = new_cache();
-        let mut blk = DataBlock::new(0, 4096);
+        let blk = DataBlock::new(0, 4096);
         blk.set_should_cache();
         cache.insert(0, blk);
         assert_eq!(cache.dirty_count(), 1);
@@ -373,7 +373,7 @@ mod tests {
     fn contains_promotes_from_cache_to_dirty() {
         let mut cache = new_cache();
         // put block in LRU cache via clear_dirty path
-        let mut blk = DataBlock::new(0, 4096);
+        let blk = DataBlock::new(0, 4096);
         blk.set_should_cache();
         cache.insert(0, blk);
         cache.clear_dirty();
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn get_mut_promotes_from_cache_to_dirty() {
         let mut cache = new_cache();
-        let mut blk = DataBlock::new(0, 4096);
+        let blk = DataBlock::new(0, 4096);
         blk.set_should_cache();
         cache.insert(0, blk);
         cache.clear_dirty();
@@ -415,7 +415,7 @@ mod tests {
         let mut cache = MemCache::new(2, 4096); // only 2 LRU slots
         // fill LRU via clear_dirty
         for i in 0..3 {
-            let mut blk = DataBlock::new(i, 4096);
+            let blk = DataBlock::new(i, 4096);
             blk.set_should_cache();
             cache.insert(i, blk);
         }
@@ -443,7 +443,7 @@ mod tests {
         cache.set_unlimited();
         // should be able to insert many without eviction
         for i in 0..100 {
-            let mut blk = DataBlock::new(i, 4096);
+            let blk = DataBlock::new(i, 4096);
             blk.set_should_cache();
             cache.insert(i, blk);
         }

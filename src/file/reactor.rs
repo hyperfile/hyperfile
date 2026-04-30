@@ -536,7 +536,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
@@ -548,7 +548,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     fetched.push(block);
                 },
@@ -582,7 +582,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         for blk_idx in list {
             match self.bmap.lookup(&blk_idx).await {
                 Ok(blk_ptr) => {
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     let buf = block.as_mut_slice();
                     let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
@@ -594,7 +594,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         return Err(e);
                     }
                     debug!("block index {} not found in bmap, prepare a new block", blk_idx);
-                    let mut block = self.cache.new_block(blk_idx);
+                    let block = self.cache.new_block(blk_idx);
                     block.set_should_cache();
                     fetched.push(block);
                 },
