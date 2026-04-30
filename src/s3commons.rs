@@ -123,9 +123,13 @@ impl S3Ops {
             Err(sdk_err) => {
                 if let Some(resp) = sdk_err.raw_response() {
                     if resp.status().as_u16() == 412 {
-                        let err_str = format!("Conditional DeleteObject failed on s3://{}/{}, status: {}", bucket, key, resp.status().as_u16());
+                        // OCC conflict: another writer modified the object
+                        // between our read and our delete. Surfaced as
+                        // AlreadyExists so the flush retry loop can
+                        // distinguish it from generic ResourceBusy.
+                        let err_str = format!("Conditional DeleteObject failed on s3://{}/{}, status: 412 (concurrent modification)", bucket, key);
                         warn!("{}", err_str);
-                        return Err(Error::new(ErrorKind::ResourceBusy, err_str));
+                        return Err(Error::new(ErrorKind::AlreadyExists, err_str));
                     }
                 }
                 let mut err_str = format!("DeleteObject s3://{}/{} error: ", bucket, key);
@@ -221,9 +225,14 @@ impl S3Ops {
                 if let Some(resp) = sdk_err.raw_response() {
                     match resp.status().as_u16() {
                         412 | 409 => {
-                            let err_str = format!("Conditional PutObject failed on s3://{}/{}, status: {}", bucket, key, resp.status().as_u16());
+                            // OCC conflict: another writer committed to the
+                            // same key (412 = If-Match failed, 409 = bucket
+                            // state conflict). Surfaced as AlreadyExists so
+                            // the flush retry loop can apply FlushConflictPolicy
+                            // (RetryLastWriterWins vs FailFast).
+                            let err_str = format!("Conditional PutObject failed on s3://{}/{}, status: {} (concurrent modification)", bucket, key, resp.status().as_u16());
                             warn!("{}", err_str);
-                            return Err(Error::new(ErrorKind::ResourceBusy, err_str));
+                            return Err(Error::new(ErrorKind::AlreadyExists, err_str));
                         },
                         _ => {},
                     }
@@ -343,10 +352,12 @@ impl S3Ops {
                 if let Some(resp) = sdk_err.raw_response() {
                     match resp.status().as_u16() {
                         412 | 409 => {
-                            let err_str = format!("Conditional CompleteMultipartUpload failed on s3://{}/{}, status: {}",
+                            // OCC conflict on the final multipart commit.
+                            // Same semantics as do_put_object's conflict branch.
+                            let err_str = format!("Conditional CompleteMultipartUpload failed on s3://{}/{}, status: {} (concurrent modification)",
                                 bucket, key, resp.status().as_u16());
                             warn!("{}", err_str);
-                            return Err(Error::new(ErrorKind::ResourceBusy, err_str));
+                            return Err(Error::new(ErrorKind::AlreadyExists, err_str));
                         },
                         _ => {},
                     }
