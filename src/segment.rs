@@ -78,36 +78,28 @@ impl SegmentSum {
         if bufsz < hdrsz {
             panic!("failed to create segment sum from buf, buf len {} < hdr size {}, it's too small", bufsz, hdrsz);
         }
-        // intermediate object for header
-        let hdr: SegmentHeader = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        let hdr_u8_slice = unsafe {
-            std::slice::from_raw_parts_mut(
-                std::ptr::addr_of!(hdr) as *mut SegmentHeader as *mut u8,
-                hdrsz
-            )
-        };
-        // split input buffer at header size
-        let (buf_hdr_slice, buf_remain) = buf.split_at(hdrsz);
-        hdr_u8_slice.copy_from_slice(buf_hdr_slice);
+        // 1. decode header.
+        let hdr = SegmentHeader::read_from(&buf[..hdrsz]);
 
         let ndatablk = hdr.s_ndatablk as usize;
-        if bufsz < hdrsz + ndatablk * SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE {
+        let need = hdrsz + ndatablk * SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE;
+        if bufsz < need {
             panic!("failed to create segment sum from buf, buf len {} < hdr size {} + num of blk idx {}, it's too small", bufsz, hdrsz, ndatablk);
         }
-        // split remain input buffer at block index array boundary
-        let (buf_blocks, _) = buf_remain.split_at(ndatablk * SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE);
-        // build block index list
-        let blocks_raw = unsafe {
-            std::slice::from_raw_parts(buf_blocks.as_ptr() as *const SegmentBlockEntryRaw, ndatablk)
-        };
-        // raw to in memory struct conversion
-        let blocks: Vec<SegmentBlockDesc> = blocks_raw.into_iter()
-                        .map(|e| SegmentBlockDesc { blkidx: e.e_blkidx, blkptr: e.e_blkptr })
-                        .collect();
-        Self {
-            hdr: hdr,
-            blocks: Vec::from(blocks),
+
+        // 2. decode each entry field-by-field.
+        let mut blocks: Vec<SegmentBlockDesc> = Vec::with_capacity(ndatablk);
+        let mut off = hdrsz;
+        for _ in 0..ndatablk {
+            let raw = SegmentBlockEntryRaw::read_from(&buf[off..off + SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE]);
+            blocks.push(SegmentBlockDesc {
+                blkidx: raw.e_blkidx,
+                blkptr: raw.e_blkptr,
+            });
+            off += SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE;
         }
+
+        Self { hdr, blocks }
     }
 
     // write ss in segment header raw format into segment output buffer
@@ -115,29 +107,30 @@ impl SegmentSum {
         let hdrsz = SEGMENT_SUMMARY_HEADER_SIZE;
         let bufsz = buf.len();
         if bufsz < hdrsz {
-            panic!("failed to write segment sum to buf, buf len {} < hdr size {}, it's too small", buf.len(), hdrsz);
+            panic!("failed to write segment sum to buf, buf len {} < hdr size {}, it's too small", bufsz, hdrsz);
         }
-        let hdr_u8_slice = unsafe {
-            std::slice::from_raw_parts(
-                std::ptr::addr_of!(self.hdr) as *const SegmentHeader as *const u8,
-                hdrsz
-            )
-        };
-
-        let (buf_hdr_slice, buf_remain) = buf.split_at_mut(hdrsz);
-        buf_hdr_slice.copy_from_slice(hdr_u8_slice);
 
         let ndatablk = self.hdr.s_ndatablk as usize;
-        if bufsz < hdrsz + ndatablk * SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE {
+        let need = hdrsz + ndatablk * SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE;
+        if bufsz < need {
             panic!("failed to write segment sum to buf, buf len {} < hdr size {} + num of blk idx {}, it's too small", bufsz, hdrsz, ndatablk);
         }
 
-        let blocks_slice = unsafe {
-            std::mem::transmute::<&mut [u8], &mut [SegmentBlockEntryRaw]>(buf_remain)
-        };
-        for (i, entry) in self.blocks.iter().enumerate() {
-            blocks_slice[i].e_blkidx = entry.blkidx;
-            blocks_slice[i].e_blkptr = entry.blkptr.into();
+        // 1. write header (first hdrsz bytes).
+        self.hdr.write_to(&mut buf[..hdrsz]);
+
+        // 2. write entries one by one, field-by-field. Note: we iterate
+        //    over `self.blocks` (`Vec<SegmentBlockDesc>`), which is the
+        //    in-memory representation; on-disk `SegmentBlockEntryRaw` is
+        //    written directly from `blkidx` / `blkptr`.
+        let mut off = hdrsz;
+        for entry in self.blocks.iter() {
+            let raw = SegmentBlockEntryRaw {
+                e_blkidx: entry.blkidx,
+                e_blkptr: entry.blkptr,
+            };
+            raw.write_to(&mut buf[off..off + SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE]);
+            off += SEGMENT_SUMMARY_BLOCK_ENTRY_SIZE;
         }
     }
 

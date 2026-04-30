@@ -90,6 +90,35 @@ impl SegmentBlockEntryRaw {
     pub(crate) fn new() -> Self {
         Self { e_blkidx: 0, e_blkptr: 0 }
     }
+
+    /// Serialize this entry into a 16-byte buffer using native endian.
+    /// Panics if `buf.len() < 16`.
+    ///
+    /// The on-disk format matches the memory layout of the
+    /// `#[repr(C, align(8))]` struct (two `u64` fields in sequence).
+    pub(crate) fn write_to(&self, buf: &mut [u8]) {
+        const SIZE: usize = std::mem::size_of::<SegmentBlockEntryRaw>();
+        assert!(buf.len() >= SIZE,
+            "SegmentBlockEntryRaw::write_to buf len {} < {}", buf.len(), SIZE);
+        buf[0..8].copy_from_slice(&self.e_blkidx.to_ne_bytes());
+        buf[8..16].copy_from_slice(&self.e_blkptr.to_ne_bytes());
+    }
+
+    /// Deserialize a 16-byte buffer into an entry.
+    /// Panics if `buf.len() < 16`.
+    pub(crate) fn read_from(buf: &[u8]) -> Self {
+        const SIZE: usize = std::mem::size_of::<SegmentBlockEntryRaw>();
+        assert!(buf.len() >= SIZE,
+            "SegmentBlockEntryRaw::read_from buf len {} < {}", buf.len(), SIZE);
+        let mut idx_bytes = [0u8; 8];
+        let mut ptr_bytes = [0u8; 8];
+        idx_bytes.copy_from_slice(&buf[0..8]);
+        ptr_bytes.copy_from_slice(&buf[8..16]);
+        Self {
+            e_blkidx: u64::from_ne_bytes(idx_bytes),
+            e_blkptr: u64::from_ne_bytes(ptr_bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,18 +170,7 @@ impl SegmentHeader {
         if bufsz != hdrsz {
             panic!("failed to segment header from buf, buf len {} != hdr size {}", bufsz, hdrsz);
         }
-        // intermediate object for header
-        let hdr: SegmentHeader = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        let hdr_u8_slice = unsafe {
-            std::slice::from_raw_parts_mut(
-                std::ptr::addr_of!(hdr) as *mut SegmentHeader as *mut u8,
-                hdrsz
-            )
-        };
-        // split input buffer at header size
-        let (buf_hdr_slice, _buf_remain) = buf.split_at(hdrsz);
-        hdr_u8_slice.copy_from_slice(buf_hdr_slice);
-        hdr
+        Self::read_from(buf)
     }
 
     #[inline]
@@ -164,6 +182,58 @@ impl SegmentHeader {
     #[inline]
     pub fn aligned_ss_bytes(&self) -> usize {
         (self.s_bytes as usize + 4096 - 1) >> 12 << 12
+    }
+
+    /// Serialize this header to a byte buffer. The on-disk layout matches
+    /// the memory representation of this `#[repr(C, align(8))]` struct
+    /// (including the `s_inode: InodeRaw` nested struct).
+    ///
+    /// Panics if `buf.len()` is smaller than `SegmentHeader::size()`.
+    pub fn write_to(&self, buf: &mut [u8]) {
+        let sz = Self::size();
+        assert!(buf.len() >= sz,
+            "SegmentHeader::write_to buf len {} < {}", buf.len(), sz);
+        // SAFETY: `self` is a fully initialized `#[repr(C)]` value with
+        // `Copy` semantics. Reading its bytes through a `*const u8` read
+        // does not observe any non-`Copy` state. Padding bytes in the
+        // struct may have indeterminate values but are still legal to
+        // read as `u8` (reading uninit bytes as `u8` is defined behavior
+        // since Rust 1.75).
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!(*self) as *const u8,
+                sz,
+            )
+        };
+        buf[..sz].copy_from_slice(src);
+    }
+
+    /// Deserialize a header from a byte buffer. The buffer may be larger
+    /// than `SegmentHeader::size()`; only the first `size()` bytes are read.
+    /// Panics if `buf.len()` is smaller than `SegmentHeader::size()`.
+    pub fn read_from(buf: &[u8]) -> Self {
+        let sz = Self::size();
+        assert!(buf.len() >= sz,
+            "SegmentHeader::read_from buf len {} < {}", buf.len(), sz);
+        // SAFETY: `SegmentHeader` is `#[repr(C, align(8))]` and contains
+        // only `Pod`-like fields (ints and another `#[repr(C)]` struct of
+        // the same shape). Zero-initialized memory is a valid bit pattern
+        // for every field. The subsequent `copy_from_slice` overwrites
+        // every byte before any field is read.
+        let mut hdr: SegmentHeader = unsafe {
+            std::mem::MaybeUninit::zeroed().assume_init()
+        };
+        // SAFETY: `hdr` is a local value we own; writing to its backing
+        // bytes does not alias anything. `sz` bytes equals the struct size,
+        // so the write stays within the struct.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(
+                std::ptr::addr_of_mut!(hdr) as *mut u8,
+                sz,
+            )
+        };
+        dst.copy_from_slice(&buf[..sz]);
+        hdr
     }
 }
 
