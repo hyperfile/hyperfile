@@ -1,0 +1,318 @@
+//! Reactor-mode smoke integration tests.
+//!
+//! Exercises the two reactor APIs built on top of `Hyper`:
+//!
+//!  - `HyperFileHandler` (fh.rs) — direct Handler-style API where the
+//!    caller explicitly owns a `LocalSpawner`.
+//!  - `HyperFileTokio` (tokio_wrapper.rs) — higher-level wrapper that
+//!    spawns its own spawner and exposes tokio AsyncRead / AsyncWrite /
+//!    AsyncSeek. Each method goes through a request/response round
+//!    trip with the internal handler loop.
+//!
+//! Both APIs should behave functionally equivalent to the direct
+//! `Hyper::fs_*` API; these tests are here to catch regressions in the
+//! request serialization, channel plumbing, and spawner lifecycle.
+//!
+//! Runs under default features (reactor + meta_loader_batch) only —
+//! additional feature combinations are covered by separate binaries.
+//!
+//! ```bash
+//! cargo test --test integration_reactor_s3_smoke -- --ignored --test-threads=1
+//! ```
+
+#![cfg(feature = "reactor")]
+
+#[allow(dead_code)]
+mod common;
+#[allow(dead_code)]
+mod common_reactor;
+
+use std::io::SeekFrom;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use common::*;
+use common_reactor::*;
+
+use hyperfile::file::fh::HyperFileHandler;
+use hyperfile::file::tokio_wrapper::HyperFileTokio;
+use hyperfile::file::flags::FileFlags;
+use hyperfile::file::mode::FileMode;
+
+// ---------------------------------------------------------------------
+// HyperFileHandler (fh_*) tests — 1 spawner per test, explicit control
+// ---------------------------------------------------------------------
+
+/// Handler: create → write → release → reopen → read round-trip.
+#[tokio::test]
+#[ignore]
+async fn reactor_handler_write_read_round_trip() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let spawner = make_spawner();
+    let payload: Vec<u8> = (0u8..=127u8).collect();
+
+    // Create + write + release.
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("fh create");
+        let n = fh.fh_write(0, &payload).await.expect("fh_write");
+        assert_eq!(n, payload.len());
+        let _ = fh.fh_release().await.expect("fh_release");
+    }
+
+    // Reopen read-only, verify.
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &spawner, &client, tf.uri(), FileFlags::rdonly(),
+        )
+        .await
+        .expect("fh open");
+        let stat = fh.fh_getattr().await.expect("fh_getattr");
+        assert_eq!(stat.st_size as usize, payload.len());
+
+        let mut buf = vec![0u8; payload.len()];
+        let n = fh.fh_read(0, &mut buf).await.expect("fh_read");
+        assert_eq!(n, payload.len());
+        assert_eq!(buf, payload);
+        let _ = fh.fh_release().await;
+    }
+
+    drop(spawner);
+    tf.cleanup(&client).await;
+}
+
+/// Handler: truncate to extend preserves data, fills zeros.
+#[tokio::test]
+#[ignore]
+async fn reactor_handler_truncate_extend() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let spawner = make_spawner();
+    let payload: Vec<u8> = (0..1024u16).map(|v| (v & 0xFF) as u8).collect();
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = fh.fh_write(0, &payload).await.expect("write");
+        let _ = fh.fh_release().await;
+    }
+
+    let new_size = 8 * 1024;
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &spawner, &client, tf.uri(), FileFlags::rdwr(),
+        )
+        .await
+        .expect("open");
+        fh.fh_truncate(new_size).await.expect("truncate extend");
+        let _ = fh.fh_release().await;
+    }
+
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &spawner, &client, tf.uri(), FileFlags::rdonly(),
+        )
+        .await
+        .expect("open");
+        let stat = fh.fh_getattr().await.expect("getattr");
+        assert_eq!(stat.st_size as usize, new_size);
+
+        let mut buf = vec![0u8; new_size];
+        let _ = fh.fh_read(0, &mut buf).await.expect("read");
+        assert_eq!(&buf[..payload.len()], &payload[..]);
+        assert!(buf[payload.len()..].iter().all(|&b| b == 0));
+        let _ = fh.fh_release().await;
+    }
+
+    drop(spawner);
+    tf.cleanup(&client).await;
+}
+
+/// Handler: truncate to shrink preserves the prefix, drops the tail.
+#[tokio::test]
+#[ignore]
+async fn reactor_handler_truncate_shrink() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let spawner = make_spawner();
+    let payload: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = fh.fh_write(0, &payload).await.expect("write");
+        let _ = fh.fh_release().await;
+    }
+
+    let new_size = 5000;
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &spawner, &client, tf.uri(), FileFlags::rdwr(),
+        )
+        .await
+        .expect("open");
+        fh.fh_truncate(new_size).await.expect("truncate shrink");
+        let _ = fh.fh_release().await;
+    }
+
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &spawner, &client, tf.uri(), FileFlags::rdonly(),
+        )
+        .await
+        .expect("open");
+        let stat = fh.fh_getattr().await.expect("getattr");
+        assert_eq!(stat.st_size as usize, new_size);
+
+        let mut buf = vec![0u8; new_size];
+        let _ = fh.fh_read(0, &mut buf).await.expect("read");
+        assert_eq!(&buf[..], &payload[..new_size]);
+        let _ = fh.fh_release().await;
+    }
+
+    drop(spawner);
+    tf.cleanup(&client).await;
+}
+
+/// Handler: explicit fh_flush after write returns a monotonic segid.
+#[tokio::test]
+#[ignore]
+async fn reactor_handler_flush_returns_cno() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let spawner = make_spawner();
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    )
+    .await
+    .expect("create");
+
+    let _ = fh.fh_write(0, &[0xAAu8; 4096]).await.expect("write");
+    let cno1 = fh.fh_flush().await.expect("first flush");
+
+    let _ = fh.fh_write(0, &[0xBBu8; 4096]).await.expect("write 2");
+    let cno2 = fh.fh_flush().await.expect("second flush");
+
+    // Each flush that persists dirty state must advance the checkpoint.
+    assert!(cno2 > cno1, "cno did not advance: {} -> {}", cno1, cno2);
+
+    let _ = fh.fh_release().await;
+    drop(spawner);
+    tf.cleanup(&client).await;
+}
+
+/// Handler: getattr and setattr round-trip.
+#[tokio::test]
+#[ignore]
+async fn reactor_handler_getattr_setattr() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let spawner = make_spawner();
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    )
+    .await
+    .expect("create");
+
+    let stat1 = fh.fh_getattr().await.expect("getattr");
+    assert!(stat1.st_mode & libc::S_IFREG != 0);
+
+    // Mutate uid/gid via setattr.
+    let mut stat2 = stat1;
+    stat2.st_uid = 7777;
+    stat2.st_gid = 8888;
+    let out = fh.fh_setattr(stat2).await.expect("setattr");
+    assert_eq!(out.st_uid, 7777);
+    assert_eq!(out.st_gid, 8888);
+
+    let _ = fh.fh_release().await;
+    drop(spawner);
+    tf.cleanup(&client).await;
+}
+
+// ---------------------------------------------------------------------
+// HyperFileTokio tests — AsyncRead / AsyncWrite / AsyncSeek surface
+// ---------------------------------------------------------------------
+
+/// Tokio: write → seek → read verifies the tokio AsyncRead/Write/Seek
+/// surface wraps the reactor correctly.
+#[tokio::test]
+#[ignore]
+async fn reactor_tokio_read_write_seek_round_trip() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let payload = b"hello reactor tokio world";
+    {
+        let mut file = HyperFileTokio::open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+
+        // AsyncWrite::write
+        let n = file.write(payload).await.expect("write");
+        assert_eq!(n, payload.len());
+
+        file.flush().await.expect("flush");
+        file.shutdown().await.expect("shutdown");
+    }
+
+    {
+        let mut file = HyperFileTokio::open(
+            &client, tf.uri(), FileFlags::rdonly(),
+        )
+        .await
+        .expect("open");
+
+        // Seek past the beginning, then read the tail.
+        file.seek(SeekFrom::Start(6)).await.expect("seek");
+        let mut buf = vec![0u8; payload.len() - 6];
+        file.read_exact(&mut buf).await.expect("read_exact");
+        assert_eq!(buf, &payload[6..]);
+
+        file.shutdown().await.expect("shutdown");
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// Tokio: flush returns Ok on an empty buffered state (no dirty data).
+#[tokio::test]
+#[ignore]
+async fn reactor_tokio_flush_shutdown_empty() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    {
+        let mut file = HyperFileTokio::open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        file.flush().await.expect("flush on empty file");
+        file.shutdown().await.expect("shutdown");
+    }
+
+    tf.cleanup(&client).await;
+}
