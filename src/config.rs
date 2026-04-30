@@ -110,6 +110,39 @@ pub struct HyperFileRuntimeConfig {
     pub data_cache_dirty_max_flush_interval: u64,
     // bmap node cache
     pub node_cache_blocks: usize,
+    /// How to resolve flush conflicts when another writer has modified
+    /// the same file between our read and our write. See
+    /// `FlushConflictPolicy` for details.
+    #[serde(default)]
+    pub flush_conflict_policy: FlushConflictPolicy,
+}
+
+/// Policy that controls how `flush` handles a concurrent modification
+/// detected at the storage layer (S3 PutObject returns 412 Precondition
+/// Failed because another writer committed since we read the ETag).
+///
+/// Default is `RetryLastWriterWins` to preserve the pre-existing
+/// single-writer / relaxed behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+pub enum FlushConflictPolicy {
+    /// Retry on conflict by refreshing local state from the persisted
+    /// inode and re-flushing. In a multi-writer scenario this means the
+    /// later writer silently overwrites the earlier writer's change.
+    /// Convenient for single-writer workloads; NOT safe if your workload
+    /// cannot tolerate silent overwrites.
+    RetryLastWriterWins,
+
+    /// Return `std::io::ErrorKind::AlreadyExists` on the first conflict
+    /// without retrying. The caller decides whether to re-read, merge,
+    /// or abort. Use this for workflows that need explicit conflict
+    /// detection (e.g. ensuring no lost updates).
+    FailFast,
+}
+
+impl Default for FlushConflictPolicy {
+    fn default() -> Self {
+        Self::RetryLastWriterWins
+    }
 }
 
 impl Default for HyperFileRuntimeConfig {
@@ -125,6 +158,7 @@ impl Default for HyperFileRuntimeConfig {
             data_cache_dirty_max_blocks_threshold: DEFAULT_MAX_DIRTY_DATA_BLOCKS_THRESHOLD,
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
             node_cache_blocks: DEFAULT_NODE_CACHE_BLOCKS,
+            flush_conflict_policy: FlushConflictPolicy::default(),
         }
     }
 }
@@ -142,6 +176,7 @@ impl HyperFileRuntimeConfig {
             data_cache_dirty_max_blocks_threshold: DEFAULT_LARGE_MAX_DIRTY_DATA_BLOCKS_THRESHOLD,
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
             node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
+            flush_conflict_policy: FlushConflictPolicy::default(),
         }
     }
 
@@ -157,6 +192,7 @@ impl HyperFileRuntimeConfig {
             data_cache_dirty_max_blocks_threshold: DEFAULT_MIDDLE_MAX_DIRTY_DATA_BLOCKS_THRESHOLD,
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
             node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
+            flush_conflict_policy: FlushConflictPolicy::default(),
         }
     }
 }
