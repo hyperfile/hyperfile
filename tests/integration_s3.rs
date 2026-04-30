@@ -24,6 +24,7 @@ use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
 use hyperfile::file::mode::FileMode;
 use hyperfile::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
+use hyperfile::config::{FlushConflictPolicy, HyperFileRuntimeConfig};
 use hyperfile::inode::FlushInodeFlag;
 use hyperfile::staging::StagingIntercept;
 use hyperfile::staging::s3::S3Staging;
@@ -1972,6 +1973,111 @@ async fn concurrent_writer_a_fails_writer_b_succeeds() {
         buf.iter().all(|&b| b == 0xBB),
         "persisted bytes do not match writer B's data (first={:#x}, last={:#x})",
         buf[0], buf[2047],
+    );
+
+    tf.cleanup(&client).await;
+}
+
+/// Same scenario as `concurrent_two_writers_optimistic_cc` but both
+/// writers are configured with `FlushConflictPolicy::FailFast`. In this
+/// mode the later writer must NOT silently overwrite the earlier one —
+/// exactly one writer succeeds, the other observes
+/// `ErrorKind::AlreadyExists` and does not retry.
+#[tokio::test]
+#[ignore]
+async fn concurrent_two_writers_fail_fast_policy() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Seed empty file.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let runtime_cfg = HyperFileRuntimeConfig {
+        flush_conflict_policy: FlushConflictPolicy::FailFast,
+        ..HyperFileRuntimeConfig::default()
+    };
+
+    let uri = tf.uri().to_string();
+    let client_a = client.clone();
+    let client_b = client.clone();
+    let uri_a = uri.clone();
+    let uri_b = uri.clone();
+    let cfg_a = runtime_cfg.clone();
+    let cfg_b = runtime_cfg.clone();
+
+    let writer_a = async move {
+        let mut hyper = Hyper::fs_open_opt(&client_a, &uri_a, FileFlags::rdwr(), &cfg_a)
+            .await
+            .expect("open A");
+        let data = vec![0xAAu8; 4096];
+        let _ = hyper.fs_write(0, &data).await.expect("write A");
+        let flush = hyper.fs_flush().await;
+        let _ = hyper.fs_release().await;
+        flush
+    };
+
+    let writer_b = async move {
+        let mut hyper = Hyper::fs_open_opt(&client_b, &uri_b, FileFlags::rdwr(), &cfg_b)
+            .await
+            .expect("open B");
+        let data = vec![0xBBu8; 4096];
+        let _ = hyper.fs_write(0, &data).await.expect("write B");
+        let flush = hyper.fs_flush().await;
+        let _ = hyper.fs_release().await;
+        flush
+    };
+
+    let (a_flush, b_flush) = tokio::join!(writer_a, writer_b);
+    println!(
+        "[fail_fast_policy] A flush={:?} B flush={:?}",
+        a_flush, b_flush
+    );
+
+    // Exactly one must be Ok; the other must be AlreadyExists.
+    let a_ok = a_flush.is_ok();
+    let b_ok = b_flush.is_ok();
+    assert!(
+        a_ok ^ b_ok,
+        "expected exactly one writer to succeed under FailFast, got A={:?} B={:?}",
+        a_flush, b_flush,
+    );
+
+    // The failing side must report AlreadyExists specifically, not a
+    // generic ResourceBusy or Other.
+    let failed = if a_ok { b_flush } else { a_flush };
+    let err = failed.as_ref().err().expect("failing writer should have error");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::AlreadyExists,
+        "failing writer's error kind should be AlreadyExists under FailFast, got {:?}",
+        err,
+    );
+
+    // Persisted content must match the winning writer (homogeneous bytes).
+    let mut buf = vec![0u8; 4096];
+    let mut hyper = Hyper::fs_open(&client, &uri, FileFlags::rdonly())
+        .await
+        .expect("reopen");
+    let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+    let _ = hyper.fs_release().await;
+
+    let all_aa = buf.iter().all(|&b| b == 0xAA);
+    let all_bb = buf.iter().all(|&b| b == 0xBB);
+    assert!(
+        all_aa || all_bb,
+        "persisted content is a mix of A and B (first={:#x} last={:#x})",
+        buf[0], buf[4095],
     );
 
     tf.cleanup(&client).await;
