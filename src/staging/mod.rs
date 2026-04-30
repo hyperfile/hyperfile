@@ -6,6 +6,14 @@ use crate::staging::config::StagingConfig;
 use crate::inode::{OnDiskState, FlushInodeFlag};
 
 pub trait StagingIntercept<Staging>: Send + Sync {
+    /// Called before `flush_inode` writes the inode to storage.
+    ///
+    /// Returning `Err(_)` causes `flush_inode` itself to fail with that error,
+    /// which is useful for fault-injection tests. Default is no-op.
+    fn before_flush_inode(&self, staging: &Staging, payload: &[u8], flag: FlushInodeFlag) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + '_ + Send>> {
+        let _ = (staging, payload, flag);
+        Box::pin(async { Ok(()) })
+    }
     fn after_flush_inode(&self, staging: &Staging, payload: &[u8], flag: FlushInodeFlag) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + '_ + Send>>;
     fn after_remove_inode(&self, staging: &Staging) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + '_ + Send>>;
 }

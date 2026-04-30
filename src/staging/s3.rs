@@ -123,6 +123,9 @@ impl Staging<S3BlockLoader> for S3Staging {
     }
 
     async fn flush_inode(&self, buf: &[u8], inode_state: &Option<OnDiskState>, flag: FlushInodeFlag) -> Result<Option<OnDiskState>> {
+        if let Some(i) = &self.interceptor {
+            let _ = i.before_flush_inode(&self, buf, flag.clone()).await?;
+        }
         let inode_state = S3Ops::do_put_object(&self.client, &self.bucket, &self.inode_file, buf, inode_state).await?;
         if let Some(i) = &self.interceptor {
             let _ = i.after_flush_inode(&self, buf, flag).await;
