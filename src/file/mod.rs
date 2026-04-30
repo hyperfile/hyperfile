@@ -653,6 +653,9 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     }}
 
     fn flush(&mut self) -> impl Future<Output = Result<SegmentId>> {async {
+        use crate::config::FlushConflictPolicy;
+        let policy = self.config().runtime.flush_conflict_policy;
+
         let mut retries = 0;
         let mut backoff = DEFAULT_FLUSH_BACKOFF_SECS;
         while retries < DEFAULT_FLUSH_RETRIES {
@@ -663,11 +666,29 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
                     return Ok(segid);
                 },
                 Err(err) => {
-                    if err.kind() != ErrorKind::ResourceBusy {
+                    let kind = err.kind();
+
+                    // AlreadyExists signals an OCC conflict from the storage
+                    // layer (S3 412/409). Behavior is policy-controlled.
+                    if kind == ErrorKind::AlreadyExists {
+                        match policy {
+                            FlushConflictPolicy::FailFast => {
+                                // Do not retry: surface the conflict to the
+                                // caller so it can re-read state and decide.
+                                self.flush_unlock(lock);
+                                return Err(err);
+                            },
+                            FlushConflictPolicy::RetryLastWriterWins => {
+                                // Fall through to the retry path below.
+                                warn!("{err}");
+                            },
+                        }
+                    } else if kind != ErrorKind::ResourceBusy {
                         self.flush_unlock(lock);
                         return Err(err);
+                    } else {
+                        warn!("{err}");
                     }
-                    warn!("{err}");
                 },
             }
             self.flush_unlock(lock);
