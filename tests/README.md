@@ -70,10 +70,19 @@ partial-flush recovery, and MPU semantics.
 
 ### Configuration (environment variables)
 
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `HYPERFILE_TEST_BUCKET` | `<your-bucket>` | Name of the bucket to write to. |
-| `HYPERFILE_TEST_REGION` | `<your-region>` | AWS region for the client. |
+Both variables are **required** — the integration suites panic with a
+clear message if either is unset, because picking a default bucket
+in library code would either silently hit someone else's account or
+hard-code a specific environment's identifier into the repository.
+
+| Variable | Notes |
+| --- | --- |
+| `HYPERFILE_TEST_BUCKET` | Name of the S3 bucket to write to. Must be an S3 general-purpose bucket or S3 Express One Zone directory bucket you own. |
+| `HYPERFILE_TEST_REGION` | AWS region of the bucket. |
+
+The tests use the AWS SDK's default credential provider chain
+(env vars → `~/.aws/credentials` → IMDS → SSO). The identity in
+use must have `s3:*` on the configured bucket.
 
 ### Running all integration suites
 

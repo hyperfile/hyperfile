@@ -24,15 +24,23 @@ use hyperfile::staging::StagingIntercept;
 use hyperfile::staging::s3::S3Staging;
 use hyperfile::SegmentId;
 
-pub const DEFAULT_BUCKET: &str = "<your-bucket>";
-pub const DEFAULT_REGION: &str = "<your-region>";
-
 pub fn test_bucket() -> String {
-    std::env::var("HYPERFILE_TEST_BUCKET").unwrap_or_else(|_| DEFAULT_BUCKET.to_string())
+    std::env::var("HYPERFILE_TEST_BUCKET").unwrap_or_else(|_| {
+        panic!(
+            "HYPERFILE_TEST_BUCKET is not set. Integration tests require an \
+             S3 bucket you own; set HYPERFILE_TEST_BUCKET and \
+             HYPERFILE_TEST_REGION before running `cargo test -- --ignored`."
+        )
+    })
 }
 
 pub fn test_region() -> String {
-    std::env::var("HYPERFILE_TEST_REGION").unwrap_or_else(|_| DEFAULT_REGION.to_string())
+    std::env::var("HYPERFILE_TEST_REGION").unwrap_or_else(|_| {
+        panic!(
+            "HYPERFILE_TEST_REGION is not set. Integration tests require the \
+             AWS region of the bucket named by HYPERFILE_TEST_BUCKET."
+        )
+    })
 }
 
 /// Build an S3 client configured for the test region.
