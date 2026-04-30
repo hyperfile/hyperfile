@@ -84,3 +84,130 @@ impl RangeLock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK: u64 = 4096;
+
+    #[test]
+    fn new_lock_is_unlocked() {
+        let lock = RangeLock::new(BLOCK);
+        assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn lock_then_unlock() {
+        let mut lock = RangeLock::new(BLOCK);
+        assert!(lock.try_lock(0..BLOCK));
+        assert!(lock.is_locked());
+        lock.try_unlock(0..BLOCK);
+        assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn overlapping_lock_fails() {
+        let lock = RangeLock::new(BLOCK);
+        assert!(lock.try_lock(0..BLOCK));
+        // Exact same range must fail.
+        assert!(!lock.try_lock(0..BLOCK));
+    }
+
+    #[test]
+    fn partial_overlap_fails() {
+        let lock = RangeLock::new(BLOCK);
+        // Lock [0, 2*BLOCK).
+        assert!(lock.try_lock(0..2 * BLOCK));
+        // [BLOCK, 3*BLOCK) overlaps second half of the existing lock.
+        assert!(!lock.try_lock(BLOCK..3 * BLOCK));
+    }
+
+    #[test]
+    fn disjoint_ranges_both_succeed() {
+        let lock = RangeLock::new(BLOCK);
+        assert!(lock.try_lock(0..BLOCK));
+        // [2*BLOCK, 3*BLOCK) is strictly above, not overlapping.
+        assert!(lock.try_lock(2 * BLOCK..3 * BLOCK));
+    }
+
+    #[test]
+    fn abutting_ranges_both_succeed() {
+        let lock = RangeLock::new(BLOCK);
+        // End of first == start of second; half-open ranges do not overlap.
+        assert!(lock.try_lock(0..BLOCK));
+        assert!(lock.try_lock(BLOCK..2 * BLOCK));
+    }
+
+    #[test]
+    fn unlock_allows_relock() {
+        let mut lock = RangeLock::new(BLOCK);
+        assert!(lock.try_lock(0..BLOCK));
+        assert!(!lock.try_lock(0..BLOCK));
+        lock.try_unlock(0..BLOCK);
+        assert!(lock.try_lock(0..BLOCK));
+    }
+
+    #[test]
+    fn aligned_range_rounds_out() {
+        let lock = RangeLock::new(BLOCK);
+        // Unaligned [100, 200) should expand to [0, BLOCK).
+        let expanded = lock.aligned_range(&(100..200));
+        assert_eq!(expanded, 0..BLOCK);
+
+        // [0, BLOCK-1) should expand to [0, BLOCK).
+        let expanded = lock.aligned_range(&(0..(BLOCK - 1)));
+        assert_eq!(expanded, 0..BLOCK);
+
+        // Cross-block [BLOCK-1, BLOCK+1) should expand to [0, 2*BLOCK).
+        let expanded = lock.aligned_range(&((BLOCK - 1)..(BLOCK + 1)));
+        assert_eq!(expanded, 0..2 * BLOCK);
+
+        // Already aligned range stays the same.
+        let expanded = lock.aligned_range(&(BLOCK..3 * BLOCK));
+        assert_eq!(expanded, BLOCK..3 * BLOCK);
+    }
+
+    #[test]
+    fn lock_unaligned_conflicts_with_aligned() {
+        let lock = RangeLock::new(BLOCK);
+        // Locking [100, 200) aligns to [0, BLOCK).
+        assert!(lock.try_lock(100..200));
+        // Another lock fully inside that aligned span must fail.
+        assert!(!lock.try_lock(300..400));
+        // But a range in the next aligned block succeeds.
+        assert!(lock.try_lock((BLOCK + 100)..(BLOCK + 200)));
+    }
+
+    #[test]
+    fn unlock_nonexistent_range_is_noop() {
+        let mut lock = RangeLock::new(BLOCK);
+        // Unlocking a range that was never locked should not panic or
+        // interfere with subsequent locks.
+        lock.try_unlock(0..BLOCK);
+        assert!(!lock.is_locked());
+        assert!(lock.try_lock(0..BLOCK));
+    }
+
+    #[tokio::test]
+    async fn async_unlock_also_releases() {
+        let mut lock = RangeLock::new(BLOCK);
+        assert!(lock.try_lock(0..BLOCK));
+        lock.unlock(0..BLOCK).await;
+        assert!(!lock.is_locked());
+        assert!(lock.try_lock(0..BLOCK));
+    }
+
+    #[test]
+    fn is_locked_reflects_state_across_clones() {
+        // Clone shares the same inner Mutex/RangeMap.
+        let lock = RangeLock::new(BLOCK);
+        let clone = lock.clone();
+        assert!(!lock.is_locked());
+        assert!(!clone.is_locked());
+
+        assert!(lock.try_lock(0..BLOCK));
+        // Clone sees the lock.
+        assert!(clone.is_locked());
+    }
+}
