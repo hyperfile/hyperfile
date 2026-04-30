@@ -245,21 +245,16 @@ cargo test --features wal --test integration_reactor_s3_wal \
 
 ### `integration_reactor_s3_all_features`
 
-Maximum-feature smoke: reactor + wal + range-lock enabled together.
-Covers the most complex feature combination that still works reliably
-with the reactor's current-thread runtime.
+Maximum-feature smoke: reactor + wal + range-lock +
+concurrent-segment-build enabled together. Covers the full feature
+matrix in a single binary.
 
-Feature requirement: `reactor` + `wal` + `range-lock`.
-
-**Known gap**: enabling `concurrent-segment-build` on top of `wal`
-causes a deadlock in the reactor's current-thread runtime because
-`flush_process_build_segment` busy-polls `JoinHandle::is_finished()`
-without yielding. The segment-build path needs to be await-ified
-before a full-feature variant can be added.
+Feature requirement: `reactor` + `wal` + `range-lock` +
+`concurrent-segment-build`.
 
 Run with:
 ```bash
-cargo test --features "wal range-lock" \
+cargo test --features "wal range-lock concurrent-segment-build" \
     --test integration_reactor_s3_all_features \
     -- --ignored --test-threads=1
 ```
@@ -274,8 +269,7 @@ iterating on a feature flag, run only the relevant suite:
 | `reactor` only (default) | `integration_reactor_s3_smoke` |
 | `reactor` + `range-lock` | `integration_reactor_s3_range_lock` |
 | `reactor` + `wal` | `integration_reactor_s3_wal` |
-| `reactor` + `wal` + `range-lock` | `integration_reactor_s3_all_features` |
-| `reactor` + `concurrent-segment-build` | ― (not yet covered; see gap note) |
+| `reactor` + `wal` + `range-lock` + `concurrent-segment-build` | `integration_reactor_s3_all_features` |
 
 To validate a release candidate, run every combination once:
 
@@ -291,8 +285,8 @@ cargo test --features range-lock --test integration_reactor_s3_range_lock \
 cargo test --features wal --test integration_reactor_s3_wal \
     -- --ignored --test-threads=1
 
-# + both
-cargo test --features "wal range-lock" \
+# + all features
+cargo test --features "wal range-lock concurrent-segment-build" \
     --test integration_reactor_s3_all_features \
     -- --ignored --test-threads=1
 ```
