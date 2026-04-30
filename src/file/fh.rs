@@ -16,6 +16,18 @@ pub struct HyperFileHandler<'a> {
 }
 
 impl<'a: 'static> HyperFileHandler<'a> {
+    /// Wrap a pre-constructed `Hyper` with a handler task. Useful when
+    /// the caller needs full `HyperFileConfig` control (e.g. WAL
+    /// configuration) that isn't surfaced by the other `fh_*`
+    /// constructors.
+    pub async fn fh_from_hyper(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, hyper: Hyper<'a>) -> Result<Self>
+    {
+        let (tx, rx) = oneshot::channel();
+        spawner.spawn(hyper, tx);
+        let fh = rx.await.expect("failed to get back file handler");
+        Ok(Self { inner: fh })
+    }
+
     pub async fn fh_create(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         let hyper = Hyper::fs_create(client, uri, flags, mode).await?;
