@@ -1,21 +1,12 @@
-//! Reactor + multiple opt-in features smoke test.
+//! Reactor + all opt-in features smoke test.
 //!
-//! Requires `--features "wal range-lock"`. Verifies that enabling both
-//! WAL and range-lock on top of the reactor doesn't introduce
+//! Requires `--features "wal range-lock concurrent-segment-build"`.
+//! Verifies that the maximum feature combination does not introduce
 //! cross-feature conflicts.
-//!
-//! NOTE: `concurrent-segment-build` is intentionally NOT enabled in
-//! this combination. Enabling it together with `wal` triggers a hang
-//! in the current_thread runtime used by `LocalSpawner`: the segment
-//! builder's busy-loop over `JoinHandle::is_finished()` never yields
-//! to the runtime, so spawn_blocking tasks that share the Arc<Vec<u8>>
-//! backing buffer cannot make progress. Tracking this as a separate
-//! issue; once the segment-build path is await-ified, an all-features
-//! variant of this test can be added.
 //!
 //! Run with:
 //! ```bash
-//! cargo test --features "wal range-lock" \
+//! cargo test --features "wal range-lock concurrent-segment-build" \
 //!     --test integration_reactor_s3_all_features \
 //!     -- --ignored --test-threads=1
 //! ```
@@ -24,6 +15,7 @@
     feature = "reactor",
     feature = "wal",
     feature = "range-lock",
+    feature = "concurrent-segment-build",
 ))]
 
 #[allow(dead_code)]
@@ -42,11 +34,12 @@ use hyperfile::config::HyperFileConfigBuilder;
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::wal::config::HyperFileWalConfig;
 
-/// Smoke: reactor + wal + range-lock together. Two concurrent disjoint
-/// writes, flush, reopen, verify persisted content.
+/// Smoke: reactor + wal + range-lock + concurrent-segment-build
+/// together. Two concurrent disjoint writes, flush, reopen, verify
+/// persisted content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn all_features_wal_range_lock_write_read_round_trip() {
+async fn all_features_write_read_round_trip() {
     let _ = env_logger::try_init();
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
