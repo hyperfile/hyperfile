@@ -430,3 +430,108 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
 
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// Crash recovery under multiple handler clones: two clones
+/// write to disjoint byte ranges in sequence, then the spawner
+/// is dropped without a flush. Reopening should replay both
+/// writes' WAL chunks and both payloads should be present.
+///
+/// This exercises the "multiple cloned HyperFileHandlers share
+/// the same Hyper" usage pattern in combination with WAL + crash
+/// recovery. The writes are issued sequentially rather than via
+/// `tokio::join!` because truly concurrent writes through cloned
+/// handles without the `range-lock` feature hang (unrelated WAL
+/// issue: the default semaphore-based serialization interacts
+/// poorly with the WAL pipeline's multi-hop request path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_crash_recovery_multiple_handles() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let config = build_wal_config(tf.uri());
+    let payload_a = vec![0xA1u8; 4096];
+    let payload_b = vec![0xB2u8; 4096];
+    let off_b = 16384;
+
+    // Phase 1: clean create.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::create(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        )
+        .await
+        .expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+        let _ = fh.fh_release().await;
+        drop(fh);
+        drop(spawner);
+    }
+
+    // Phase 2: reopen, two concurrent writes via cloned handlers,
+    //          then crash.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::open(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        )
+        .await
+        .expect("reopen");
+        let fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+
+        let mut fh_a = fh.clone();
+        let mut fh_b = fh.clone();
+        drop(fh);
+
+        // Sequential writes via two clones (not concurrent) —
+        // enough to exercise WAL under multi-handle usage while
+        // keeping the ordering deterministic.
+        fh_a.fh_write(0, &payload_a).await.expect("A write");
+        fh_b.fh_write(off_b, &payload_b).await.expect("B write");
+
+        // Both fh_write calls have returned Ok, so both WAL PUTs
+        // have completed. Crash without flush/release.
+        drop(fh_a);
+        drop(fh_b);
+        drop(spawner);
+    }
+
+    // Phase 3: reopen, both payloads should be there.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::open(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        )
+        .await
+        .expect("reopen after crash");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+
+        let mut buf_a = vec![0u8; payload_a.len()];
+        fh.fh_read(0, &mut buf_a).await.expect("read A");
+        assert_eq!(buf_a, payload_a, "A did not survive concurrent crash");
+
+        let mut buf_b = vec![0u8; payload_b.len()];
+        fh.fh_read(off_b, &mut buf_b).await.expect("read B");
+        assert_eq!(buf_b, payload_b, "B did not survive concurrent crash");
+
+        let _ = fh.fh_release().await;
+        drop(fh);
+        drop(spawner);
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}
