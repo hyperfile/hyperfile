@@ -1,6 +1,5 @@
 //! impl request handler style IO process
 use std::mem::ManuallyDrop;
-use std::ops::Deref;
 use std::io::{Result, ErrorKind};
 #[cfg(feature = "wal")]
 use log::{warn, info, debug};
@@ -25,88 +24,138 @@ pub type FileRespFlush = Result<SegmentId>;
 pub type FileRespRelease = Result<SegmentId>;
 pub type FileRespLastCno = u64;
 
-#[repr(C)]
-pub union FileResp {
-    getattr: ManuallyDrop<oneshot::Sender<FileRespGetAttr>>,
-    setattr: ManuallyDrop<oneshot::Sender<FileRespSetAttr>>,
-    read: ManuallyDrop<mpsc::Sender<FileRespRead>>,
-    write: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
-    write_zero: ManuallyDrop<mpsc::Sender<FileRespWriteZero>>,
-    write_aligned_batch: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
-    write_batch: ManuallyDrop<mpsc::Sender<FileRespWrite>>,
-    trunc: ManuallyDrop<oneshot::Sender<FileRespTrunc>>,
-    flush: ManuallyDrop<oneshot::Sender<FileRespFlush>>,
+/// Response carrier for a request handed off to the reactor
+/// handler.
+///
+/// Each variant holds the sender side of a channel the caller is
+/// awaiting on. When the handler finishes normally it consumes the
+/// variant (via `to_*()` accessors) and drives the sender directly.
+///
+/// The enum (rather than `union { ManuallyDrop<T> }`) matters for
+/// crash safety: if the handler task panics before it reaches the
+/// consumer call, this `FileResp` is dropped as part of the task
+/// frame unwind, and the enum's automatic Drop drops the contained
+/// sender. That closes the channel and lets the caller's
+/// `rx.await` resolve with `Err(RecvError)` instead of hanging.
+pub enum FileResp {
+    GetAttr(oneshot::Sender<FileRespGetAttr>),
+    SetAttr(oneshot::Sender<FileRespSetAttr>),
+    Read(mpsc::Sender<FileRespRead>),
+    Write(mpsc::Sender<FileRespWrite>),
+    WriteZero(mpsc::Sender<FileRespWriteZero>),
+    WriteAlignedBatch(mpsc::Sender<FileRespWrite>),
+    WriteBatch(mpsc::Sender<FileRespWrite>),
+    Trunc(oneshot::Sender<FileRespTrunc>),
+    Flush(oneshot::Sender<FileRespFlush>),
     #[cfg(feature = "wal")]
-    wal_flush: ManuallyDrop<()>,
+    WalFlush,
     #[cfg(feature = "wal")]
-    wal_flush_done: ManuallyDrop<()>,
+    WalFlushDone,
     #[cfg(feature = "wal")]
-    wal_flush_recovery: ManuallyDrop<()>,
-    release: ManuallyDrop<oneshot::Sender<FileRespRelease>>,
-    last_cno: ManuallyDrop<oneshot::Sender<FileRespLastCno>>,
+    WalFlushRecovery,
+    Release(oneshot::Sender<FileRespRelease>),
+    LastCno(oneshot::Sender<FileRespLastCno>),
 }
 
 impl FileResp {
     pub fn to_getattr(self) -> oneshot::Sender<FileRespGetAttr> {
-        ManuallyDrop::into_inner(unsafe { self.getattr })
+        match self {
+            Self::GetAttr(tx) => tx,
+            _ => panic!("FileResp::to_getattr called on wrong variant"),
+        }
     }
 
     pub fn to_setattr(self) -> oneshot::Sender<FileRespSetAttr> {
-        ManuallyDrop::into_inner(unsafe { self.setattr })
+        match self {
+            Self::SetAttr(tx) => tx,
+            _ => panic!("FileResp::to_setattr called on wrong variant"),
+        }
     }
 
     pub fn to_read(self) -> mpsc::Sender<FileRespRead> {
-        ManuallyDrop::into_inner(unsafe { self.read })
+        match self {
+            Self::Read(tx) => tx,
+            _ => panic!("FileResp::to_read called on wrong variant"),
+        }
     }
 
     pub fn to_write(self) -> mpsc::Sender<FileRespWrite> {
-        ManuallyDrop::into_inner(unsafe { self.write })
+        match self {
+            Self::Write(tx) | Self::WriteAlignedBatch(tx) | Self::WriteBatch(tx) => tx,
+            _ => panic!("FileResp::to_write called on wrong variant"),
+        }
     }
 
     pub fn to_write_zero(self) -> mpsc::Sender<FileRespWriteZero> {
-        ManuallyDrop::into_inner(unsafe { self.write_zero })
+        match self {
+            Self::WriteZero(tx) => tx,
+            _ => panic!("FileResp::to_write_zero called on wrong variant"),
+        }
     }
 
     pub fn to_trunc(self) -> oneshot::Sender<FileRespTrunc> {
-        ManuallyDrop::into_inner(unsafe { self.trunc })
+        match self {
+            Self::Trunc(tx) => tx,
+            _ => panic!("FileResp::to_trunc called on wrong variant"),
+        }
     }
 
     pub fn to_flush(self) -> oneshot::Sender<FileRespFlush> {
-        ManuallyDrop::into_inner(unsafe { self.flush })
+        match self {
+            Self::Flush(tx) => tx,
+            _ => panic!("FileResp::to_flush called on wrong variant"),
+        }
     }
 
     #[cfg(feature = "wal")]
     pub fn to_wal_flush(self) {
-        ManuallyDrop::into_inner(unsafe { self.wal_flush })
+        match self {
+            Self::WalFlush => {}
+            _ => panic!("FileResp::to_wal_flush called on wrong variant"),
+        }
     }
 
     #[cfg(feature = "wal")]
     pub fn to_wal_flush_done(self) {
-        ManuallyDrop::into_inner(unsafe { self.wal_flush_done })
+        match self {
+            Self::WalFlushDone => {}
+            _ => panic!("FileResp::to_wal_flush_done called on wrong variant"),
+        }
     }
 
     #[cfg(feature = "wal")]
     pub fn to_wal_flush_recovery(self) {
-        ManuallyDrop::into_inner(unsafe { self.wal_flush_recovery })
+        match self {
+            Self::WalFlushRecovery => {}
+            _ => panic!("FileResp::to_wal_flush_recovery called on wrong variant"),
+        }
     }
 
     pub fn to_release(self) -> oneshot::Sender<FileRespRelease> {
-        ManuallyDrop::into_inner(unsafe { self.release })
+        match self {
+            Self::Release(tx) => tx,
+            _ => panic!("FileResp::to_release called on wrong variant"),
+        }
     }
 
     pub fn to_last_cno(self) -> oneshot::Sender<FileRespLastCno> {
-        ManuallyDrop::into_inner(unsafe { self.last_cno })
+        match self {
+            Self::LastCno(tx) => tx,
+            _ => panic!("FileResp::to_last_cno called on wrong variant"),
+        }
     }
 
     pub fn clone_write_resp(&self) -> mpsc::Sender<FileRespWrite> {
-        unsafe {
-            self.write.deref().clone()
+        match self {
+            Self::Write(tx) | Self::WriteAlignedBatch(tx) | Self::WriteBatch(tx) => tx.clone(),
+            _ => panic!("FileResp::clone_write_resp called on wrong variant"),
         }
     }
 
     pub fn clone_write_zero_resp(&self) -> mpsc::Sender<FileRespWriteZero> {
-        unsafe {
-            self.write_zero.deref().clone()
+        match self {
+            Self::WriteZero(tx) => tx.clone(),
+            _ => panic!("FileResp::clone_write_zero_resp called on wrong variant"),
         }
     }
 }
@@ -253,9 +302,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::GetAttr,
             body: FileReqBody { getattr: ManuallyDrop::new(FileReqGetAttr {}), },
         };
-        let resp = FileResp {
-            getattr: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::GetAttr(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -265,9 +312,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::SetAttr,
             body: FileReqBody { setattr: ManuallyDrop::new(FileReqSetAttr { stat: stat }), },
         };
-        let resp = FileResp {
-            setattr: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::SetAttr(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -278,9 +323,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::Read,
             body: FileReqBody { read: ManuallyDrop::new(FileReqRead { buf: buf, offset: offset, fh: fh }), },
         };
-        let resp = FileResp {
-            read: ManuallyDrop::new(tx.clone()),
-        };
+        let resp = FileResp::Read(tx.clone());
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
     }
 
@@ -291,9 +334,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::Write,
             body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, spawn_write_permit: None, fh: fh, fetched: Vec::new(), }), },
         };
-        let resp = FileResp {
-            write: ManuallyDrop::new(tx.clone()),
-        };
+        let resp = FileResp::Write(tx.clone());
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
     }
 
@@ -330,9 +371,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::WriteZero,
             body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, spawn_write_permit: None, fh: fh, fetched: Vec::new(), }), },
         };
-        let resp = FileResp {
-            write_zero: ManuallyDrop::new(tx.clone()),
-        };
+        let resp = FileResp::WriteZero(tx.clone());
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
     }
 
@@ -368,9 +407,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::WriteAlignedBatch,
             body: FileReqBody { write_aligned_batch: ManuallyDrop::new(FileReqWriteAlignedBatch { data_blocks: v }), },
         };
-        let resp = FileResp {
-            write_aligned_batch: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::WriteAlignedBatch(tx);
         (Self { req: Some(new_req), resp: Some(resp), }, rx)
     }
 
@@ -380,9 +417,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::WriteBatch,
             body: FileReqBody { write_batch: ManuallyDrop::new(FileReqWriteBatch { data_blocks: v }), },
         };
-        let resp = FileResp {
-            write_batch: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::WriteBatch(tx);
         (Self { req: Some(new_req), resp: Some(resp), }, rx)
     }
 
@@ -392,9 +427,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::Trunc,
             body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset: offset }), },
         };
-        let resp = FileResp {
-            trunc: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::Trunc(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -404,9 +437,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::Flush,
             body: FileReqBody { flush: ManuallyDrop::new(FileReqFlush { fh, }), },
         };
-        let resp = FileResp {
-            flush: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::Flush(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -417,9 +448,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::WalFlush,
             body: FileReqBody { wal_flush: ManuallyDrop::new(FileReqWalFlush { fh, }), },
         };
-        let resp = FileResp {
-            wal_flush: ManuallyDrop::new(()),
-        };
+        let resp = FileResp::WalFlush;
         Self { req: Some(req), resp: Some(resp) }
     }
 
@@ -429,9 +458,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::WalFlushDone,
             body: FileReqBody { wal_flush_done: ManuallyDrop::new(FileReqWalFlushDone { lock, segid, od_state, bmap_cache_limit, }), },
         };
-        let resp = FileResp {
-            wal_flush_done: ManuallyDrop::new(()),
-        };
+        let resp = FileResp::WalFlushDone;
         Self { req: Some(req), resp: Some(resp) }
     }
 
@@ -441,9 +468,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::WalFlushRecovery,
             body: FileReqBody { wal_flush_recovery: ManuallyDrop::new(FileReqWalFlushRecovery { lock, }), },
         };
-        let resp = FileResp {
-            wal_flush_recovery: ManuallyDrop::new(()),
-        };
+        let resp = FileResp::WalFlushRecovery;
         Self { req: Some(req), resp: Some(resp) }
     }
 
@@ -453,9 +478,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::Release,
             body: FileReqBody { release: ManuallyDrop::new(FileReqRelease { fh, }), },
         };
-        let resp = FileResp {
-            release: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::Release(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -465,9 +488,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::LastCno,
             body: FileReqBody { last_cno: ManuallyDrop::new(FileReqLastCno {}), },
         };
-        let resp = FileResp {
-            last_cno: ManuallyDrop::new(tx),
-        };
+        let resp = FileResp::LastCno(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -549,9 +570,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 // prepare error response handler
                 let _resp_read = resp.to_read();
                 let resp_read = _resp_read.clone();
-                let resp = FileResp {
-                    read: ManuallyDrop::new(_resp_read),
-                };
+                let resp = FileResp::Read(_resp_read);
                 let res = self.inner.spawn_read(req, resp).await;
                 match res {
                     Ok(_) => {}
@@ -572,9 +591,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 // prepare error response handler
                 let _resp_write = resp.to_write();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::Write(_resp_write);
                 let res = self.inner.spawn_write(req, resp).await;
                 match res {
                     Ok(bytes) => {
@@ -598,9 +615,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 // prepare error response handler
                 let _resp_write = resp.to_write();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::Write(_resp_write);
                 let res = self.inner.spawn_write_wal(req, resp).await;
                 match res {
                     Ok(_) => {},
@@ -620,9 +635,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let range = req.offset as u64..(req.offset + req.buf.len()) as u64;
                 let _resp_write = resp.to_write();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::Write(_resp_write);
                 let mut fetched = Vec::new();
                 fetched.append(&mut req.fetched);
                 let res = self.inner.absorb_write(req, resp, fetched).await;
@@ -644,9 +657,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 let _resp_write = resp.to_write();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::Write(_resp_write);
                 let res = self.inner.absorb_write_bh(req, resp).await;
                 let _ = resp_write.try_send(res);
             },
@@ -658,9 +669,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 // prepare error response handler
                 let _resp_write = resp.to_write_zero();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write_zero: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::WriteZero(_resp_write);
                 let res = self.inner.spawn_write_zero(req, resp).await;
                 match res {
                     Ok(bytes) => {
@@ -684,9 +693,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 // prepare error response handler
                 let _resp_write = resp.to_write_zero();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write_zero: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::WriteZero(_resp_write);
                 let res = self.inner.spawn_write_zero_wal(req, resp).await;
                 match res {
                     Ok(_) => {},
@@ -706,9 +713,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let range = req.offset as u64..(req.offset + req.len) as u64;
                 let _resp_write = resp.to_write_zero();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write_zero: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::WriteZero(_resp_write);
                 let mut fetched = Vec::new();
                 fetched.append(&mut req.fetched);
                 let res = self.inner.absorb_write_zero(req, resp, fetched).await;
@@ -730,9 +735,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 let _resp_write = resp.to_write_zero();
                 let resp_write = _resp_write.clone();
-                let resp = FileResp {
-                    write_zero: ManuallyDrop::new(_resp_write),
-                };
+                let resp = FileResp::WriteZero(_resp_write);
                 let res = self.inner.absorb_write_zero_bh(req, resp).await;
                 let _ = resp_write.try_send(res);
             },
