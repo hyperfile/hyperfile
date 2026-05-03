@@ -187,4 +187,27 @@ impl WalReadWrite for S3Wal {
             }
         })
     }
+
+    fn delete_segment(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let wal_segment_root_path = format!("{}{}/", self.root_path_slash, Segment::segid_to_staging_file_id(segid));
+        Box::pin(async move {
+            // Collect keys under the segid prefix, then batch-delete.
+            let mut keys = Vec::new();
+            {
+                let keys_ref = &mut keys;
+                let filter = |o: &aws_sdk_s3::types::Object| {
+                    if let Some(key) = o.key() {
+                        keys_ref.push(key.to_string());
+                    }
+                };
+                S3Ops::do_list_objects(&client, &bucket, &wal_segment_root_path, filter).await?;
+            }
+            if keys.is_empty() {
+                return Ok(());
+            }
+            S3Ops::do_delete_objects(&client, &bucket, keys).await
+        })
+    }
 }

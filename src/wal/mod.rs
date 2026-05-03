@@ -26,4 +26,15 @@ pub trait WalReadWrite {
     // list
     fn list_segments(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SegmentId>>> + Send + '_>>;
     fn list_chunks(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<BTreeMap<usize, WalChunkDesc>>> + Send + '_>>;
+    /// Delete every WAL object for the given segid from backing
+    /// storage.
+    ///
+    /// Intended to be called after a successful flush has made the
+    /// WAL chunks for `segid` redundant. Callers typically run this
+    /// via `tokio::spawn` as a low-priority fire-and-forget cleanup:
+    /// the WAL is safe to keep around (recovery filters by
+    /// `last_ondisk_cno`), so a lost delete leaves storage slightly
+    /// bloated but does not affect correctness. The returned future
+    /// is `'static + Send` so callers can detach it freely.
+    fn delete_segment(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 }

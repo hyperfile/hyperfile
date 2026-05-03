@@ -717,6 +717,25 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         assert!(last_cno == segid);
         self.inode_mut().set_last_ondisk_cno(last_cno);
         self.wal_clear_mem_segment(segid).await;
+        // Fire-and-forget delete of the persisted WAL objects.
+        //
+        // WAL chunks are written under the inode's last_seq at the
+        // time of each write. The flush path calls get_next_seq(),
+        // allocates the NEW segid for the segment, and the WAL
+        // chunks stay under (segid - 1). Delete that prefix.
+        //
+        // A lost delete here leaves storage slightly bloated —
+        // recovery filters by last_ondisk_cno, so old entries are
+        // still correct — and is not worth blocking the flush ack.
+        if let Some(ref wal) = self.wal {
+            let wal_segid = segid.saturating_sub(1);
+            let fut = wal.delete_segment(wal_segid);
+            tokio::task::spawn(async move {
+                if let Err(e) = fut.await {
+                    warn!("wal delete_segment {} failed: {:?}", wal_segid, e);
+                }
+            });
+        }
         // restore cache limit
         self.restore_data_blocks_cache_limit();
         self.bmap_set_cache_limit(bmap_cache_limit);
@@ -801,7 +820,25 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         self.wal = wal;
 
         // force flush
-        self.flush_process().await
+        let res = self.flush_process().await;
+
+        // Fire-and-forget cleanup of the replayed WAL objects. If
+        // this fails, recovery on the next open will just skip them
+        // (list_segments is filtered by last_ondisk_cno), so the
+        // only cost of a lost delete is a small bit of storage
+        // bloat; don't block on it.
+        if res.is_ok() {
+            if let Some(ref wal) = self.wal {
+                let fut = wal.delete_segment(segid);
+                tokio::task::spawn(async move {
+                    if let Err(e) = fut.await {
+                        warn!("wal delete_segment {} after replay failed: {:?}", segid, e);
+                    }
+                });
+            }
+        }
+
+        res
     }
 
     pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {

@@ -183,3 +183,74 @@ async fn reactor_wal_flush_and_reopen_is_idempotent() {
     drop(spawner);
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// After a successful flush, the WAL prefix for the flushed segid
+/// should be cleaned up. The cleanup runs as a fire-and-forget
+/// `tokio::spawn` inside the handler, so we give it a moment
+/// before listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_delete_after_flush() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let spawner = make_spawner();
+    let config = build_wal_config(tf.uri());
+    let payload = vec![0xCDu8; 8192];
+
+    // Create with WAL, write, flush.
+    {
+        let hyper = Hyper::create(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        )
+        .await
+        .expect("create hyper with wal");
+
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn handler");
+        fh.fh_write(0, &payload).await.expect("write");
+        let _segid = fh.fh_flush().await.expect("flush");
+
+        // Let the fire-and-forget delete task catch up. 1s is plenty
+        // over the ~20-100ms ListObjects + DeleteObjects round trip
+        // on S3 Express One Zone.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let _ = fh.fh_release().await;
+    }
+
+    // List the WAL prefix directly via the S3 client. It should
+    // contain zero objects: every chunk from the flushed segid
+    // has been deleted.
+    let wal_prefix = format!("{}/wal/", tf.uri().trim_start_matches("s3://")
+        .splitn(2, '/')
+        .nth(1)
+        .expect("uri has no key part"));
+    let bucket = test_bucket();
+    let list = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(&wal_prefix)
+        .send()
+        .await
+        .expect("list_objects_v2");
+    let keys: Vec<String> = list
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        keys.is_empty(),
+        "WAL prefix still holds {} objects after flush: {:?}",
+        keys.len(),
+        keys,
+    );
+
+    drop(spawner);
+    cleanup_with_wal(&client, tf.uri()).await;
+}
