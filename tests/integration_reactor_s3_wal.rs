@@ -431,18 +431,21 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
     cleanup_with_wal(&client, tf.uri()).await;
 }
 
-/// Crash recovery under multiple handler clones: two clones
-/// write to disjoint byte ranges in sequence, then the spawner
-/// is dropped without a flush. Reopening should replay both
-/// writes' WAL chunks and both payloads should be present.
+/// Crash recovery under concurrent writers via multiple handler
+/// clones: two clones issue writes to disjoint byte ranges
+/// concurrently through `tokio::join!`, then the handler +
+/// spawner are dropped without a flush. Reopening should replay
+/// both writes' WAL chunks and both payloads should be present.
 ///
-/// This exercises the "multiple cloned HyperFileHandlers share
-/// the same Hyper" usage pattern in combination with WAL + crash
-/// recovery. The writes are issued sequentially rather than via
-/// `tokio::join!` because truly concurrent writes through cloned
-/// handles without the `range-lock` feature hang (unrelated WAL
-/// issue: the default semaphore-based serialization interacts
-/// poorly with the WAL pipeline's multi-hop request path).
+/// The fh_write pipeline under WAL spans multiple handler hops
+/// (Write -> WriteWal -> WriteAbsorbBh) and the per-file
+/// semaphore permit is held across those hops. An earlier naive
+/// implementation used a blocking acquire_owned().await, which
+/// deadlocked here: handler is serial, so handler A couldn't
+/// progress through its remaining hops while handler B was
+/// blocked inside acquire_owned(). spawn_write/spawn_write_zero
+/// now use a non-blocking try_acquire_owned() and re-queue via
+/// send_highprio when the permit is unavailable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn reactor_wal_crash_recovery_multiple_handles() {
@@ -493,11 +496,17 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
         let mut fh_b = fh.clone();
         drop(fh);
 
-        // Sequential writes via two clones (not concurrent) —
-        // enough to exercise WAL under multi-handle usage while
-        // keeping the ordering deterministic.
-        fh_a.fh_write(0, &payload_a).await.expect("A write");
-        fh_b.fh_write(off_b, &payload_b).await.expect("B write");
+        let data_a = payload_a.clone();
+        let data_b = payload_b.clone();
+        let writer_a = async move {
+            fh_a.fh_write(0, &data_a).await.expect("A write");
+            fh_a
+        };
+        let writer_b = async move {
+            fh_b.fh_write(off_b, &data_b).await.expect("B write");
+            fh_b
+        };
+        let (fh_a, fh_b) = tokio::join!(writer_a, writer_b);
 
         // Both fh_write calls have returned Ok, so both WAL PUTs
         // have completed. Crash without flush/release.
