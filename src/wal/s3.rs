@@ -211,3 +211,127 @@ impl WalReadWrite for S3Wal {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `S3Wal` with a dummy AWS client suitable for
+    /// testing pure-logic methods (encode / decode / next_seq /
+    /// reset_seq). The client is never actually invoked.
+    fn wal_for_tests(root_path: &str, last_segid: SegmentId) -> S3Wal {
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build();
+        let client = Client::new(&sdk_config);
+        let root_path = root_path.to_string();
+        let root_path_slash = format!("{}/", root_path);
+        S3Wal {
+            client,
+            bucket: "test-bucket".to_string(),
+            root_path,
+            root_path_slash,
+            data_block_size: 4096,
+            last_segid,
+            seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn next_seq_increments_monotonically() {
+        let wal = wal_for_tests("root", 0);
+        assert_eq!(wal.next_seq(), 0);
+        assert_eq!(wal.next_seq(), 1);
+        assert_eq!(wal.next_seq(), 2);
+        assert_eq!(wal.next_seq(), 3);
+    }
+
+    #[test]
+    fn reset_seq_restarts_from_zero() {
+        let wal = wal_for_tests("root", 0);
+        let _ = wal.next_seq();
+        let _ = wal.next_seq();
+        let _ = wal.next_seq();
+        wal.reset_seq();
+        assert_eq!(wal.next_seq(), 0);
+        assert_eq!(wal.next_seq(), 1);
+    }
+
+    #[test]
+    fn encode_format_matches_expected_scheme() {
+        let mut wal = wal_for_tests("root", 0);
+        let key = wal.encode(0, 0, 4096);
+        // Path shape: <root>/<padded-segid>/<seq>_<off>_<len>
+        assert_eq!(key, "root/0000000000/0_0_4096");
+    }
+
+    #[test]
+    fn encode_seq_advances_for_same_segid() {
+        let mut wal = wal_for_tests("root", 0);
+        assert_eq!(wal.encode(0, 0, 100), "root/0000000000/0_0_100");
+        assert_eq!(wal.encode(0, 100, 50), "root/0000000000/1_100_50");
+        assert_eq!(wal.encode(0, 200, 25), "root/0000000000/2_200_25");
+    }
+
+    #[test]
+    fn encode_resets_seq_when_segid_changes() {
+        let mut wal = wal_for_tests("root", 0);
+        let _ = wal.encode(0, 0, 100);
+        let _ = wal.encode(0, 100, 100);
+        // New segid — seq should reset to 0.
+        assert_eq!(wal.encode(1, 0, 200), "root/0000000001/0_0_200");
+        assert_eq!(wal.encode(1, 200, 50), "root/0000000001/1_200_50");
+    }
+
+    #[test]
+    fn encode_static_ignores_internal_seq_state() {
+        let wal = wal_for_tests("root", 99);
+        // encode_static takes seq as a parameter, doesn't touch
+        // self.seq; repeated calls produce the same key.
+        let k1 = wal.encode_static(7, 42, 1024, 2048);
+        let k2 = wal.encode_static(7, 42, 1024, 2048);
+        assert_eq!(k1, k2);
+        assert_eq!(k1, "root/0000000042/7_1024_2048");
+    }
+
+    #[test]
+    fn decode_roundtrip_after_encode() {
+        let mut wal = wal_for_tests("root", 0);
+        let key = wal.encode(5, 16384, 8192);
+        // decode receives just the basename (the "<seq>_<off>_<len>"
+        // tail), as produced by the trim_start_matches in
+        // list_chunks. Extract it manually here.
+        let basename = key.rsplit('/').next().unwrap();
+        assert_eq!(wal.decode(basename), Some((0, 16384, 8192)));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_names() {
+        let wal = wal_for_tests("root", 0);
+        // Missing a component.
+        assert_eq!(wal.decode("0_100"), None);
+        // Too many components.
+        assert_eq!(wal.decode("0_100_200_extra"), None);
+        // Non-numeric parts.
+        assert_eq!(wal.decode("a_100_200"), None);
+        assert_eq!(wal.decode("0_x_200"), None);
+        assert_eq!(wal.decode("0_100_z"), None);
+        // Empty.
+        assert_eq!(wal.decode(""), None);
+    }
+
+    #[test]
+    fn decode_accepts_zero_values() {
+        let wal = wal_for_tests("root", 0);
+        assert_eq!(wal.decode("0_0_0"), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn encode_does_not_reset_seq_when_same_segid_seen_twice_in_a_row() {
+        let mut wal = wal_for_tests("root", 0);
+        let _ = wal.encode(7, 0, 100); // initial: last_segid changes 0->7, reset, seq=0 returned
+        let _ = wal.encode(7, 100, 100); // same segid: seq=1
+        let k3 = wal.encode(7, 200, 100); // still same: seq=2
+        assert!(k3.ends_with("/2_200_100"), "got: {}", k3);
+    }
+}
