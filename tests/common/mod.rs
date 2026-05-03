@@ -363,3 +363,57 @@ impl StagingIntercept<S3Staging> for FailOtherNoRetry {
         Box::pin(async { Ok(()) })
     }
 }
+
+/// Interceptor that panics on the Nth call to `before_flush_inode`.
+/// Used to exercise the reactor's handler-death path: a panic inside
+/// the handler task (via this interceptor) should propagate to any
+/// caller waiting on a response channel as a task panic, not as an
+/// `Err(_)` return.
+#[derive(Clone)]
+pub struct PanicOnFlushInode {
+    target_count: usize,
+    calls: Arc<AtomicUsize>,
+}
+
+impl PanicOnFlushInode {
+    pub fn at(target_count: usize) -> Self {
+        Self {
+            target_count,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl StagingIntercept<S3Staging> for PanicOnFlushInode {
+    fn before_flush_inode(
+        &self,
+        _staging: &S3Staging,
+        _payload: &[u8],
+        _flag: FlushInodeFlag,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {
+        let current = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let should_panic = current == self.target_count;
+        Box::pin(async move {
+            if should_panic {
+                panic!("PanicOnFlushInode: injected panic at call #{}", current);
+            }
+            Ok(())
+        })
+    }
+
+    fn after_flush_inode(
+        &self,
+        _staging: &S3Staging,
+        _payload: &[u8],
+        _flag: FlushInodeFlag,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn after_remove_inode(
+        &self,
+        _staging: &S3Staging,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {
+        Box::pin(async { Ok(()) })
+    }
+}
