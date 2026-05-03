@@ -185,15 +185,10 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
-    pub async fn fh_last_cno(&self) -> u64
+    pub async fn fh_last_cno(&self) -> Result<u64>
     {
         let (ctx, rx) = FileContext::new_last_cno();
         self.inner.send(ctx);
-        // NOTE: this API returns `u64` directly and therefore cannot
-        // surface handler death as an `Err`. A panic here means the
-        // reactor handler task has died; callers that need graceful
-        // handling should use one of the Result-returning methods
-        // (e.g. fh_flush) and get BrokenPipe instead.
-        rx.await.expect("reactor handler task died (fh_last_cno has no error channel)")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))
     }
 }

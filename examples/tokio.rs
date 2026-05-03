@@ -54,7 +54,7 @@ async fn random_write(client: &Client, config: &HyperFileConfig, data: &mut Vec<
     };
     assert!(write_bytes == rand_data_bytes);
     file.flush().await?;
-    let last_cno = file.last_cno().await;
+    let last_cno = file.last_cno().await?;
     file.shutdown().await?;
     println!(". Done with last cno {}", last_cno);
     Ok(())
@@ -91,7 +91,7 @@ async fn random_truncate(client: &Client, config: &HyperFileConfig, data: &mut V
     // extend file by truncate
     file.set_len(new_file_len as u64).await?;
     file.flush().await?;
-    let last_cno = file.last_cno().await;
+    let last_cno = file.last_cno().await?;
     data.resize(new_file_len, 0);
     file.shutdown().await?;
     println!(". Done with last cno {}", last_cno);

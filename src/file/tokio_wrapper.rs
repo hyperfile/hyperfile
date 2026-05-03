@@ -120,12 +120,10 @@ impl<'a: 'static> HyperFileTokio<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
-    pub async fn last_cno(&self) -> u64 {
+    pub async fn last_cno(&self) -> Result<u64> {
         let (ctx, rx) = FileContext::new_last_cno();
         self.inner.send(ctx);
-        // See comment on HyperFileHandler::fh_last_cno: no Result
-        // return, so handler death surfaces as a panic here.
-        rx.await.expect("reactor handler task died (last_cno has no error channel)")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))
     }
 
     pub async fn flush_ext(&self) -> Result<u64> {

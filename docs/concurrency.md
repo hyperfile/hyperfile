@@ -273,14 +273,6 @@ consequences are:
       `src/file/handler.rs:847` — same pattern, not separately
       validated in tests yet.
 
-Two callers are **not** covered by this mechanism and still panic
-on handler death: `HyperFileHandler::fh_last_cno` and
-`HyperFileTokio::last_cno`. They return `u64` directly and therefore
-have no `Err` channel; a panic from the dropped sender propagates to
-the caller. If you need handler-death safety there, use a
-Result-returning call (such as `fh_flush`) to detect the condition
-first.
-
 Historical note: before the `FileResp` union was rewritten to an
 `enum`, the `ManuallyDrop<Sender>` inside the union leaked on
 unwind, so the caller's `rx.await` never resolved and the caller
@@ -323,7 +315,6 @@ the drop happens inside the runtime it was spawned on.
 | Operation fails with a domain error (I/O, permission, OCC conflict) | `Err(e)` from the `fh_*` call; `e.kind()` meaningful |
 | Request internally requeued (`ResourceBusy` inside handler) | Invisible; caller still awaits the final result |
 | Handler task panics (e.g. panic in an interceptor) | `Err(ErrorKind::BrokenPipe, "reactor handler task died")` from the `fh_*` call |
-| Handler task panics, but caller uses `fh_last_cno` / `last_cno` | **Panic** in caller's task (those APIs have no error channel) |
 | Range lock held elsewhere (`range-lock` on) | Invisible; caller awaits until the range is released |
 | WAL write required (`wal` on) | Invisible; caller awaits until WAL stage completes |
 
@@ -340,9 +331,6 @@ the drop happens inside the runtime it was spawned on.
   The reactor swallows it for its own retry; the direct API can
   still surface it, but with different provenance (real in-progress
   flush, not an internal requeue).
-- `fh_last_cno` and `HyperFileTokio::last_cno` can panic on handler
-  death (they return `u64`, no error channel). Prefer to check
-  liveness with a Result-returning call first if this matters.
 
 ## Choosing a policy
 
