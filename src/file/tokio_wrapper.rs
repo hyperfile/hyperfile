@@ -111,25 +111,27 @@ impl<'a: 'static> HyperFileTokio<'a> {
     pub async fn set_len(&self, size: u64) -> Result<()> {
         let (ctx, rx) = FileContext::new_trunc(size as usize);
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn metadata(&self) -> Result<libc::stat> {
         let (ctx, rx) = FileContext::new_getattr();
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn last_cno(&self) -> u64 {
         let (ctx, rx) = FileContext::new_last_cno();
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        // See comment on HyperFileHandler::fh_last_cno: no Result
+        // return, so handler death surfaces as a panic here.
+        rx.await.expect("reactor handler task died (last_cno has no error channel)")
     }
 
     pub async fn flush_ext(&self) -> Result<u64> {
         let (ctx, rx) = FileContext::new_flush(self.inner.clone());
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn write_zero(&mut self, len: usize) -> Result<usize> {
@@ -142,7 +144,7 @@ impl<'a: 'static> HyperFileTokio<'a> {
                     let (ctx, tx, mut rx) = FileContext::new_write_zero(self.pos as usize, len, self.inner.clone());
                     self.inner.send(ctx);
                     self.state = State::Busy(Operation::WriteZero(()));
-                    let res = rx.recv().await.expect("task channel closed");
+                    let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
                     drop(tx);
                     self.state = State::Idle(());
                     return res;

@@ -105,7 +105,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     {
         let (ctx, rx) = FileContext::new_release(self.inner.clone());
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_read(&mut self, off: usize, buf: &mut [u8]) -> Result<usize>
@@ -115,7 +115,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
         };
         let (ctx, tx, mut rx) = FileContext::new_read(b, off, self.inner.clone());
         self.inner.send(ctx);
-        let res = rx.recv().await.expect("task channel closed");
+        let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
         drop(tx);
         let _ = buf;
         res
@@ -128,7 +128,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
         };
         let (ctx, tx, mut rx) = FileContext::new_write(b, off, self.inner.clone());
         self.inner.send(ctx);
-        let res = rx.recv().await.expect("task channel closed");
+        let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
         drop(tx);
         let _ = buf;
         res
@@ -138,7 +138,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     {
         let (ctx, tx, mut rx) = FileContext::new_write_zero(off, len, self.inner.clone());
         self.inner.send(ctx);
-        let res = rx.recv().await.expect("task channel closed");
+        let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
         drop(tx);
         res
     }
@@ -147,48 +147,53 @@ impl<'a: 'static> HyperFileHandler<'a> {
     {
         let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks);
         self.inner.send(ctx);
-        rx.recv().await.expect("task channel closed")
+        rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize>
     {
         let (ctx, mut rx) = FileContext::new_write_batch(blocks);
         self.inner.send(ctx);
-        rx.recv().await.expect("task channel closed")
+        rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_flush(&mut self) -> Result<u64>
     {
         let (ctx, rx) = FileContext::new_flush(self.inner.clone());
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_truncate(&mut self, offset: usize) -> Result<()>
     {
         let (ctx, rx) = FileContext::new_trunc(offset);
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_getattr(&self) -> Result<libc::stat>
     {
         let (ctx, rx) = FileContext::new_getattr();
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_setattr(&self, stat: libc::stat) -> Result<libc::stat>
     {
         let (ctx, rx) = FileContext::new_setattr(stat);
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_last_cno(&self) -> u64
     {
         let (ctx, rx) = FileContext::new_last_cno();
         self.inner.send(ctx);
-        rx.await.expect("task channel closed")
+        // NOTE: this API returns `u64` directly and therefore cannot
+        // surface handler death as an `Err`. A panic here means the
+        // reactor handler task has died; callers that need graceful
+        // handling should use one of the Result-returning methods
+        // (e.g. fh_flush) and get BrokenPipe instead.
+        rx.await.expect("reactor handler task died (fh_last_cno has no error channel)")
     }
 }
