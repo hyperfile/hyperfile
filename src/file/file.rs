@@ -36,7 +36,7 @@ use crate::inode::OnDiskState;
 use crate::data_cache::Cache;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
-use super::{HyperTrait, DirtyDataBlocks};
+use super::{HyperTrait, DirtyDataBlocks, FlushTiming};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
 use super::state::State;
@@ -53,6 +53,7 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     pub(crate) state: State,
     pub(crate) sema: Arc<Semaphore>,
     pub(crate) flush_lock: Arc<Mutex<()>>,
+    pub(crate) flush_timing: FlushTiming,
     #[cfg(feature = "range-lock")]
     pub(crate) range_lock: RangeLock,
     #[cfg(feature = "reactor")]
@@ -156,6 +157,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             state: State::default(),
             sema: Arc::new(Semaphore::new(permits)),
             flush_lock: Arc::new(Mutex::new(())),
+            flush_timing: FlushTiming::default(),
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
@@ -264,6 +266,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             state: State::default(),
             sema: Arc::new(Semaphore::new(permits)),
             flush_lock: Arc::new(Mutex::new(())),
+            flush_timing: FlushTiming::default(),
             #[cfg(feature = "reactor")]
             rt: Some(tokio::runtime::Runtime::new().unwrap()),
             #[cfg(feature = "wal")]
@@ -987,6 +990,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub fn in_memory_last_ondisk_cno(&self) -> u64 {
         self.inode.get_last_ondisk_cno()
     }
+
+    /// Benchmark/regression-profiling only: cumulative per-phase
+    /// timing counters accumulated across all completed flushes.
+    /// Unstable interface, do not rely on it from production code.
+    #[doc(hidden)]
+    pub fn flush_timing(&self) -> &FlushTiming {
+        &self.flush_timing
+    }
+
+    /// Benchmark/regression-profiling only: reset the flush timing
+    /// counters to zero.
+    #[doc(hidden)]
+    pub fn flush_timing_reset(&self) {
+        self.flush_timing.reset();
+    }
 }
 
 impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static, C: NodeCache<BlockPtr> + Clone> HyperFile<'a, T, L, C> {
@@ -1413,6 +1431,10 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
 
     fn set_last_flush(&mut self) {
         self.state.set_last_flush();
+    }
+
+    fn flush_timing(&self) -> &FlushTiming {
+        &self.flush_timing
     }
 
     fn inode(&self) -> &Inode {

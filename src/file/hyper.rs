@@ -114,4 +114,16 @@ impl<'a: 'static> Hyper<'a> {
     pub fn in_memory_last_ondisk_cno(&self) -> u64 {
         self.inner.in_memory_last_ondisk_cno()
     }
+
+    /// Benchmark-only: cumulative per-phase flush timings.
+    #[doc(hidden)]
+    pub fn flush_timing(&self) -> &crate::file::FlushTiming {
+        self.inner.flush_timing()
+    }
+
+    /// Benchmark-only: reset the flush timing counters.
+    #[doc(hidden)]
+    pub fn flush_timing_reset(&self) {
+        self.inner.flush_timing_reset()
+    }
 }

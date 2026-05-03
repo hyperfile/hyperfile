@@ -17,6 +17,7 @@ mod state;
 
 use std::io::{Error, ErrorKind, Result};
 use std::time::{Instant, Duration};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::BTreeMap;
 #[cfg(feature = "wal")]
 use std::sync::Weak;
@@ -38,6 +39,63 @@ use crate::config::HyperFileConfig;
 use crate::ondisk::{BMapRawType, InodeRaw};
 use crate::inode::{Inode, OnDiskState, FlushInodeFlag};
 use crate::staging::Staging;
+
+/// Per-phase cumulative nanosecond counters for the flush path.
+///
+/// Instrumented from inside `flush_process`. Each phase's elapsed
+/// time is added to the matching counter on every flush; the
+/// `flush_count` counter is incremented once per completed flush.
+///
+/// Read externally via `HyperFile::flush_timing()`; reset via
+/// `HyperFile::flush_timing_reset()`. Both accessors are
+/// `#[doc(hidden)]` — the instrumentation is intended for
+/// benchmarks and regression profiling, not part of the public
+/// behavioral contract.
+///
+/// The WAL flush path is not yet instrumented; running this
+/// against a WAL-enabled file will return zero counters.
+#[derive(Default, Debug)]
+pub struct FlushTiming {
+    pub pre_build_ns: AtomicU64,
+    pub build_segment_ns: AtomicU64,
+    pub segment_done_ns: AtomicU64,
+    pub flush_inode_ns: AtomicU64,
+    pub cleanup_ns: AtomicU64,
+    pub flush_count: AtomicU64,
+}
+
+/// Snapshot of `FlushTiming` values at a single point in time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlushTimingSnapshot {
+    pub pre_build_ns: u64,
+    pub build_segment_ns: u64,
+    pub segment_done_ns: u64,
+    pub flush_inode_ns: u64,
+    pub cleanup_ns: u64,
+    pub flush_count: u64,
+}
+
+impl FlushTiming {
+    pub fn snapshot(&self) -> FlushTimingSnapshot {
+        FlushTimingSnapshot {
+            pre_build_ns: self.pre_build_ns.load(Ordering::Relaxed),
+            build_segment_ns: self.build_segment_ns.load(Ordering::Relaxed),
+            segment_done_ns: self.segment_done_ns.load(Ordering::Relaxed),
+            flush_inode_ns: self.flush_inode_ns.load(Ordering::Relaxed),
+            cleanup_ns: self.cleanup_ns.load(Ordering::Relaxed),
+            flush_count: self.flush_count.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.pre_build_ns.store(0, Ordering::Relaxed);
+        self.build_segment_ns.store(0, Ordering::Relaxed);
+        self.segment_done_ns.store(0, Ordering::Relaxed);
+        self.flush_inode_ns.store(0, Ordering::Relaxed);
+        self.cleanup_ns.store(0, Ordering::Relaxed);
+        self.flush_count.store(0, Ordering::Relaxed);
+    }
+}
 
 pub struct DirtyDataBlocks<'a> {
     pub inner: Option<BTreeMap<BlockIndex, &'a DataBlock>>,
@@ -108,6 +166,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn config(&self) -> &HyperFileConfig;
     fn set_last_flush(&mut self);
     fn sleep(dur: Duration) -> impl Future<Output = ()>;
+    fn flush_timing(&self) -> &FlushTiming;
 
     // wal
     #[cfg(feature = "wal")]
@@ -385,22 +444,31 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let fn_start = Instant::now();
         debug!("flush started");
 
+        let _start = Instant::now();
         let (segid, dirty_data_blocks) = self.flush_process_pre_build_segment().await?;
+        self.flush_timing().pre_build_ns.fetch_add(
+            _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if segid > 0 {
+            self.flush_timing().flush_count.fetch_add(1, Ordering::Relaxed);
             return Ok(segid);
         }
+        let _start = Instant::now();
         let (segwr, segid, raw_inode, dirty_meta_vec) = self.flush_process_build_segment(dirty_data_blocks).await?;
+        self.flush_timing().build_segment_ns.fetch_add(
+            _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         let _start = Instant::now();
         segwr.done().await?;
         // update last cno in memory after segment write out
         self.inode_mut().set_last_cno(segid);
-        let _ = _start.elapsed();
+        self.flush_timing().segment_done_ns.fetch_add(
+            _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // flush inode after writeout segment
         let _start = Instant::now();
         let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), self.inode().get_ondisk_state(), FlushInodeFlag::Update).await?;
-        let _ = _start.elapsed();
+        self.flush_timing().flush_inode_ns.fetch_add(
+            _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.inode_mut().clear_attr_dirty();
         self.inode_mut().set_ondisk_state(od_state);
         let last_cno = self.inode().get_last_cno();
@@ -421,7 +489,9 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // reset last flush
         self.set_last_flush();
 
-        let _ = _start.elapsed();
+        self.flush_timing().cleanup_ns.fetch_add(
+            _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.flush_timing().flush_count.fetch_add(1, Ordering::Relaxed);
         let _ = fn_start.elapsed();
         Ok(self.inode().get_last_ondisk_cno())
     }}
