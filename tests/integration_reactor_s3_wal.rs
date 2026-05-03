@@ -254,3 +254,179 @@ async fn reactor_wal_delete_after_flush() {
     drop(spawner);
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// Crash recovery: write, do NOT flush, drop the handler + spawner
+/// (simulates a process crash), reopen, verify the written data
+/// comes back via WAL replay on open.
+///
+/// `fh_write` returning `Ok` already implies the WAL PUT has
+/// completed (the handler only wakes the caller after the spawned
+/// WAL PUT and the cache-update callback have both finished), so
+/// no extra synchronization is needed here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_crash_recovery_replays_unflushed_write() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let config = build_wal_config(tf.uri());
+    let payload = vec![0xE1u8; 8192];
+
+    // Phase 1: create + release cleanly so the file exists on S3
+    //          and the WAL prefix is empty.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::create(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        )
+        .await
+        .expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+        let _ = fh.fh_release().await;
+        drop(fh);
+        drop(spawner);
+    }
+
+    // Phase 2: reopen, write, crash (drop without flush/release).
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::open(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        )
+        .await
+        .expect("reopen");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+
+        fh.fh_write(0, &payload).await.expect("write");
+        // At this point WAL PUT has completed (write's Ok is
+        // only delivered after the spawned WAL PUT task reports
+        // back), so dropping here is a safe crash simulation.
+        drop(fh);
+        drop(spawner);
+    }
+
+    // Phase 3: reopen. wal_flush_recovery should fire inside
+    //          do_open and replay the WAL chunks, then force a
+    //          flush so reading succeeds.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::open(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        )
+        .await
+        .expect("reopen after crash");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+
+        let mut buf = vec![0u8; payload.len()];
+        fh.fh_read(0, &mut buf).await.expect("read");
+        assert_eq!(
+            buf, payload,
+            "data did not survive crash + reopen via WAL replay",
+        );
+
+        let _ = fh.fh_release().await;
+        drop(fh);
+        drop(spawner);
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// Crash recovery with multiple writes. Writes at two disjoint
+/// offsets, both should survive crash-and-recover via WAL replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let config = build_wal_config(tf.uri());
+    let payload_a = vec![0xAAu8; 4096];
+    let payload_b = vec![0xBBu8; 4096];
+    let off_b = 16384;
+
+    // Phase 1: create + release.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::create(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        )
+        .await
+        .expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+        let _ = fh.fh_release().await;
+        drop(fh);
+        drop(spawner);
+    }
+
+    // Phase 2: reopen, write two chunks, crash.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::open(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        )
+        .await
+        .expect("reopen");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+
+        fh.fh_write(0, &payload_a).await.expect("write A");
+        fh.fh_write(off_b, &payload_b).await.expect("write B");
+        // Both writes' WAL PUTs are complete by the time fh_write
+        // returns Ok; safe to drop here.
+        drop(fh);
+        drop(spawner);
+    }
+
+    // Phase 3: reopen, verify both payloads survive.
+    {
+        let spawner = make_spawner();
+        let hyper = Hyper::open(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        )
+        .await
+        .expect("reopen after crash");
+        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+            .await
+            .expect("spawn");
+
+        let mut buf_a = vec![0u8; payload_a.len()];
+        fh.fh_read(0, &mut buf_a).await.expect("read A");
+        assert_eq!(buf_a, payload_a, "A did not survive");
+
+        let mut buf_b = vec![0u8; payload_b.len()];
+        fh.fh_read(off_b, &mut buf_b).await.expect("read B");
+        assert_eq!(buf_b, payload_b, "B did not survive");
+
+        let _ = fh.fh_release().await;
+        drop(fh);
+        drop(spawner);
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}
