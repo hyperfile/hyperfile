@@ -650,7 +650,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
         }
 
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        let Ok(permit) = self.sema.clone().try_acquire_owned() else {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "sema locked"));
+        };
         req.spawn_write_permit = Some(permit);
 
         debug!("WRITE - off: {}, buf len: {}", off, len);
@@ -690,7 +695,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
         }
 
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        let Ok(permit) = self.sema.clone().try_acquire_owned() else {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write_zero(req, resp);
+            fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "sema locked"));
+        };
         req.spawn_write_permit = Some(permit);
 
         debug!("WRITE ZERO - off: {}, len: {}", off, len);
