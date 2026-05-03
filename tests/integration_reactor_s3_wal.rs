@@ -544,3 +544,75 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
 
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// Verify the direct API flush path also cleans the WAL prefix.
+/// Mirrors reactor_wal_delete_after_flush but goes through
+/// `Hyper::fs_*` directly rather than a handler. The delete is
+/// still fire-and-forget, so we sleep briefly before listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_api_wal_delete_after_flush() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let payload = vec![0xDDu8; 8192];
+
+    // Build direct-API-friendly runtime config, then hand the
+    // config into HyperFile via Hyper::create (the direct API
+    // shortcut that composes HyperFileConfig internally is only
+    // exposed through fs_create variants, which don't take WAL
+    // config — so we use Hyper::create here).
+    let config = build_wal_config(tf.uri());
+
+    {
+        let mut hyper = Hyper::create(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        )
+        .await
+        .expect("create");
+
+        hyper.fs_write(0, &payload).await.expect("fs_write");
+        let _segid = hyper.fs_flush().await.expect("fs_flush");
+
+        // Give the fire-and-forget delete task time to complete.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let _ = hyper.fs_release().await;
+    }
+
+    // List the WAL prefix directly. It should be empty after
+    // flush + delete.
+    let wal_prefix = format!(
+        "{}/wal/",
+        tf.uri()
+            .trim_start_matches("s3://")
+            .splitn(2, '/')
+            .nth(1)
+            .expect("uri has no key part"),
+    );
+    let bucket = test_bucket();
+    let list = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(&wal_prefix)
+        .send()
+        .await
+        .expect("list_objects_v2");
+    let keys: Vec<String> = list
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        keys.is_empty(),
+        "direct API: WAL prefix still holds {} objects after flush: {:?}",
+        keys.len(),
+        keys,
+    );
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}

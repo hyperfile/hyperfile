@@ -727,15 +727,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // A lost delete here leaves storage slightly bloated —
         // recovery filters by last_ondisk_cno, so old entries are
         // still correct — and is not worth blocking the flush ack.
-        if let Some(ref wal) = self.wal {
-            let wal_segid = segid.saturating_sub(1);
-            let fut = wal.delete_segment(wal_segid);
-            tokio::task::spawn(async move {
-                if let Err(e) = fut.await {
-                    warn!("wal delete_segment {} failed: {:?}", wal_segid, e);
-                }
-            });
-        }
+        self.wal_spawn_delete_segment(segid.saturating_sub(1));
         // restore cache limit
         self.restore_data_blocks_cache_limit();
         self.bmap_set_cache_limit(bmap_cache_limit);
@@ -828,14 +820,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // only cost of a lost delete is a small bit of storage
         // bloat; don't block on it.
         if res.is_ok() {
-            if let Some(ref wal) = self.wal {
-                let fut = wal.delete_segment(segid);
-                tokio::task::spawn(async move {
-                    if let Err(e) = fut.await {
-                        warn!("wal delete_segment {} after replay failed: {:?}", segid, e);
-                    }
-                });
-            }
+            self.wal_spawn_delete_segment(segid);
         }
 
         res
@@ -1510,5 +1495,17 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
         unsafe { Arc::decrement_strong_count(Arc::as_ptr(&mem_seg)) };
         // end of mem segment life
         drop(mem_seg);
+    }
+
+    #[cfg(feature = "wal")]
+    fn wal_spawn_delete_segment(&self, segid: SegmentId) {
+        if let Some(ref wal) = self.wal {
+            let fut = wal.delete_segment(segid);
+            tokio::task::spawn(async move {
+                if let Err(e) = fut.await {
+                    warn!("wal delete_segment {} failed: {:?}", segid, e);
+                }
+            });
+        }
     }
 }

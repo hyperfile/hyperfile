@@ -149,16 +149,10 @@ measure.
 
 ## Current limitations
 
-- **Reactor-only cleanup**: The fire-and-forget WAL delete is
-  currently wired into `wal_flush_done`, which is the reactor WAL
-  flush path. A direct-API (`fs_*`) flush with WAL enabled does
-  not currently have an equivalent cleanup hook.
 - **Single-writer**: Two `Hyper` instances open on the same URI
   with WAL both write into the same `<wal_root>` prefix and
   allocate `seq` independently. Key collisions are possible. Use
   WAL from a single writer at a time.
-- **WAL in the direct-API flush path** is not fully exercised
-  (tests are reactor-focused).
 
 ## Related tests
 
@@ -166,12 +160,15 @@ measure.
 - `reactor_wal_flush_and_reopen_is_idempotent` — reopen after
   flush does not pick up stale WAL.
 - `reactor_wal_delete_after_flush` — WAL objects are actually
-  removed from S3 after flush.
+  removed from S3 after a reactor flush.
+- `direct_api_wal_delete_after_flush` — same, but via
+  `Hyper::fs_*` direct API.
 - `reactor_wal_crash_recovery_replays_unflushed_write` — drop
   handler without flush, reopen, verify the write is restored.
 - `reactor_wal_crash_recovery_multiple_disjoint_writes` — two
   sequential writes survive crash.
 - `reactor_wal_crash_recovery_multiple_handles` — multiple
-  handler clones, sequential writes, survive crash.
+  handler clones with concurrent writes via `tokio::join!`,
+  survive crash.
 - S3Wal unit tests in `src/wal/s3.rs` cover `next_seq`,
   `reset_seq`, `encode`, and `decode`.

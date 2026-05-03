@@ -173,6 +173,14 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
     #[cfg(feature = "wal")]
     fn wal_clear_mem_segment(&self, mem_segid: SegmentId) -> impl Future<Output = ()>;
+    /// Fire-and-forget delete of the WAL objects for the given
+    /// segid. Spawned so the caller (typically the flush path)
+    /// doesn't block on the round trip. If the delete fails or
+    /// the spawned task is cancelled, the WAL entries remain on
+    /// storage but recovery filters them out by last_ondisk_cno
+    /// so correctness is unaffected.
+    #[cfg(feature = "wal")]
+    fn wal_spawn_delete_segment(&self, segid: SegmentId);
 
     // provided method
     fn bmap_get_raw(&self) -> BMapRawType {
@@ -493,6 +501,17 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.flush_timing().flush_count.fetch_add(1, Ordering::Relaxed);
         let _ = fn_start.elapsed();
+
+        // WAL cleanup: the chunks feeding into this segment live
+        // under (segid - 1) (flush called get_next_seq() when
+        // allocating segid). Fire-and-forget; see the twin
+        // wal_flush_done path for the same pattern on the reactor
+        // WAL flush.
+        #[cfg(feature = "wal")]
+        {
+            self.wal_spawn_delete_segment(segid.saturating_sub(1));
+        }
+
         Ok(self.inode().get_last_ondisk_cno())
     }}
 
