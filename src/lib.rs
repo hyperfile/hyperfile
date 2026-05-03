@@ -1,3 +1,16 @@
+// Feature `reactor` and `blocking` are mutually exclusive. They pick
+// conflicting configurations of `btree-ondisk` (Arc vs Rc for the
+// internal nodes). btree-ondisk has its own `compile_error!` for
+// this, which in practice fires first; this guard documents the
+// contract as part of this crate's own API and gives the reader a
+// one-line explanation of why.
+#[cfg(all(feature = "reactor", feature = "blocking"))]
+compile_error!(
+    "features `reactor` and `blocking` are mutually exclusive: \
+     `reactor` enables btree-ondisk/arc, `blocking` enables \
+     btree-ondisk/rc. Pick one."
+);
+
 pub mod config;
 pub mod meta_format;
 pub mod inode;

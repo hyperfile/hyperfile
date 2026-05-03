@@ -40,12 +40,101 @@ crc64fast = "1.1.0"
 human_bytes = "0.4.3"
 
 [features]
+# --------------------------------------------------------------------
+# Default features
+# --------------------------------------------------------------------
+
+# `reactor` + `meta_loader_batch` is the recommended setup for new
+# users. It gives you the async request/response handle API
+# (HyperFileHandler / HyperFileTokio) and the batched meta-block
+# loader that cuts down on S3 round-trips during reads.
 default = ["reactor", "meta_loader_batch"]
+
+# --------------------------------------------------------------------
+# Optional features
+# --------------------------------------------------------------------
+
+# Enable the batched meta-block loader (`src/meta_loader/s3_batch.rs`),
+# which coalesces multiple meta-block reads into a single S3 request
+# chain. Without this feature the per-block loader at
+# `src/meta_loader/s3.rs` is used, issuing one S3 GET per meta block.
+#
+# Recommended: keep enabled. Disabling trades throughput on read for
+# a simpler call path.
 meta_loader_batch = []
+
+# Enable write-ahead logging. Writes are durably persisted to a
+# separate S3 prefix (configured via `HyperFileWalConfig`) before
+# they are acknowledged. On reopen, unflushed writes are replayed.
+#
+# Cost: every write incurs an extra S3 PUT to the WAL prefix. Every
+# successful flush removes the corresponding WAL chunks.
+#
+# Without this feature, writes sit in memory only until flush; a
+# crash between write and flush loses the unflushed data. With this
+# feature the file stays consistent across crashes up to the last
+# write acknowledged.
 wal = []
-concurrent-segment-build = []
-# concurrency control by range lock
+
+# Enable optimistic fine-grained byte-range locking inside a single
+# process. Concurrent writes to disjoint byte ranges run in parallel;
+# overlapping writes serialize. Required for the range-lock behavior
+# in HyperFileHandler when multiple clones race on the same file.
+#
+# Cross-process concurrency is still governed by the conflict policy
+# (HyperFileConfig::flush_conflict_policy), not by this feature.
+#
+# See docs/concurrency.md for the full model.
 range-lock = ["dep:rangemap"]
+
+# Parallelize segment payload construction during flush. The segment
+# builder shards dirty data blocks into chunks and memcpys them into
+# the output buffer via tokio::spawn_blocking. Useful for large
+# flushes (tens of MiB and up).
+#
+# Caveats:
+#   - Adds a spin-wait on the flush hot path; see the NOTE in
+#     `src/file/mod.rs::flush_process_build_segment` for the
+#     tradeoffs.
+#   - Benchmarks are not yet in the repository; the break-even
+#     point between serial and parallel construction has not
+#     been measured.
+concurrent-segment-build = []
+
+# --------------------------------------------------------------------
+# Runtime-model features (mutually exclusive)
+# --------------------------------------------------------------------
+#
+# Exactly one of `reactor` or `blocking` should be enabled at a time.
+# Both `btree-ondisk` and `src/lib.rs` contain `compile_error!`
+# guards for the forbidden combination: `btree-ondisk` picks between
+# `arc` (reactor) and `rc` (blocking) for its internal
+# reference-counted nodes, and the two cannot coexist.
+
+# Reactor mode. Wraps the file in an event-driven handler task (see
+# `src/file/handler.rs`): a dedicated OS thread with a current-thread
+# tokio runtime serializes all file operations through a request /
+# response channel. Reduces contention under concurrent access to the
+# same file.
+#
+# Use the `fh_*` family in `src/file/fh.rs` (HyperFileHandler /
+# HyperFileTokio) from application code; do not call `fs_*` directly
+# on the inner Hyper. Selected by the default feature set.
 reactor = ["dep:hyperfile-reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
+
+# Blocking mode. The general-purpose single-task model: call the
+# `fs_*` family in `src/file/fs.rs` directly on the file and provide
+# your own concurrency control. Uses Rc instead of Arc for
+# btree-ondisk nodes, avoiding some atomics.
+#
+# Do not enable together with `reactor`.
 blocking = ["btree-ondisk/rc"]
+
+# --------------------------------------------------------------------
+# Development / internal features
+# --------------------------------------------------------------------
+
+# Compile in the staging benchmarking helpers under
+# `src/staging/bench.rs`. Not intended for production use; pulls in
+# `rand` as a non-dev dependency.
 bench = ["dep:rand"]
