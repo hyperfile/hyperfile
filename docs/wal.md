@@ -157,13 +157,6 @@ measure.
   with WAL both write into the same `<wal_root>` prefix and
   allocate `seq` independently. Key collisions are possible. Use
   WAL from a single writer at a time.
-- **Multi-handle concurrent writes without `range-lock`**:
-  Cloning `HyperFileHandler` into multiple handles and issuing
-  simultaneous `fh_write` calls through `tokio::join!` hangs
-  under default features. Either use `range-lock` for
-  fine-grained concurrency, or serialize writes at the
-  application layer. This is not a WAL-specific issue but is
-  noted here because it intersects with WAL testing.
 - **WAL in the direct-API flush path** is not fully exercised
   (tests are reactor-focused).
 
