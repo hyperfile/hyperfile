@@ -1016,7 +1016,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
             // NotFound is fine, let's continue
         }
-        if new_size > 0 {
+        if new_size > 0 && offset_to_discard != 0 {
+            // We only need to zero the tail of the LAST partially-
+            // retained block. When new_size lands exactly on a block
+            // boundary (offset_to_discard == 0), the block at
+            // tgt_blk_idx-1 is fully retained and must NOT be
+            // touched: passing offset_to_discard=0 to
+            // `truncate_last_data_block` would interpret it as
+            // "discard from offset 0", wiping the entire block.
             let tgt_blk_idx = tgt_blk_idx - 1;
             if let Err(e) = self.truncate_last_data_block(&tgt_blk_idx, offset_to_discard).await {
                 let _ = self.rollback_from_persisted().await;

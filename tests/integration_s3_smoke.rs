@@ -713,3 +713,408 @@ async fn smoke_truncate_shrink_decrements_st_blocks() {
 
     tf.cleanup(&client).await;
 }
+
+/// **Edge case**: truncate to an exact block boundary must NOT
+/// zero the last fully-retained block. With data_block_size = 4096:
+///
+///   - Pre-condition: file size = 8192 (2 full blocks of 0xAA)
+///   - Action: truncate to 4096 (= 1 * data_block_size)
+///   - Expected: file contains [0, 4096) of 0xAA
+///
+/// The bug was that `truncate_last_data_block(0, offset_to_discard=0)`
+/// got called, which interprets "offset 0" as "zero from start", and
+/// wiped out the entire last block.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_shrink_to_block_boundary_preserves_data() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload = vec![0xAAu8; BLOCK * 2];
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await.expect("reopen rdwr");
+        // Truncate down to one full block.
+        hyper.fs_truncate(BLOCK).await.expect("truncate to boundary");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await.expect("reopen ro");
+        let stat = hyper.fs_getattr().expect("getattr");
+        assert_eq!(stat.st_size as usize, BLOCK);
+
+        let mut buf = vec![0u8; BLOCK];
+        let n = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert_eq!(n, BLOCK);
+        assert_eq!(
+            buf,
+            payload[..BLOCK],
+            "truncate to a block boundary must keep the last fully-retained \
+             block intact; got the block partly or fully zeroed"
+        );
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: shrink from N to N-1 when both fall in the same
+/// data block (same-block branch). E.g. 4097 → 4096.
+///
+/// Both old and new sizes have the same `cur_blk_idx` (= 1), so
+/// the truncate code takes the same-block branch. This case used
+/// to also call truncate_last_data_block with offset_to_discard=0,
+/// which zeroed an out-of-file block — wasteful but not wrong.
+/// After truncate, reading the file must return the first 4096
+/// bytes of payload intact.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_same_block_to_boundary() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload: Vec<u8> = (0..BLOCK + 1).map(|i| (i & 0xFF) as u8).collect();
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        // truncate to BLOCK before release; same-block (both are in block 1)
+        hyper.fs_truncate(BLOCK).await.expect("truncate");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen");
+    let stat = hyper.fs_getattr().expect("getattr");
+    assert_eq!(stat.st_size as usize, BLOCK);
+    let mut buf = vec![0u8; BLOCK];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(buf, payload[..BLOCK], "block 0 content must be preserved");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: shrink within a single mid-block. E.g. size=3000 →
+/// new_size=1500. Both in block 0. Same-block branch.
+/// truncate_last_data_block(0, 1500) zeros bytes [1500, 4096).
+/// Reads of [0, 1500) must return original payload.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_same_block_mid_to_mid() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let payload: Vec<u8> = (0..3000).map(|i| (i & 0xFF) as u8).collect();
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        hyper.fs_truncate(1500).await.expect("truncate");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen");
+    assert_eq!(hyper.fs_getattr().expect("ga").st_size as usize, 1500);
+    let mut buf = vec![0u8; 1500];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(buf, payload[..1500], "content [0,1500) must survive");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: cross-block shrink ending mid-block. Write 3 full
+/// blocks of 0xAA, truncate to mid-block 1 (5000). Block 2 must
+/// be dropped, block 1 retained with [0, 904)=0xAA, [904, 4096)=0,
+/// block 0 untouched.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_cross_block_shrink_to_mid() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload = vec![0xAAu8; BLOCK * 3];
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_flush().await.expect("flush before truncate");
+        hyper.fs_truncate(BLOCK + 904).await.expect("truncate to 5000");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, BLOCK + 904);
+    // 2 blocks allocated: block 0 + block 1 → 8 KiB / 512 = 16
+    assert_eq!(stat.st_blocks, (2 * BLOCK / 512) as i64);
+
+    let mut buf = vec![0u8; BLOCK + 904];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|&b| b == 0xAA), "content survives in [0, new_size)");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: extend file to mid-block. Reads of the new range
+/// must return zeros (sparse hole). bmap unchanged on the extend
+/// itself.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_extend_to_mid_block() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload = vec![0xCCu8; BLOCK];
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_flush().await.expect("flush before truncate");
+        hyper.fs_truncate(BLOCK + 1234).await.expect("extend to 5330");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, BLOCK + 1234);
+    // Only block 0 actually allocated (extension is sparse)
+    assert_eq!(stat.st_blocks, (BLOCK / 512) as i64);
+
+    let mut buf = vec![0u8; BLOCK + 1234];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(&buf[..BLOCK], &payload[..]);
+    assert!(buf[BLOCK..].iter().all(|&b| b == 0), "extended range reads as zeros");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: truncate to 0, then write again. After truncate(0)
+/// all blocks should be discarded; subsequent writes should
+/// produce a fresh file.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_to_zero_then_write() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let initial = vec![0xAAu8; BLOCK * 2];
+    let final_payload = vec![0xBBu8; 1000];
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &initial).await.expect("write 8 KiB");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await.expect("reopen");
+        hyper.fs_truncate(0).await.expect("truncate to zero");
+        let _ = hyper.fs_write(0, &final_payload).await.expect("write 1 KiB");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, final_payload.len());
+    assert_eq!(stat.st_blocks, (BLOCK / 512) as i64,
+        "should report 1 block (the new write), not 2 (stale from initial)");
+
+    let mut buf = vec![0u8; final_payload.len()];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(buf, final_payload);
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: extend then shrink back to original size — must
+/// behave the same as never extending. The shrink path should
+/// drop the (sparse) blocks that came from the extension.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_extend_then_shrink_back() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload = vec![0xCDu8; 100];
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write 100");
+        let _ = hyper.fs_flush().await.expect("flush");
+        hyper.fs_truncate(BLOCK * 4).await.expect("extend to 16 KiB");
+        hyper.fs_truncate(payload.len()).await.expect("shrink back to 100");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, payload.len());
+    let mut buf = vec![0u8; payload.len()];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(buf, payload);
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: shrink to 1 byte. The last partial block has a
+/// single user byte; bytes [1, block_size) must read as zero.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_shrink_to_one_byte() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload = vec![0xAAu8; BLOCK];
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await.expect("reopen");
+        hyper.fs_truncate(1).await.expect("truncate to 1 byte");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size, 1);
+    let mut buf = vec![0u8; 1];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(buf[0], 0xAA);
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: truncate-shrink across a zero-block (block created by
+/// fs_write_zero). truncate_last_data_block has special handling
+/// for zero-block blkptrs (returns Ok(false), no zeroing). Verify
+/// the path works and content is correct.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_shrink_through_zero_block() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+
+    // Layout: block 0 = data 0xAA (4 KiB), block 1 = zero block (4 KiB),
+    //         block 2 = data 0xCC (4 KiB).  size = 12 KiB.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &vec![0xAAu8; BLOCK]).await.expect("write block 0");
+        let _ = hyper.fs_write_zero(BLOCK, BLOCK).await.expect("write_zero block 1");
+        let _ = hyper.fs_write(BLOCK * 2, &vec![0xCCu8; BLOCK]).await.expect("write block 2");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Truncate to mid-block 1 (size 5000): block 2 dropped, block 1
+    // (zero block) kept partially. The current truncate code calls
+    // truncate_last_data_block(1, 904) → bmap.lookup(1) → zero block
+    // → returns Ok(false), no data change. set_size(5000).
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await.expect("reopen rdwr");
+        hyper.fs_truncate(BLOCK + 904).await.expect("truncate to 5000");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, BLOCK + 904);
+
+    let mut buf = vec![0xFFu8; BLOCK + 904]; // pre-fill with sentinel
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert!(buf[..BLOCK].iter().all(|&b| b == 0xAA), "block 0 must be 0xAA");
+    assert!(buf[BLOCK..].iter().all(|&b| b == 0), "tail of zero-block 1 must read as 0");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Edge case: truncate-shrink to exactly the boundary of a zero
+/// block. Should drop the zero block entirely and keep the
+/// previous block (whose content was 0xAA) intact.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_shrink_to_zero_block_boundary() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+
+    // Layout: block 0 = 0xAA, block 1 = zero block. size=8 KiB.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &vec![0xAAu8; BLOCK]).await.expect("write");
+        let _ = hyper.fs_write_zero(BLOCK, BLOCK).await.expect("write_zero");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Truncate to BLOCK (exact boundary, drops block 1)
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await.expect("reopen rdwr");
+        hyper.fs_truncate(BLOCK).await.expect("truncate");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, BLOCK);
+    let mut buf = vec![0u8; BLOCK];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|&b| b == 0xAA), "block 0 (0xAA) must survive");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}

@@ -108,12 +108,21 @@ with second + nanosecond resolution. They update as follows:
 | Case | Effect |
 | --- | --- |
 | `new_size == cur_size` | No-op (returns immediately). |
-| `new_size < cur_size` (shrink) | Data blocks beyond `new_size` are dropped from the cache and from the persisted block index on next flush. The last partial block (if `new_size` is not block-aligned) is zero-padded from `new_size % block_size` to the end of the block. |
-| `new_size > cur_size` (extend) | The file size is extended; the new range reads as zeros. No data blocks are allocated for the extended range — they are sparse until written. |
-| `new_size == 0` | Equivalent to `O_TRUNC` at open time. All data blocks discarded. |
+| `new_size < cur_size` (shrink, mid-block) | Data blocks beyond `new_size` are dropped from the cache and from the persisted block index on next flush. The block containing byte `new_size - 1` is the **last partial block**; its bytes `[new_size % block_size, block_size)` are zero-padded so a future extending write or read across that boundary cannot expose stale data. |
+| `new_size < cur_size` (shrink, exact block boundary) | Same as above except no partial-block zeroing happens — the last fully-retained block (`new_size / block_size - 1`) is kept untouched. (Pre-fix bug: the code used to call the partial-block path with `offset_to_discard = 0`, wiping the block.) |
+| `new_size > cur_size` (extend) | The file size is extended; the new range reads as zeros. No data blocks are allocated for the extended range — they are sparse until written. `st_blocks` does not change. |
+| `new_size == 0` | All data blocks discarded; bmap fully truncated; `i_blocks` goes to 0. |
 
 Truncate updates `mtime`. It does **not** itself flush; pair with
 `fs_flush` or `fs_release` to persist.
+
+**Caveat**: shrinking across block boundaries while the bmap has
+unflushed dirty entries can fail with `ErrorKind::NotFound`
+("assign key not found in direct node"), surfaced from
+`btree-ondisk` during the bmap-truncate step. Workaround: call
+`fs_flush()` between writes and a cross-block-boundary
+`fs_truncate(shrink)`. Same-block truncates and extending
+truncates are unaffected.
 
 ## Read on a zero-length file
 
