@@ -857,7 +857,6 @@ async fn smoke_truncate_cross_block_shrink_to_mid() {
             &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         ).await.expect("create");
         let _ = hyper.fs_write(0, &payload).await.expect("write");
-        let _ = hyper.fs_flush().await.expect("flush before truncate");
         hyper.fs_truncate(BLOCK + 904).await.expect("truncate to 5000");
         let _ = hyper.fs_release().await.expect("release");
     }
@@ -893,7 +892,6 @@ async fn smoke_truncate_extend_to_mid_block() {
             &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         ).await.expect("create");
         let _ = hyper.fs_write(0, &payload).await.expect("write");
-        let _ = hyper.fs_flush().await.expect("flush before truncate");
         hyper.fs_truncate(BLOCK + 1234).await.expect("extend to 5330");
         let _ = hyper.fs_release().await.expect("release");
     }
@@ -975,7 +973,6 @@ async fn smoke_truncate_extend_then_shrink_back() {
             &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         ).await.expect("create");
         let _ = hyper.fs_write(0, &payload).await.expect("write 100");
-        let _ = hyper.fs_flush().await.expect("flush");
         hyper.fs_truncate(BLOCK * 4).await.expect("extend to 16 KiB");
         hyper.fs_truncate(payload.len()).await.expect("shrink back to 100");
         let _ = hyper.fs_release().await.expect("release");
@@ -1115,6 +1112,54 @@ async fn smoke_truncate_shrink_to_zero_block_boundary() {
     let mut buf = vec![0u8; BLOCK];
     hyper.fs_read(0, &mut buf).await.expect("read");
     assert!(buf.iter().all(|&b| b == 0xAA), "block 0 (0xAA) must survive");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Regression test for the "assign key not found in direct node"
+/// failure: write multiple blocks, then immediately truncate-shrink
+/// across a block boundary WITHOUT calling fs_flush in between.
+///
+/// Pre-fix: the dirty data block cache still held the truncated-
+/// away blocks, so the next flush iterated those blocks and called
+/// `bmap.assign(blk_idx, real_ptr)` on a key that bmap.truncate
+/// had just dropped — surfacing as `NotFound: assign key not found
+/// in direct node`.
+///
+/// Fix: `truncate_shrink` now removes dirty cache entries whose
+/// key would be discarded by the bmap.truncate that follows.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_shrink_with_unflushed_writes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload = vec![0xAAu8; BLOCK * 3]; // 3 dirty blocks: 0, 1, 2
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        // No fs_flush here — dirty cache has blocks 0, 1, 2.
+        // Truncate to mid-block 1: drops bmap entries 2..; the
+        // dirty cache entry for block 2 must be evicted by
+        // truncate or the subsequent internal flush will fail.
+        hyper.fs_truncate(BLOCK + 904).await
+            .expect("truncate-shrink with unflushed dirty cache must not fail");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, BLOCK + 904);
+
+    let mut buf = vec![0u8; BLOCK + 904];
+    hyper.fs_read(0, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|&b| b == 0xAA),
+        "first 5000 bytes of 0xAA must survive truncate");
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }

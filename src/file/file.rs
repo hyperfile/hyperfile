@@ -1006,6 +1006,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
         }
 
+        // Drop any dirty cache entry whose key is about to be
+        // truncated from the bmap. Without this the next flush
+        // would iterate the dirty list, find a block with no
+        // matching bmap entry, and fail
+        // `bmap.assign(blk_idx, ptr) -> NotFound`.
+        let _ = self.cache.truncate_dirty_blocks_above(tgt_blk_idx);
+
         // if need to shrink bmap
         if let Err(e) = self.bmap.truncate(&tgt_blk_idx).await {
             if e.kind() != ErrorKind::NotFound {

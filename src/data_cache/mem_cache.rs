@@ -190,6 +190,30 @@ impl Cache for MemCache {
         self.data_blocks_dirty.len()
     }
 
+    fn truncate_dirty_blocks_above(&mut self, boundary: BlockIndex) -> usize {
+        let mut removed = 0;
+        // BTreeMap doesn't expose a `split_off_keys_above` so we
+        // collect the keys first and then drop. The dirty map is
+        // bounded by the dirty-blocks threshold (defaults from
+        // lib.rs are in the tens to thousands range), so the
+        // intermediate Vec is fine. Also drop any clean cached
+        // entry at the same key — its content is a snapshot of a
+        // block that's about to be dropped.
+        let to_remove: Vec<BlockIndex> = self.data_blocks_dirty
+            .range(boundary..)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in to_remove {
+            if self.data_blocks_dirty.remove(&k).is_some() {
+                removed += 1;
+            }
+            if self.data_cache_blocks > 0 {
+                let _ = self.data_blocks_cache.pop(&k);
+            }
+        }
+        removed
+    }
+
     fn get_dirty(&self) -> DirtyDataBlocks<'_> {
         let b: BTreeMap<BlockIndex, &DataBlock> = self.data_blocks_dirty.iter()
                         .map(|(idx, blk)| (*idx, blk))

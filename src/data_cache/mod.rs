@@ -23,6 +23,15 @@ pub(crate) trait Cache {
     fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex>;
     fn update_cache(&mut self, blk_idx: &BlockIndex, off: usize, buf: &[u8]);
     fn truncate_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> bool;
+    /// Remove every dirty entry whose key is `>= boundary` from
+    /// the cache. Used by `truncate_shrink` to keep the dirty
+    /// list consistent with the bmap, which is about to drop the
+    /// same range of keys: a stale dirty entry would otherwise
+    /// surface during the next flush as
+    /// `bmap.assign(blk_idx, ...) -> NotFound("assign key not
+    /// found in direct node")`. Returns the number of entries
+    /// removed.
+    fn truncate_dirty_blocks_above(&mut self, boundary: BlockIndex) -> usize;
     fn dirty_count(&self) -> usize;
     fn get_dirty(&self) -> DirtyDataBlocks<'_>;
     fn clear_dirty(&mut self);

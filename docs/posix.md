@@ -116,14 +116,6 @@ with second + nanosecond resolution. They update as follows:
 Truncate updates `mtime`. It does **not** itself flush; pair with
 `fs_flush` or `fs_release` to persist.
 
-**Caveat**: shrinking across block boundaries while the bmap has
-unflushed dirty entries can fail with `ErrorKind::NotFound`
-("assign key not found in direct node"), surfaced from
-`btree-ondisk` during the bmap-truncate step. Workaround: call
-`fs_flush()` between writes and a cross-block-boundary
-`fs_truncate(shrink)`. Same-block truncates and extending
-truncates are unaffected.
-
 ## Read on a zero-length file
 
 A `fs_read` issued on a file whose `i_size` is 0 returns `Ok(0)`
