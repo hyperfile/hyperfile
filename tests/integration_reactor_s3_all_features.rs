@@ -51,7 +51,7 @@ async fn all_features_write_read_round_trip() {
         .with_wal_config(&wal_config)
         .build();
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
 
     {
         let hyper = Hyper::create(
@@ -62,7 +62,7 @@ async fn all_features_write_read_round_trip() {
         )
         .await
         .expect("create");
-        let fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -93,7 +93,7 @@ async fn all_features_write_read_round_trip() {
         )
         .await
         .expect("reopen");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -108,6 +108,5 @@ async fn all_features_write_read_round_trip() {
         let _ = fh.fh_release().await;
     }
 
-    drop(spawner);
     let _ = Hyper::fs_unlink(&client, tf.uri()).await;
 }

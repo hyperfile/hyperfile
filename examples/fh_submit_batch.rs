@@ -13,7 +13,7 @@ use hyperfile::file::mode::FileMode;
 use hyperfile::buffer::BatchDataBlockWrapper;
 use hyperfile::file::handler::FileContext;
 use hyperfile::utils;
-use reactor::LocalSpawner;
+use hyperfile_reactor::Reactor;
 
 const NUM_ITER: usize = 1000;
 const VERIFY_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -22,7 +22,7 @@ const DEFAULT_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
 const DEFAULT_RANDOM_WRITE_OFFSET: Range<usize> = 0..DEFAULT_MAX_FILE_SIZE;
 const DEFAULT_RANDOM_WRITE_BYTES: Range<usize> = 1..DEFAULT_BLOCK_SIZE*1024; // 1Byte to 4MiB
 
-async fn prepare_hyper(spawner: &LocalSpawner<FileContext<'static>, Hyper<'static>>, client: &Client, uri: &str) -> Result<HyperFileHandler<'static>> {
+async fn prepare_hyper(reactor: &Reactor<FileContext<'static>, Hyper<'static>>, client: &Client, uri: &str) -> Result<HyperFileHandler<'static>> {
     // clear any existing on staging
     let _ = Hyper::fs_unlink(client, uri).await
                         .or_else(|e| {
@@ -38,7 +38,7 @@ async fn prepare_hyper(spawner: &LocalSpawner<FileContext<'static>, Hyper<'stati
     runtime_config.data_cache_dirty_max_flush_interval = u64::MAX;
     runtime_config.data_cache_dirty_max_bytes_threshold = usize::MAX;
     runtime_config.data_cache_dirty_max_blocks_threshold = usize::MAX;
-    let hyper = HyperFileHandler::fh_create_opt(spawner, client, uri, flags, mode, &meta_config, &runtime_config).await?;
+    let hyper = HyperFileHandler::fh_create_opt(reactor, client, uri, flags, mode, &meta_config, &runtime_config).await?;
     Ok(hyper)
 }
 
@@ -136,8 +136,8 @@ async fn main() -> Result<()> {
         write_chunks.push((offset, data));
     }
 
-    let spawner = LocalSpawner::new_current();
-    let mut hyper = prepare_hyper(&spawner, &client, &uri).await?;
+    let reactor = Reactor::new_current()?;
+    let mut hyper = prepare_hyper(&reactor, &client, &uri).await?;
     let start = Instant::now();
 
     // write in memory buffer
@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
     runtime_config.data_cache_dirty_max_flush_interval = u64::MAX;
     runtime_config.data_cache_dirty_max_bytes_threshold = usize::MAX;
     runtime_config.data_cache_dirty_max_blocks_threshold = usize::MAX;
-    let mut hyper = HyperFileHandler::fh_open_opt(&spawner, &client, &uri, flags, &runtime_config).await?;
+    let mut hyper = HyperFileHandler::fh_open_opt(&reactor, &client, &uri, flags, &runtime_config).await?;
 
     verify(&mut hyper).await?;
 

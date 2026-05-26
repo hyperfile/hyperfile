@@ -44,12 +44,12 @@ async fn reactor_rl_concurrent_disjoint_writes_succeed() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
 
     // Pre-create so both writers open the same file.
     {
         let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         )
         .await
         .expect("create");
@@ -58,7 +58,7 @@ async fn reactor_rl_concurrent_disjoint_writes_succeed() {
 
     // Open once, clone for the two concurrent writers.
     let fh = HyperFileHandler::fh_open(
-        &spawner, &client, tf.uri(), FileFlags::rdwr(),
+        &reactor, &client, tf.uri(), FileFlags::rdwr(),
     )
     .await
     .expect("open");
@@ -92,7 +92,7 @@ async fn reactor_rl_concurrent_disjoint_writes_succeed() {
 
     // Verify persisted state contains both payloads.
     let mut fh = HyperFileHandler::fh_open(
-        &spawner, &client, tf.uri(), FileFlags::rdonly(),
+        &reactor, &client, tf.uri(), FileFlags::rdonly(),
     )
     .await
     .expect("reopen");
@@ -108,7 +108,6 @@ async fn reactor_rl_concurrent_disjoint_writes_succeed() {
     assert!(buf_b.iter().all(|&b| b == 0xBB), "B's range was not preserved");
 
     let _ = fh.fh_release().await;
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 
@@ -122,11 +121,11 @@ async fn reactor_rl_concurrent_overlapping_writes_serialize() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
 
     {
         let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         )
         .await
         .expect("create");
@@ -134,7 +133,7 @@ async fn reactor_rl_concurrent_overlapping_writes_serialize() {
     }
 
     let fh = HyperFileHandler::fh_open(
-        &spawner, &client, tf.uri(), FileFlags::rdwr(),
+        &reactor, &client, tf.uri(), FileFlags::rdwr(),
     )
     .await
     .expect("open");
@@ -163,7 +162,7 @@ async fn reactor_rl_concurrent_overlapping_writes_serialize() {
     // Verify the 4 KiB block is homogeneous — either all A (0xAA) or
     // all B (0xBB). Anything else means the writes overlapped.
     let mut fh = HyperFileHandler::fh_open(
-        &spawner, &client, tf.uri(), FileFlags::rdonly(),
+        &reactor, &client, tf.uri(), FileFlags::rdonly(),
     )
     .await
     .expect("reopen");
@@ -179,7 +178,6 @@ async fn reactor_rl_concurrent_overlapping_writes_serialize() {
         buf[0], buf[4095],
     );
 
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 
@@ -194,10 +192,10 @@ async fn reactor_rl_flush_waits_for_inflight_writes() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     {
         let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         )
         .await
         .expect("create");
@@ -205,7 +203,7 @@ async fn reactor_rl_flush_waits_for_inflight_writes() {
     }
 
     let fh = HyperFileHandler::fh_open(
-        &spawner, &client, tf.uri(), FileFlags::rdwr(),
+        &reactor, &client, tf.uri(), FileFlags::rdwr(),
     )
     .await
     .expect("open");
@@ -236,7 +234,7 @@ async fn reactor_rl_flush_waits_for_inflight_writes() {
     // Regardless of flush-vs-write interleaving, the final persisted
     // state must reflect the write in full.
     let mut fh = HyperFileHandler::fh_open(
-        &spawner, &client, tf.uri(), FileFlags::rdonly(),
+        &reactor, &client, tf.uri(), FileFlags::rdonly(),
     )
     .await
     .expect("reopen");
@@ -248,6 +246,5 @@ async fn reactor_rl_flush_waits_for_inflight_writes() {
     assert_eq!(buf, payload_expected, "persisted data mismatch after race");
 
     let _ = fh.fh_release().await;
-    drop(spawner);
     tf.cleanup(&client).await;
 }

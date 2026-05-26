@@ -28,7 +28,7 @@ use tokio::sync::{OwnedSemaphorePermit, OwnedMutexGuard};
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 #[cfg(all(feature = "wal", feature = "reactor"))]
-use hyperfile_reactor::TaskHandler;
+use crate::file::handler::ChannelGroup;
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::file::handler::FileContext;
 use crate::*;
@@ -516,7 +516,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     }}
 
     #[cfg(all(feature = "wal", feature = "reactor"))]
-    fn wal_flush_process_reactor<'a: 'static>(&mut self, fh: TaskHandler<FileContext<'a>>, lock: OwnedMutexGuard<()>)
+    fn wal_flush_process_reactor<'a: 'static>(&mut self, fh: ChannelGroup<FileContext<'a>>, lock: OwnedMutexGuard<()>)
             -> impl Future<Output = std::result::Result<SegmentId, (OwnedMutexGuard<()>, Error)>>
     {async move {
         let fn_start = Instant::now();
@@ -550,19 +550,19 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
                 Err(e) => {
                     warn!("segment write failed in wal flush process: {:?}", e);
                     let ctx = FileContext::new_wal_flush_recovery(lock);
-                    fh.send_cb(ctx);
+                    let _ = fh.send_cb(ctx);
                     return;
                 },
             }
             match staging.flush_inode(raw_inode.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
                 Ok(od_state) => {
                     let ctx = FileContext::new_wal_flush_done(lock, segid, od_state.unwrap().clone(), bmap_cache_limit);
-                    fh.send_cb(ctx);
+                    let _ = fh.send_cb(ctx);
                 },
                 Err(e) => {
                     warn!("flush inode failed in wal flush process: {:?}", e);
                     let ctx = FileContext::new_wal_flush_recovery(lock);
-                    fh.send_cb(ctx);
+                    let _ = fh.send_cb(ctx);
                 },
             }
         });

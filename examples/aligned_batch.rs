@@ -4,7 +4,7 @@ use std::time::Instant;
 use rand::Rng;
 use rand::prelude::SliceRandom;
 use aws_sdk_s3::Client;
-use reactor::LocalSpawner;
+use hyperfile_reactor::Reactor;
 use hyperfile::BlockIndex;
 use hyperfile::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use hyperfile::file::fh::HyperFileHandler;
@@ -20,7 +20,7 @@ const BLOCK_SIZE: u64 = 4096;
 const VERIFY_CHUNK_SIZE: usize = 1 * 1024 * 1024 * 1024;
 const SCATTER_BLOCKS_COUNT: usize = 1000_000; // 4GiB random data
 
-async fn prepare_hyper(spawner: &LocalSpawner<FileContext<'static>, Hyper<'static>>, client: &Client, uri: &str) -> Result<HyperFileHandler<'static>> {
+async fn prepare_hyper(reactor: &Reactor<FileContext<'static>, Hyper<'static>>, client: &Client, uri: &str) -> Result<HyperFileHandler<'static>> {
     // clear any existing on staging
     let _ = Hyper::fs_unlink(client, uri).await
                         .or_else(|e| {
@@ -37,7 +37,7 @@ async fn prepare_hyper(spawner: &LocalSpawner<FileContext<'static>, Hyper<'stati
     runtime_config.data_cache_dirty_max_flush_interval = u64::MAX;
     runtime_config.data_cache_dirty_max_bytes_threshold = usize::MAX;
     runtime_config.data_cache_dirty_max_blocks_threshold = usize::MAX;
-    let hyper = HyperFileHandler::fh_create_opt(spawner, client, uri, flags, mode, &meta_config, &runtime_config).await?;
+    let hyper = HyperFileHandler::fh_create_opt(reactor, client, uri, flags, mode, &meta_config, &runtime_config).await?;
     Ok(hyper)
 }
 
@@ -95,8 +95,8 @@ async fn main() -> Result<()> {
     }
     println!("{} of random blocks prepared...", SCATTER_BLOCKS_COUNT);
 
-    let spawner = LocalSpawner::new_current();
-    let mut hyper = prepare_hyper(&spawner, &client, &uri).await?;
+    let reactor = Reactor::new_current()?;
+    let mut hyper = prepare_hyper(&reactor, &client, &uri).await?;
     println!("write random data with fh_write* fn...");
     let start = Instant::now();
     for (_, block) in blocks.iter() {
@@ -114,8 +114,8 @@ async fn main() -> Result<()> {
     // get sorted vec for batch
     let v: Vec<AlignedDataBlockWrapper> = blocks.into_values().collect();
 
-    let spawner = LocalSpawner::new_current();
-    let mut hyper = prepare_hyper(&spawner, &client, &uri).await?;
+    let reactor = Reactor::new_current()?;
+    let mut hyper = prepare_hyper(&reactor, &client, &uri).await?;
     println!("write random data with batch fn...");
     let start = Instant::now();
     let _ = hyper.fh_write_aligned_batch(v).await?;

@@ -1,18 +1,101 @@
 //! impl request handler style IO process
 use std::mem::ManuallyDrop;
-use std::io::{Result, ErrorKind};
+use std::io::{Error, Result, ErrorKind};
 #[cfg(feature = "wal")]
 use log::{warn, info, debug};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 #[cfg(feature = "wal")]
 use tokio::sync::OwnedMutexGuard;
-use hyperfile_reactor::{Task, TaskHandler};
+use hyperfile_reactor::{Capacity, Channel, Task, TaskBuilder, TaskHandler};
 use crate::SegmentId;
 #[cfg(feature = "wal")]
 use crate::inode::OnDiskState;
 use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use super::hyper::Hyper;
 use super::HyperTrait;
+
+/// Wrapper around `TaskHandler` that bundles three priority
+/// channels (highprio / cb / user) and exposes them as named send
+/// methods. All three channels are unbounded.
+///
+/// Built once per Hyper task by [`build_channel_group`]; cheaply
+/// cloneable thereafter (the inner handler is `Arc`-backed and the
+/// `Channel` tokens are `Copy`).
+///
+/// ## Channel priorities
+///
+/// - `highprio` (priority 0): retried requests after a contention
+///   miss (range-lock taken, semaphore busy). They were already
+///   accepted from the user but couldn't proceed; we put them
+///   ahead of new user requests so the request being retried
+///   doesn't get starved.
+/// - `cb` (priority 1): internal callback re-routes (multi-hop
+///   pipelines like WAL write -> WAL PUT done -> cache update).
+///   Higher than `user` so the in-progress hop finishes before a
+///   new request starts a new hop and grabs the per-file
+///   semaphore.
+/// - `user` (priority 2): incoming user requests from
+///   `HyperFileHandler::fh_*` / `HyperFileTokio::*`.
+pub struct ChannelGroup<Ctx> {
+    inner: TaskHandler<Ctx>,
+    highprio: Channel<Ctx>,
+    cb: Channel<Ctx>,
+    user: Channel<Ctx>,
+}
+
+impl<Ctx> Clone for ChannelGroup<Ctx> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            highprio: self.highprio,
+            cb: self.cb,
+            user: self.user,
+        }
+    }
+}
+
+impl<Ctx> ChannelGroup<Ctx> {
+    /// Send a context to the user channel. Returns
+    /// `Err(BrokenPipe)` if the reactor task has terminated.
+    pub fn send(&self, ctx: Ctx) -> Result<()> {
+        self.inner.send(self.user, ctx).map_err(|_| {
+            Error::new(ErrorKind::BrokenPipe, "reactor handler task died")
+        })
+    }
+
+    /// Send a context to the callback channel.
+    pub fn send_cb(&self, ctx: Ctx) -> Result<()> {
+        self.inner.send(self.cb, ctx).map_err(|_| {
+            Error::new(ErrorKind::BrokenPipe, "reactor handler task died")
+        })
+    }
+
+    /// Send a context to the high-priority channel.
+    pub fn send_highprio(&self, ctx: Ctx) -> Result<()> {
+        self.inner.send(self.highprio, ctx).map_err(|_| {
+            Error::new(ErrorKind::BrokenPipe, "reactor handler task died")
+        })
+    }
+}
+
+/// Build the standard 3-channel `TaskBuilder` used by every
+/// hyperfile reactor task, returning the matching `ChannelGroup`
+/// constructor.
+///
+/// Returns `(builder, |handler| -> ChannelGroup)`: the caller
+/// passes the builder to `Reactor::spawn_async`, then feeds the
+/// resulting `TaskHandler` through the closure to get a fully
+/// wired `ChannelGroup`.
+pub fn build_channel_group<Ctx>() -> (TaskBuilder<Ctx>, impl FnOnce(TaskHandler<Ctx>) -> ChannelGroup<Ctx>)
+where
+    Ctx: Send + 'static,
+{
+    let mut builder = TaskBuilder::<Ctx>::new();
+    let highprio = builder.add_channel(0, Capacity::Unbounded);
+    let cb       = builder.add_channel(1, Capacity::Unbounded);
+    let user     = builder.add_channel(2, Capacity::Unbounded);
+    (builder, move |inner| ChannelGroup { inner, highprio, cb, user })
+}
 
 pub type FileRespGetAttr = Result<libc::stat>;
 pub type FileRespSetAttr = Result<libc::stat>;
@@ -164,7 +247,7 @@ impl FileResp {
 pub struct FileReqRead<'a> {
     pub buf: &'a mut [u8],
     pub offset: usize,
-    pub fh: TaskHandler<FileContext<'a>>,
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 pub struct FileReqWrite<'a> {
@@ -172,7 +255,7 @@ pub struct FileReqWrite<'a> {
     pub offset: usize,
     pub fetched: Vec<DataBlock>,
     pub spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
-    pub fh: TaskHandler<FileContext<'a>>,
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 pub struct FileReqWriteZero<'a> {
@@ -180,7 +263,7 @@ pub struct FileReqWriteZero<'a> {
     pub len: usize,
     pub fetched: Vec<DataBlock>,
     pub spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
-    pub fh: TaskHandler<FileContext<'a>>,
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 pub struct FileReqWriteAlignedBatch {
@@ -202,12 +285,12 @@ pub struct FileReqSetAttr {
 }
 
 pub struct FileReqFlush<'a> {
-    pub fh: TaskHandler<FileContext<'a>>,
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 #[cfg(feature = "wal")]
 pub struct FileReqWalFlush<'a> {
-    pub fh: TaskHandler<FileContext<'a>>,
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 #[cfg(feature = "wal")]
@@ -224,7 +307,7 @@ pub struct FileReqWalFlushRecovery {
 }
 
 pub struct FileReqRelease<'a> {
-    pub fh: TaskHandler<FileContext<'a>>,
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 pub struct FileReqLastCno {}
@@ -317,7 +400,7 @@ impl<'a> FileContext<'a> {
     }
 
     // return both tx and rx, for mpsc channel we need to keep tx until we receved response
-    pub fn new_read(buf: &'a mut [u8], offset: usize, fh: TaskHandler<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespRead>, mpsc::Receiver<FileRespRead>) {
+    pub fn new_read(buf: &'a mut [u8], offset: usize, fh: ChannelGroup<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespRead>, mpsc::Receiver<FileRespRead>) {
         let (tx, rx) = mpsc::channel::<FileRespRead>(1);
         let req = FileReq {
             op: FileReqOp::Read,
@@ -328,7 +411,7 @@ impl<'a> FileContext<'a> {
     }
 
     // return both tx and rx, for mpsc channel we need to keep tx until we receved response
-    pub fn new_write(buf: &'a [u8], offset: usize, fh: TaskHandler<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>) {
+    pub fn new_write(buf: &'a [u8], offset: usize, fh: ChannelGroup<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>) {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let req = FileReq {
             op: FileReqOp::Write,
@@ -365,7 +448,7 @@ impl<'a> FileContext<'a> {
     }
 
     // return both tx and rx, for mpsc channel we need to keep tx until we receved response
-    pub fn new_write_zero(offset: usize, len: usize, fh: TaskHandler<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>) {
+    pub fn new_write_zero(offset: usize, len: usize, fh: ChannelGroup<FileContext<'a>>) -> (Self, mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>) {
         let (tx, rx) = mpsc::channel::<FileRespWriteZero>(1);
         let req = FileReq {
             op: FileReqOp::WriteZero,
@@ -431,7 +514,7 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
-    pub fn new_flush(fh: TaskHandler<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespFlush>) {
+    pub fn new_flush(fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespFlush>) {
         let (tx, rx) = oneshot::channel::<FileRespFlush>();
         let req = FileReq {
             op: FileReqOp::Flush,
@@ -443,7 +526,7 @@ impl<'a> FileContext<'a> {
 
     // only used by internal driven process when wal enabled
     #[cfg(feature = "wal")]
-    pub fn new_wal_flush(fh: TaskHandler<FileContext<'a>>) -> Self {
+    pub fn new_wal_flush(fh: ChannelGroup<FileContext<'a>>) -> Self {
         let req = FileReq {
             op: FileReqOp::WalFlush,
             body: FileReqBody { wal_flush: ManuallyDrop::new(FileReqWalFlush { fh, }), },
@@ -472,7 +555,7 @@ impl<'a> FileContext<'a> {
         Self { req: Some(req), resp: Some(resp) }
     }
 
-    pub fn new_release(fh: TaskHandler<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespRelease>) {
+    pub fn new_release(fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespRelease>) {
         let (tx, rx) = oneshot::channel::<FileRespRelease>();
         let req = FileReq {
             op: FileReqOp::Release,
@@ -545,7 +628,7 @@ impl<'a> FileContext<'a> {
 impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
 {
     // main loop
-    async fn handler(&mut self, ctx: FileContext<'a>) {
+    async fn handle(&mut self, ctx: FileContext<'a>) {
         let (req, resp) = ctx.take();
         match req.op {
             FileReqOp::GetAttr => {
@@ -769,7 +852,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 if self.inner.range_lock.is_locked() {
                     let fh = _req.fh.clone();
                     let ctx = FileContext::reform_flush(_req, resp);
-                    fh.send_cb(ctx);
+                    let _ = fh.send_cb(ctx);
                     return;
                 }
                 let res = self.inner.flush().await;
@@ -785,7 +868,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     let ctx = FileContext::reform_flush(req, resp);
                     // move flush op to cb queue
                     // so that flush op can run immediately after all inflight write op finished
-                    fh.send_cb(ctx);
+                    let _ = fh.send_cb(ctx);
                     return;
                 }
                 let res = if self.inner.wal.is_none() {
@@ -802,7 +885,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                         let ctx = FileContext::reform_flush(req, resp);
                         // move flush op to cb queue
                         // so that flush op can run immediately after all inflight write op finished
-                        fh.send_cb(ctx);
+                        let _ = fh.send_cb(ctx);
                         return;
                     }
                     res
@@ -819,7 +902,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     let ctx = FileContext::reform_wal_flush(req, resp);
                     // move flush op to cb queue
                     // so that flush op can run immediately after all inflight write op finished
-                    fh.send_cb(ctx);
+                    let _ = fh.send_cb(ctx);
                     return;
                 }
                 let res = self.inner.kick_wal_protected_flush_reactor(req.fh).await;
@@ -865,7 +948,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                         } else {
                             let fh = req.fh.clone();
                             let ctx = FileContext::reform_release(req, resp);
-                            fh.send_highprio(ctx);
+                            let _ = fh.send_highprio(ctx);
                         }
                     },
                 }
@@ -885,15 +968,27 @@ mod tests {
     use super::*;
     use std::mem::ManuallyDrop;
     use tokio::task::LocalSet;
+    use hyperfile_reactor::Reactor;
 
-    // Minimal Task impl to obtain a real TaskHandler
+    // Minimal Task impl to obtain a real ChannelGroup for tests.
     struct DummyTask;
     impl Task<FileContext<'static>> for DummyTask {
-        async fn handler(&mut self, _ctx: FileContext<'static>) {}
+        async fn handle(&mut self, _ctx: FileContext<'static>) {}
     }
 
-    async fn make_handler() -> TaskHandler<FileContext<'static>> {
-        DummyTask.start()
+    async fn make_handler() -> ChannelGroup<FileContext<'static>> {
+        // Tests construct FileReq structs that carry an `fh:
+        // ChannelGroup` field, but never actually send through it.
+        // Spawn a throwaway reactor + dummy task to obtain a live
+        // ChannelGroup, then leak the reactor so the senders inside
+        // the ChannelGroup stay valid for the lifetime of the test.
+        let reactor = Reactor::<FileContext<'static>, DummyTask>::new_current()
+            .expect("reactor");
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(DummyTask, builder).await
+            .expect("spawn");
+        std::mem::forget(reactor);
+        finish(handler)
     }
 
     // ==================== oneshot patterns ====================

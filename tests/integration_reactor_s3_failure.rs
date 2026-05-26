@@ -44,7 +44,7 @@ async fn reactor_fail_path_domain_error_returns_err() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
 
     // The first flush_inode call happens inside fh_create_with
     // itself (to persist the newly-created inode). Target the
@@ -52,7 +52,7 @@ async fn reactor_fail_path_domain_error_returns_err() {
     // fh_flush is the one that fails.
     let interceptor = FailOnFlushInode::at(2);
     let mut fh = HyperFileHandler::fh_create_with(
-        &spawner,
+        &reactor,
         &client,
         tf.uri(),
         FileFlags::rdwr(),
@@ -81,7 +81,6 @@ async fn reactor_fail_path_domain_error_returns_err() {
     // triggers another flush; don't care.
     let _ = fh.fh_release().await;
     drop(fh);
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 
@@ -96,9 +95,9 @@ async fn reactor_spawner_dropped_handle_still_works() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let mut fh = HyperFileHandler::fh_create(
-        &spawner,
+        &reactor,
         &client,
         tf.uri(),
         FileFlags::rdwr(),
@@ -108,7 +107,6 @@ async fn reactor_spawner_dropped_handle_still_works() {
     .expect("fh_create");
 
     // Drop the spawner while we still hold fh.
-    drop(spawner);
 
     // If our assumption is correct, the spawner thread is kept
     // alive by the sender inside fh and this still works.
@@ -145,13 +143,13 @@ async fn reactor_handler_panic_via_interceptor_returns_broken_pipe() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
 
     // First call is the create-time internal flush; panic on call
     // #2 which is the user's explicit fh_flush.
     let interceptor = PanicOnFlushInode::at(2);
     let mut fh = HyperFileHandler::fh_create_with(
-        &spawner,
+        &reactor,
         &client,
         tf.uri(),
         FileFlags::rdwr(),
@@ -183,7 +181,6 @@ async fn reactor_handler_panic_via_interceptor_returns_broken_pipe() {
     );
 
     drop(fh);
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 

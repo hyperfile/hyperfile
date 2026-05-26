@@ -1,7 +1,7 @@
 use std::io::Result;
-use tokio::sync::oneshot;
 use aws_sdk_s3::Client;
-use hyperfile_reactor::{LocalSpawner, TaskHandler};
+use hyperfile_reactor::Reactor;
+use crate::file::handler::{ChannelGroup, build_channel_group};
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use crate::staging::{s3::S3Staging, StagingIntercept};
@@ -12,7 +12,7 @@ use super::handler::FileContext;
 
 #[derive(Clone)]
 pub struct HyperFileHandler<'a> {
-    inner: TaskHandler<FileContext<'a>>,
+    inner: ChannelGroup<FileContext<'a>>,
 }
 
 impl<'a: 'static> HyperFileHandler<'a> {
@@ -20,80 +20,80 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// the caller needs full `HyperFileConfig` control (e.g. WAL
     /// configuration) that isn't surfaced by the other `fh_*`
     /// constructors.
-    pub async fn fh_from_hyper(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, hyper: Hyper<'a>) -> Result<Self>
+    pub async fn fh_from_hyper(reactor: &Reactor<FileContext<'a>, Hyper<'a>>, hyper: Hyper<'a>) -> Result<Self>
     {
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
-    pub async fn fh_create(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
+    pub async fn fh_create(reactor: &Reactor<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         let hyper = Hyper::fs_create(client, uri, flags, mode).await?;
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
-    pub async fn fh_create_with(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode, interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
+    pub async fn fh_create_with(reactor: &Reactor<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode, interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
     {
         let hyper = Hyper::fs_create_with_interceptor(client, uri, flags, mode, interceptor).await?;
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
-    pub async fn fh_create_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
+    pub async fn fh_create_opt(reactor: &Reactor<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
             meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
         let hyper = Hyper::fs_create_opt(client, uri, flags, mode, meta_config, runtime_config).await?;
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
-    pub async fn fh_create_opt_with_interceptor(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>,
+    pub async fn fh_create_opt_with_interceptor(reactor: &Reactor<FileContext<'a>, Hyper<'a>>,
             client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
             meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig,
             interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<Self>
     {
         let hyper = Hyper::fs_create_opt_with_interceptor(client, uri, flags, mode, meta_config, runtime_config, interceptor).await?;
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
-    pub async fn fh_open(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    pub async fn fh_open(reactor: &Reactor<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
     {
         let hyper = Hyper::fs_open(client, uri, flags).await?;
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
-    pub async fn fh_open_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags,
+    pub async fn fh_open_opt(reactor: &Reactor<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags,
             runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
         let hyper = Hyper::fs_open_opt(client, uri, flags, runtime_config).await?;
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
-    pub async fn fh_open_or_create_with_default_opt(spawner: &LocalSpawner<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
+    pub async fn fh_open_or_create_with_default_opt(reactor: &Reactor<FileContext<'a>, Hyper<'a>>, client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags, mode).await?;
-        let (tx, rx) = oneshot::channel();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh })
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler) })
     }
 
     pub async fn fh_unlink(client: &Client, uri: &str) -> Result<()>
@@ -104,7 +104,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_release(&mut self) -> Result<u64>
     {
         let (ctx, rx) = FileContext::new_release(self.inner.clone());
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
@@ -114,7 +114,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
             std::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
         };
         let (ctx, tx, mut rx) = FileContext::new_read(b, off, self.inner.clone());
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
         drop(tx);
         let _ = buf;
@@ -127,7 +127,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
             std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len())
         };
         let (ctx, tx, mut rx) = FileContext::new_write(b, off, self.inner.clone());
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
         drop(tx);
         let _ = buf;
@@ -137,7 +137,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_write_zero(&mut self, off: usize, len: usize) -> Result<usize>
     {
         let (ctx, tx, mut rx) = FileContext::new_write_zero(off, len, self.inner.clone());
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
         drop(tx);
         res
@@ -146,49 +146,49 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize>
     {
         let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks);
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize>
     {
         let (ctx, mut rx) = FileContext::new_write_batch(blocks);
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_flush(&mut self) -> Result<u64>
     {
         let (ctx, rx) = FileContext::new_flush(self.inner.clone());
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_truncate(&mut self, offset: usize) -> Result<()>
     {
         let (ctx, rx) = FileContext::new_trunc(offset);
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_getattr(&self) -> Result<libc::stat>
     {
         let (ctx, rx) = FileContext::new_getattr();
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_setattr(&self, stat: libc::stat) -> Result<libc::stat>
     {
         let (ctx, rx) = FileContext::new_setattr(stat);
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_last_cno(&self) -> Result<u64>
     {
         let (ctx, rx) = FileContext::new_last_cno();
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))
     }
 }

@@ -13,28 +13,30 @@
 //! use common_reactor::*;
 //! ```
 //!
-//! The whole module is gated on `feature = "reactor"` because none of
-//! the reactor APIs (`HyperFileHandler`, `HyperFileTokio`,
-//! `LocalSpawner`) exist without it.
+//! The whole module is gated on `feature = "reactor"` because none
+//! of the reactor APIs (`HyperFileHandler`, `HyperFileTokio`,
+//! `Reactor`) exist without it.
 
 #![cfg(feature = "reactor")]
 #![allow(dead_code)]
 
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::handler::FileContext;
-use hyperfile_reactor::LocalSpawner;
+use hyperfile_reactor::Reactor;
 
-/// Type alias for the reactor spawner used by hyperfile tests. The
-/// spawner starts an OS thread running a current-thread tokio runtime
-/// that owns the `Hyper` instances and their handler loops.
-pub type HyperSpawner = LocalSpawner<FileContext<'static>, Hyper<'static>>;
+/// Type alias for the reactor used by hyperfile tests. The reactor
+/// owns an OS thread running a current-thread tokio runtime that
+/// hosts the `Hyper` instance and its handler loop.
+pub type HyperReactor = Reactor<FileContext<'static>, Hyper<'static>>;
 
-/// Create a fresh spawner using `new_current` (current-thread runtime).
+/// Create a fresh reactor using `new_current` (current-thread
+/// runtime).
 ///
-/// When the returned spawner (and every `HyperFileHandler` / handler
-/// clone derived from it) is dropped, the backing OS thread winds down
-/// once its handler loops exit and all tasks complete. Tests do not
-/// need to join the thread explicitly; the process will reap it.
-pub fn make_spawner() -> HyperSpawner {
-    LocalSpawner::new_current()
+/// When the returned reactor is dropped (along with every
+/// `HyperFileHandler` clone derived from it), the backing OS
+/// thread winds down once its handler loops exit and all tasks
+/// complete. Tests do not need to join the thread explicitly; the
+/// process will reap it.
+pub fn make_reactor() -> HyperReactor {
+    Reactor::new_current().expect("failed to create reactor")
 }

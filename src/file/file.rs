@@ -9,7 +9,7 @@ use std::time::{Instant, Duration};
 use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
 #[cfg(all(feature = "wal", feature = "reactor"))]
-use hyperfile_reactor::TaskHandler;
+use crate::file::handler::ChannelGroup;
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
@@ -692,7 +692,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     #[cfg(all(feature = "wal", feature = "reactor"))]
-    pub(crate) async fn kick_wal_protected_flush_reactor(&mut self, fh: TaskHandler<FileContext<'a>>) -> Result<SegmentId> {
+    pub(crate) async fn kick_wal_protected_flush_reactor(&mut self, fh: ChannelGroup<FileContext<'a>>) -> Result<SegmentId> {
         let Ok(lock) = self.flush_lock.clone().try_lock_owned() else {
             // FIXME: skip this flush by return ResourceBusy for now,
             // should this flush be re-queue?

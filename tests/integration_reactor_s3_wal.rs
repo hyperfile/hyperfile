@@ -65,7 +65,7 @@ async fn reactor_wal_smoke_write_flush_reopen() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let config = build_wal_config(tf.uri());
     let payload = b"hello wal world".to_vec();
 
@@ -80,7 +80,7 @@ async fn reactor_wal_smoke_write_flush_reopen() {
         .await
         .expect("create hyper with wal");
 
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn handler");
         fh.fh_write(0, &payload).await.expect("write");
@@ -98,7 +98,7 @@ async fn reactor_wal_smoke_write_flush_reopen() {
         .await
         .expect("open hyper with wal");
 
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn handler");
         let mut buf = vec![0u8; payload.len()];
@@ -107,7 +107,6 @@ async fn reactor_wal_smoke_write_flush_reopen() {
         let _ = fh.fh_release().await;
     }
 
-    drop(spawner);
     cleanup_with_wal(&client, tf.uri()).await;
 }
 
@@ -121,7 +120,7 @@ async fn reactor_wal_flush_and_reopen_is_idempotent() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let config = build_wal_config(tf.uri());
 
     // First pass: write A, flush, release.
@@ -135,7 +134,7 @@ async fn reactor_wal_flush_and_reopen_is_idempotent() {
         )
         .await
         .expect("create");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
         fh.fh_write(0, &payload_a).await.expect("write A");
@@ -153,7 +152,7 @@ async fn reactor_wal_flush_and_reopen_is_idempotent() {
         )
         .await
         .expect("open B");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn B");
         fh.fh_write(0, &payload_b).await.expect("write B");
@@ -171,7 +170,7 @@ async fn reactor_wal_flush_and_reopen_is_idempotent() {
         )
         .await
         .expect("reopen ro");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn ro");
         let mut buf = vec![0u8; payload_b.len()];
@@ -180,7 +179,6 @@ async fn reactor_wal_flush_and_reopen_is_idempotent() {
         let _ = fh.fh_release().await;
     }
 
-    drop(spawner);
     cleanup_with_wal(&client, tf.uri()).await;
 }
 
@@ -195,7 +193,7 @@ async fn reactor_wal_delete_after_flush() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let config = build_wal_config(tf.uri());
     let payload = vec![0xCDu8; 8192];
 
@@ -210,7 +208,7 @@ async fn reactor_wal_delete_after_flush() {
         .await
         .expect("create hyper with wal");
 
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn handler");
         fh.fh_write(0, &payload).await.expect("write");
@@ -251,7 +249,6 @@ async fn reactor_wal_delete_after_flush() {
         keys,
     );
 
-    drop(spawner);
     cleanup_with_wal(&client, tf.uri()).await;
 }
 
@@ -276,7 +273,7 @@ async fn reactor_wal_crash_recovery_replays_unflushed_write() {
     // Phase 1: create + release cleanly so the file exists on S3
     //          and the WAL prefix is empty.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::create(
             client.clone(),
             config.clone(),
@@ -285,17 +282,16 @@ async fn reactor_wal_crash_recovery_replays_unflushed_write() {
         )
         .await
         .expect("create");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
         let _ = fh.fh_release().await;
         drop(fh);
-        drop(spawner);
     }
 
     // Phase 2: reopen, write, crash (drop without flush/release).
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::open(
             client.clone(),
             config.clone(),
@@ -303,7 +299,7 @@ async fn reactor_wal_crash_recovery_replays_unflushed_write() {
         )
         .await
         .expect("reopen");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -312,14 +308,13 @@ async fn reactor_wal_crash_recovery_replays_unflushed_write() {
         // only delivered after the spawned WAL PUT task reports
         // back), so dropping here is a safe crash simulation.
         drop(fh);
-        drop(spawner);
     }
 
     // Phase 3: reopen. wal_flush_recovery should fire inside
     //          do_open and replay the WAL chunks, then force a
     //          flush so reading succeeds.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::open(
             client.clone(),
             config.clone(),
@@ -327,7 +322,7 @@ async fn reactor_wal_crash_recovery_replays_unflushed_write() {
         )
         .await
         .expect("reopen after crash");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -340,7 +335,6 @@ async fn reactor_wal_crash_recovery_replays_unflushed_write() {
 
         let _ = fh.fh_release().await;
         drop(fh);
-        drop(spawner);
     }
 
     cleanup_with_wal(&client, tf.uri()).await;
@@ -362,7 +356,7 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
 
     // Phase 1: create + release.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::create(
             client.clone(),
             config.clone(),
@@ -371,17 +365,16 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
         )
         .await
         .expect("create");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
         let _ = fh.fh_release().await;
         drop(fh);
-        drop(spawner);
     }
 
     // Phase 2: reopen, write two chunks, crash.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::open(
             client.clone(),
             config.clone(),
@@ -389,7 +382,7 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
         )
         .await
         .expect("reopen");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -398,12 +391,11 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
         // Both writes' WAL PUTs are complete by the time fh_write
         // returns Ok; safe to drop here.
         drop(fh);
-        drop(spawner);
     }
 
     // Phase 3: reopen, verify both payloads survive.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::open(
             client.clone(),
             config.clone(),
@@ -411,7 +403,7 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
         )
         .await
         .expect("reopen after crash");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -425,7 +417,6 @@ async fn reactor_wal_crash_recovery_multiple_disjoint_writes() {
 
         let _ = fh.fh_release().await;
         drop(fh);
-        drop(spawner);
     }
 
     cleanup_with_wal(&client, tf.uri()).await;
@@ -460,7 +451,7 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
 
     // Phase 1: clean create.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::create(
             client.clone(),
             config.clone(),
@@ -469,18 +460,17 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
         )
         .await
         .expect("create");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
         let _ = fh.fh_release().await;
         drop(fh);
-        drop(spawner);
     }
 
     // Phase 2: reopen, two concurrent writes via cloned handlers,
     //          then crash.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::open(
             client.clone(),
             config.clone(),
@@ -488,7 +478,7 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
         )
         .await
         .expect("reopen");
-        let fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -512,12 +502,11 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
         // have completed. Crash without flush/release.
         drop(fh_a);
         drop(fh_b);
-        drop(spawner);
     }
 
     // Phase 3: reopen, both payloads should be there.
     {
-        let spawner = make_spawner();
+        let reactor = make_reactor();
         let hyper = Hyper::open(
             client.clone(),
             config.clone(),
@@ -525,7 +514,7 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
         )
         .await
         .expect("reopen after crash");
-        let mut fh = HyperFileHandler::fh_from_hyper(&spawner, hyper)
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper)
             .await
             .expect("spawn");
 
@@ -539,7 +528,6 @@ async fn reactor_wal_crash_recovery_multiple_handles() {
 
         let _ = fh.fh_release().await;
         drop(fh);
-        drop(spawner);
     }
 
     cleanup_with_wal(&client, tf.uri()).await;

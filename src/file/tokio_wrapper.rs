@@ -8,7 +8,8 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 use tokio::sync::mpsc::error::TryRecvError as MpscTryRecvError;
 use tokio::sync::oneshot::error::TryRecvError as OneshotTryRecvError;
 use aws_sdk_s3::Client;
-use hyperfile_reactor::{LocalSpawner, TaskHandler};
+use hyperfile_reactor::Reactor;
+use crate::file::handler::{ChannelGroup, build_channel_group};
 use crate::config::{HyperFileConfig, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use super::hyper::Hyper;
 use super::flags::FileFlags;
@@ -37,9 +38,9 @@ enum Operation {
 }
 
 pub struct HyperFileTokio<'a> {
-    inner: TaskHandler<FileContext<'a>>,
+    inner: ChannelGroup<FileContext<'a>>,
     #[allow(dead_code)]
-    spawner: LocalSpawner<FileContext<'a>, Hyper<'a>>,
+    _reactor: Reactor<FileContext<'a>, Hyper<'a>>,
     state: State,
     pos: u64,
     seek_target: SeekFrom,
@@ -50,85 +51,91 @@ impl<'a: 'static> HyperFileTokio<'a> {
     pub async fn create(client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         let hyper = Hyper::fs_create(client, uri, flags, mode).await?;
-        let (tx, rx) = oneshot::channel();
-        let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
+        let reactor: Reactor<FileContext<'_>, Hyper<'_>> = Reactor::new_current()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("reactor init failed: {}", e)))?;
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler), _reactor: reactor, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
     }
     pub async fn create_opt(client: &Client, uri: &str, flags: FileFlags, mode: FileMode,
             meta_config: &HyperFileMetaConfig, runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
         let hyper = Hyper::fs_create_opt(client, uri, flags, mode, meta_config, runtime_config).await?;
-        let (tx, rx) = oneshot::channel();
-        let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
+        let reactor: Reactor<FileContext<'_>, Hyper<'_>> = Reactor::new_current()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("reactor init failed: {}", e)))?;
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler), _reactor: reactor, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
     }
 
     pub async fn open(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
     {
         let hyper = Hyper::fs_open(client, uri, flags).await?;
-        let (tx, rx) = oneshot::channel();
-        let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
+        let reactor: Reactor<FileContext<'_>, Hyper<'_>> = Reactor::new_current()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("reactor init failed: {}", e)))?;
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler), _reactor: reactor, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
     }
 
     pub async fn open_opt(client: &Client, uri: &str, flags: FileFlags,
             runtime_config: &HyperFileRuntimeConfig) -> Result<Self>
     {
         let hyper = Hyper::fs_open_opt(client, uri, flags, runtime_config).await?;
-        let (tx, rx) = oneshot::channel();
-        let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
+        let reactor: Reactor<FileContext<'_>, Hyper<'_>> = Reactor::new_current()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("reactor init failed: {}", e)))?;
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler), _reactor: reactor, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
     }
 
     pub async fn open_or_create_with_default_opt(client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         let hyper = Hyper::fs_open_or_create_with_default_opt(client, uri, flags, mode).await?;
-        let (tx, rx) = oneshot::channel();
-        let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
+        let reactor: Reactor<FileContext<'_>, Hyper<'_>> = Reactor::new_current()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("reactor init failed: {}", e)))?;
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler), _reactor: reactor, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
     }
 
     pub async fn open_or_create_with_config(client: &Client, config: HyperFileConfig, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         let hyper = Hyper::fs_open_or_create_with_config(client, config, flags, mode).await?;
-        let (tx, rx) = oneshot::channel();
-        let spawner: LocalSpawner<FileContext<'_>, Hyper<'_>> = LocalSpawner::new_current();
-        spawner.spawn(hyper, tx);
-        let fh = rx.await.expect("failed to get back file handler");
-        Ok(Self { inner: fh, spawner: spawner, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
+        let reactor: Reactor<FileContext<'_>, Hyper<'_>> = Reactor::new_current()
+            .map_err(|e| Error::new(ErrorKind::Other, format!("reactor init failed: {}", e)))?;
+        let (builder, finish) = build_channel_group();
+        let handler = reactor.spawn_async(hyper, builder).await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "reactor thread is gone"))?;
+        Ok(Self { inner: finish(handler), _reactor: reactor, state: State::Idle(()), pos: 0, seek_target: SeekFrom::Start(0), read_buf: Pin::new(Box::new(Vec::new())), })
     }
 
     pub async fn set_len(&self, size: u64) -> Result<()> {
         let (ctx, rx) = FileContext::new_trunc(size as usize);
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn metadata(&self) -> Result<libc::stat> {
         let (ctx, rx) = FileContext::new_getattr();
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn last_cno(&self) -> Result<u64> {
         let (ctx, rx) = FileContext::new_last_cno();
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))
     }
 
     pub async fn flush_ext(&self) -> Result<u64> {
         let (ctx, rx) = FileContext::new_flush(self.inner.clone());
-        self.inner.send(ctx);
+        self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
@@ -140,7 +147,7 @@ impl<'a: 'static> HyperFileTokio<'a> {
                 },
                 State::Idle(_) => {
                     let (ctx, tx, mut rx) = FileContext::new_write_zero(self.pos as usize, len, self.inner.clone());
-                    self.inner.send(ctx);
+                    self.inner.send(ctx)?;
                     self.state = State::Busy(Operation::WriteZero(()));
                     let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
                     drop(tx);
@@ -165,7 +172,7 @@ impl AsyncRead for HyperFileTokio<'_> {
                     std::slice::from_raw_parts_mut(me.read_buf.as_ptr() as *mut u8, me.read_buf.len())
                 };
                 let (ctx, tx, rx) = FileContext::new_read(buf_mut_ref, me.pos as usize, me.inner.clone());
-                me.inner.send(ctx);
+                if let Err(e) = me.inner.send(ctx) { return Poll::Ready(Err(e)); }
                 me.state = State::Busy(Operation::Read((tx, rx)));
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -212,7 +219,7 @@ impl AsyncSeek for HyperFileTokio<'_> {
             State::Idle(_) => {
                 me.seek_target = pos;
                 let (ctx, rx) = FileContext::new_getattr();
-                me.inner.send(ctx);
+                me.inner.send(ctx)?;
                 me.state = State::Busy(Operation::Seek(rx));
                 Ok(())
             },
@@ -273,7 +280,7 @@ impl AsyncWrite for HyperFileTokio<'_> {
                     std::slice::from_raw_parts(src.as_ptr() as *const u8, src.len())
                 };
                 let (ctx, tx, rx) = FileContext::new_write(b, me.pos as usize, me.inner.clone());
-                me.inner.send(ctx);
+                if let Err(e) = me.inner.send(ctx) { return Poll::Ready(Err(e)); }
                 me.state = State::Busy(Operation::Write((tx, rx)));
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -312,7 +319,7 @@ impl AsyncWrite for HyperFileTokio<'_> {
         match me.state {
             State::Idle(_) => {
                 let (ctx, rx) = FileContext::new_flush(me.inner.clone());
-                me.inner.send(ctx);
+                if let Err(e) = me.inner.send(ctx) { return Poll::Ready(Err(e)); }
                 me.state = State::Busy(Operation::Flush(rx));
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -349,7 +356,7 @@ impl AsyncWrite for HyperFileTokio<'_> {
         match me.state {
             State::Idle(_) => {
                 let (ctx, rx) = FileContext::new_release(me.inner.clone());
-                me.inner.send(ctx);
+                if let Err(e) = me.inner.send(ctx) { return Poll::Ready(Err(e)); }
                 me.state = State::Busy(Operation::Release(rx));
                 cx.waker().wake_by_ref();
                 Poll::Pending

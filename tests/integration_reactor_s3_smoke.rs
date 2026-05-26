@@ -49,13 +49,13 @@ async fn reactor_handler_write_read_round_trip() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let payload: Vec<u8> = (0u8..=127u8).collect();
 
     // Create + write + release.
     {
         let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         )
         .await
         .expect("fh create");
@@ -67,7 +67,7 @@ async fn reactor_handler_write_read_round_trip() {
     // Reopen read-only, verify.
     {
         let mut fh = HyperFileHandler::fh_open(
-            &spawner, &client, tf.uri(), FileFlags::rdonly(),
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
         )
         .await
         .expect("fh open");
@@ -81,7 +81,6 @@ async fn reactor_handler_write_read_round_trip() {
         let _ = fh.fh_release().await;
     }
 
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 
@@ -93,12 +92,12 @@ async fn reactor_handler_truncate_extend() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let payload: Vec<u8> = (0..1024u16).map(|v| (v & 0xFF) as u8).collect();
 
     {
         let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         )
         .await
         .expect("create");
@@ -109,7 +108,7 @@ async fn reactor_handler_truncate_extend() {
     let new_size = 8 * 1024;
     {
         let mut fh = HyperFileHandler::fh_open(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(),
         )
         .await
         .expect("open");
@@ -119,7 +118,7 @@ async fn reactor_handler_truncate_extend() {
 
     {
         let mut fh = HyperFileHandler::fh_open(
-            &spawner, &client, tf.uri(), FileFlags::rdonly(),
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
         )
         .await
         .expect("open");
@@ -133,7 +132,6 @@ async fn reactor_handler_truncate_extend() {
         let _ = fh.fh_release().await;
     }
 
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 
@@ -145,12 +143,12 @@ async fn reactor_handler_truncate_shrink() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let payload: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
 
     {
         let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
         )
         .await
         .expect("create");
@@ -161,7 +159,7 @@ async fn reactor_handler_truncate_shrink() {
     let new_size = 5000;
     {
         let mut fh = HyperFileHandler::fh_open(
-            &spawner, &client, tf.uri(), FileFlags::rdwr(),
+            &reactor, &client, tf.uri(), FileFlags::rdwr(),
         )
         .await
         .expect("open");
@@ -171,7 +169,7 @@ async fn reactor_handler_truncate_shrink() {
 
     {
         let mut fh = HyperFileHandler::fh_open(
-            &spawner, &client, tf.uri(), FileFlags::rdonly(),
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
         )
         .await
         .expect("open");
@@ -184,7 +182,6 @@ async fn reactor_handler_truncate_shrink() {
         let _ = fh.fh_release().await;
     }
 
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 
@@ -196,9 +193,9 @@ async fn reactor_handler_flush_returns_cno() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-        &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
     )
     .await
     .expect("create");
@@ -213,7 +210,6 @@ async fn reactor_handler_flush_returns_cno() {
     assert!(cno2 > cno1, "cno did not advance: {} -> {}", cno1, cno2);
 
     let _ = fh.fh_release().await;
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 
@@ -225,9 +221,9 @@ async fn reactor_handler_getattr_setattr() {
     let client = make_client().await;
     let tf = TestFile::new(&client).await;
 
-    let spawner = make_spawner();
+    let reactor = make_reactor();
     let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
-        &spawner, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
     )
     .await
     .expect("create");
@@ -244,7 +240,6 @@ async fn reactor_handler_getattr_setattr() {
     assert_eq!(out.st_gid, 8888);
 
     let _ = fh.fh_release().await;
-    drop(spawner);
     tf.cleanup(&client).await;
 }
 

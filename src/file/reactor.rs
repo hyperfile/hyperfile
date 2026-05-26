@@ -251,7 +251,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if self.state.is_flushing() {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_read(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
         }
 
@@ -261,7 +261,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if self.range_lock.try_lock(range.clone()) == false {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_read(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
         }
         let mut buf = req.buf;
@@ -354,7 +354,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if let Some(_) = &mut self.wal {
             let fh = req.fh.clone();
             let ctx = FileContext::write_wal(req, resp);
-            fh.send_cb(ctx);
+            let _ = fh.send_cb(ctx);
             // TODO: change to ErrorKind::InProgress when it's stable
             return Err(Error::new(ErrorKind::ResourceBusy, "op resubmit to exec write wal"));
         }
@@ -415,7 +415,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             } else {
                 let fh = req.fh;
                 let ctx = FileContext::new_wal_flush(fh.clone());
-                fh.send_highprio(ctx);
+                let _ = fh.send_highprio(ctx);
             }
             #[cfg(not(feature = "wal"))]
             self.flush().await?;
@@ -442,7 +442,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if let Some(_) = &mut self.wal {
             let fh = req.fh.clone();
             let ctx = FileContext::write_zero_wal(req, resp);
-            fh.send_cb(ctx);
+            let _ = fh.send_cb(ctx);
             // TODO: change to ErrorKind::InProgress when it's stable
             return Err(Error::new(ErrorKind::ResourceBusy, "op resubmit to exec write zero wal"));
         }
@@ -519,7 +519,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             } else {
                 let fh = req.fh;
                 let ctx = FileContext::new_wal_flush(fh.clone());
-                fh.send_highprio(ctx);
+                let _ = fh.send_highprio(ctx);
             }
             #[cfg(not(feature = "wal"))]
             self.flush().await?;
@@ -568,7 +568,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let _ = actual_bytes;
             let fh = req.fh.clone();
             let ctx = FileContext::write_absorb(req, resp);
-            fh.send_cb(ctx);
+            let _ = fh.send_cb(ctx);
         });
 
         Ok(())
@@ -614,7 +614,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let _ = actual_bytes;
             let fh = req.fh.clone();
             let ctx = FileContext::write_zero_absorb(req, resp);
-            fh.send_cb(ctx);
+            let _ = fh.send_cb(ctx);
         });
 
         Ok(())
@@ -636,7 +636,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if self.state.is_flushing() {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
         }
 
@@ -646,14 +646,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if self.range_lock.try_lock(range) == false {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
         }
 
         let Ok(permit) = self.sema.clone().try_acquire_owned() else {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "sema locked"));
         };
         req.spawn_write_permit = Some(permit);
@@ -681,7 +681,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if self.state.is_flushing() {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write_zero(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
         }
 
@@ -691,14 +691,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if self.range_lock.try_lock(range) == false {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write_zero(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
         }
 
         let Ok(permit) = self.sema.clone().try_acquire_owned() else {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write_zero(req, resp);
-            fh.send_highprio(ctx);
+            let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "sema locked"));
         };
         req.spawn_write_permit = Some(permit);
@@ -736,7 +736,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
             let fh = req.fh.clone();
             let ctx = FileContext::write_absorb_bh(req, resp);
-            fh.send_cb(ctx);
+            let _ = fh.send_cb(ctx);
         });
         Ok(len)
     }
@@ -758,7 +758,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
             let fh = req.fh.clone();
             let ctx = FileContext::write_zero_absorb_bh(req, resp);
-            fh.send_cb(ctx);
+            let _ = fh.send_cb(ctx);
         });
         Ok(len)
     }
