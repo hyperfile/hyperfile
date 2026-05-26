@@ -386,18 +386,25 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         // bulk update bmap
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
+        let mut new_blocks: usize = 0;
         for (blk_idx, _, _) in blk_iter {
             // force bmap update for dirty blocks
             // NOTE:
             // since we have update the dirty blocks cache,
             // if we failed in bmap insert, we have not way to rollback, so let's panic here
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            let prev = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            if prev.is_none() {
+                new_blocks += 1;
+            }
         }
 
         let oldsize = self.inode.size();
         if off + len > oldsize {
             self.inode.set_size(off + len);
             self.cache.set_size(off + len);
+        }
+        if new_blocks > 0 {
+            self.inode.update_blocks((new_blocks * data_block_size) as isize);
         }
         self.inode.update_mtime();
         drop(opt_permit);
@@ -467,13 +474,17 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let data_block_size = self.config.meta.data_block_size;
         let oldsize = self.inode.size();
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
+        let mut new_blocks: usize = 0;
         for (blk_idx, start_off, data_len) in blk_iter {
             // for a complete block,
             // no need to update data in cache, because is's already all zero
             // and insert zero block into block map
             if start_off == 0 && data_len == data_block_size {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                let prev = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                if prev.is_none() {
+                    new_blocks += 1;
+                }
                 bytes_write += data_len;
                 let _ = self.cache.remove(&blk_idx);
                 continue;
@@ -483,7 +494,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // TODO: merge this with new cache impl
             if start_off == 0 && (blk_idx as usize * data_block_size) + start_off + data_len > oldsize {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                let prev = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                if prev.is_none() {
+                    new_blocks += 1;
+                }
                 bytes_write += data_len;
                 let _ = self.cache.remove(&blk_idx);
                 continue;
@@ -494,7 +508,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             zero.resize(data_len, 0);
             self.update_cache(blk_idx, start_off, &zero);
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            let prev = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            if prev.is_none() {
+                new_blocks += 1;
+            }
             bytes_write += data_len;
         }
 
@@ -502,6 +519,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if off + len > oldsize {
             self.inode.set_size(off + len);
             self.cache.set_size(off + len);
+        }
+        if new_blocks > 0 {
+            self.inode.update_blocks((new_blocks * data_block_size) as isize);
         }
         self.inode.update_mtime();
         drop(opt_permit);

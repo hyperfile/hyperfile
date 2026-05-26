@@ -592,3 +592,124 @@ async fn smoke_o_excl_without_creat_is_ignored_on_open() {
 
     tf.cleanup(&client).await;
 }
+
+/// st_blocks reflects only actually-allocated 512-byte units, not
+/// `ceil(st_size / 512)`. Verifies the fix for the previous
+/// behaviour that inferred st_blocks from st_size and reported
+/// huge inflated values for sparse files.
+///
+/// Scenario:
+///   - Create file
+///   - Write 4 KiB at offset 0  (1 block)
+///   - Write 4 KiB at offset 1 GiB (1 more block — sparse hole in
+///     between)
+///   - Reopen and check st_size = 1 GiB + 4 KiB but st_blocks = 16
+///     (= 2 blocks * 4 KiB / 512). NOT (1 GiB + 4 KiB) / 512.
+#[tokio::test]
+#[ignore]
+async fn smoke_sparse_st_blocks_does_not_inflate() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const ONE_GIB: usize = 1024 * 1024 * 1024;
+    const BLOCK: usize = 4096;
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let buf = vec![0xAA; BLOCK];
+        hyper.fs_write(0, &buf).await.expect("write head");
+        hyper.fs_write(ONE_GIB, &buf).await.expect("write tail");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    {
+        let hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        let stat = hyper.fs_getattr().expect("getattr");
+        assert_eq!(
+            stat.st_size as usize,
+            ONE_GIB + BLOCK,
+            "st_size should reflect the virtual file size"
+        );
+        // 2 data blocks * 4 KiB = 8 KiB allocated; 8 KiB / 512 = 16
+        // 512-byte units. The bug we're guarding against would
+        // report ~2097160 (= ceil((1 GiB + 4 KiB) / 512)).
+        let expected_blocks = (2 * BLOCK / 512) as i64;
+        let bug_value = ((ONE_GIB + BLOCK) / 512) as i64;
+        assert_eq!(
+            stat.st_blocks, expected_blocks,
+            "st_blocks should reflect actually-allocated 512-byte units \
+             (expected {}, got {}); the old buggy value would be {}",
+            expected_blocks, stat.st_blocks, bug_value
+        );
+        // st_blksize should be the data_block_size (default: 4 KiB)
+        assert_eq!(
+            stat.st_blksize as usize, BLOCK,
+            "st_blksize should equal the data_block_size from meta config"
+        );
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// st_blocks decreases when a file is truncated to shrink. Write
+/// 8 blocks worth of data, truncate to 1 block, verify st_blocks
+/// reports 8 (= 4096 / 512), not 64.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_shrink_decrements_st_blocks() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let payload: Vec<u8> = (0..BLOCK * 8).map(|i| (i & 0xFF) as u8).collect();
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await
+            .expect("reopen rdwr");
+        let stat_before = hyper.fs_getattr().expect("getattr before");
+        assert_eq!(stat_before.st_blocks, (8 * BLOCK / 512) as i64);
+
+        hyper.fs_truncate(BLOCK).await.expect("truncate to 1 block");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    {
+        let hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen ro");
+        let stat = hyper.fs_getattr().expect("getattr");
+        assert_eq!(stat.st_size as usize, BLOCK);
+        assert_eq!(
+            stat.st_blocks,
+            (BLOCK / 512) as i64,
+            "after shrinking from 8 blocks to 1, st_blocks should be 8 (= 4096/512), not 64"
+        );
+    }
+
+    tf.cleanup(&client).await;
+}

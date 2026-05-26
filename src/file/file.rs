@@ -445,15 +445,25 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         // bulk update bmap
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
+        let mut new_blocks: usize = 0;
         for (blk_idx, _, _) in blk_iter {
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            let prev = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            if prev.is_none() {
+                new_blocks += 1;
+            }
         }
 
         let oldsize = self.inode.size();
         if off + len > oldsize {
             self.inode.set_size(off + len);
             self.cache.set_size(off + len);
+        }
+        if new_blocks > 0 {
+            // Each newly-allocated bmap entry backs `data_block_size`
+            // bytes; convert to the 512-byte units that st_blocks
+            // reports.
+            self.inode.update_blocks((new_blocks * data_block_size) as isize);
         }
         self.inode.update_mtime();
         drop(permit);
@@ -493,6 +503,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
 
         let mut bytes_write = 0;
+        let mut new_blocks: usize = 0;
 
         let data_block_size = self.config.meta.data_block_size;
         let oldsize = self.inode.size();
@@ -503,7 +514,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // and insert zero block into block map
             if start_off == 0 && data_len == data_block_size {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                let prev = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                if prev.is_none() {
+                    new_blocks += 1;
+                }
                 bytes_write += data_len;
                 let _ = self.cache.remove(&blk_idx);
                 continue;
@@ -513,7 +527,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // TODO: merge this with new cache impl
             if start_off == 0 && (blk_idx as usize * data_block_size) + start_off + data_len > oldsize {
                 // insert or update
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                let prev = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                if prev.is_none() {
+                    new_blocks += 1;
+                }
                 bytes_write += data_len;
                 let _ = self.cache.remove(&blk_idx);
                 continue;
@@ -524,7 +541,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             zero.resize(data_len, 0);
             self.update_cache(blk_idx, start_off, &zero);
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            let prev = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            if prev.is_none() {
+                new_blocks += 1;
+            }
             bytes_write += data_len;
         }
 
@@ -532,6 +552,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if off + len > oldsize {
             self.inode.set_size(off + len);
             self.cache.set_size(off + len);
+        }
+        if new_blocks > 0 {
+            self.inode.update_blocks((new_blocks * data_block_size) as isize);
         }
         self.inode.update_mtime();
         drop(permit);
@@ -560,6 +583,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let data_block_size = self.config.meta.data_block_size;
 
         let mut bytes_write = 0;
+        let mut new_blocks: usize = 0;
         for block_wrapper in blocks.iter() {
             let blk_idx = block_wrapper.index();
             let blk_sz = block_wrapper.size();
@@ -567,13 +591,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             if block_wrapper.is_zero() {
                 let _ = self.cache.remove(&blk_idx);
                 bytes_write += blk_sz;
-                let _ = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                let prev = self.bmap.insert(blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                if prev.is_none() {
+                    new_blocks += 1;
+                }
                 continue;
             }
             self.update_cache(blk_idx, 0, block_wrapper.as_slice());
             bytes_write += blk_sz;
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            let prev = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            if prev.is_none() {
+                new_blocks += 1;
+            }
         }
         // try update file size by offset and len from last block
         let last_block_wrapper = blocks.last().expect("unable to get last block, input blocks is empty");
@@ -583,6 +613,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if off + len > oldsize {
             self.inode.set_size(off + len);
             self.cache.set_size(off + len);
+        }
+        if new_blocks > 0 {
+            self.inode.update_blocks((new_blocks * data_block_size) as isize);
         }
         self.inode.update_mtime();
         drop(permit);
@@ -952,6 +985,27 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         debug!("truncate - shrink bmap to BlockIndex {}", tgt_blk_idx);
         // re-calc tgt_blk_idx for bmap truncate
         let tgt_blk_idx = ((new_size + data_block_size - 1) / data_block_size) as BlockIndex;
+
+        // Count entries in [tgt_blk_idx, ∞) before we drop them, so
+        // we can decrement i_blocks correctly. seek_key returns the
+        // smallest key >= start, NotFound when none. Walking via
+        // (found+1) gives a one-pass count of exactly the entries
+        // about to be discarded.
+        let mut removed_blocks: usize = 0;
+        {
+            let mut k = tgt_blk_idx;
+            loop {
+                match self.bmap.seek_key(&k).await {
+                    Ok(found) => {
+                        removed_blocks += 1;
+                        let Some(next) = found.checked_add(1) else { break; };
+                        k = next;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         // if need to shrink bmap
         if let Err(e) = self.bmap.truncate(&tgt_blk_idx).await {
             if e.kind() != ErrorKind::NotFound {
@@ -971,6 +1025,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
         self.inode.set_size(new_size);
         self.cache.set_size(new_size);
+        if removed_blocks > 0 {
+            self.inode.update_blocks(-((removed_blocks * data_block_size) as isize));
+        }
         self.inode.update_mtime();
         drop(permit);
         if let Err(e) = self.flush().await {
@@ -1287,6 +1344,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             };
         }
 
+        let mut new_blocks: usize = 0;
         for (blk_idx, (is_full_block, v_blocks)) in merged.iter() {
             if !is_full_block {
                 // if not a full block, playback all partial data blocks
@@ -1302,7 +1360,10 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                     bytes_write += part.len();
                 }
                 block.unlock();
-                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+                let prev = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+                if prev.is_none() {
+                    new_blocks += 1;
+                }
                 continue;
             }
             // is full block
@@ -1312,13 +1373,19 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             if block_wrapper.is_zero() {
                 let _ = self.cache.remove(&blk_idx);
                 bytes_write += blk_sz;
-                let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                let prev = self.bmap.insert(*blk_idx, BlockPtrFormat::new_zero_block()).await.expect("failed to insert new zero to bmap");
+                if prev.is_none() {
+                    new_blocks += 1;
+                }
                 continue;
             }
             self.update_cache(*blk_idx, 0, block_wrapper.as_slice());
             bytes_write += blk_sz;
             // force bmap update for dirty blocks
-            let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            let prev = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await.expect("failed to insert dummy value to bmap for dirty blocks");
+            if prev.is_none() {
+                new_blocks += 1;
+            }
         }
         // try update file size by offset and len from last block
         let (blk_idx, (is_full_block, v_blocks)) = merged.pop_last().expect("unable to get last block, input blocks is empty");
@@ -1332,6 +1399,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         if off + len > oldsize {
             self.inode.set_size(off + len);
             self.cache.set_size(off + len);
+        }
+        if new_blocks > 0 {
+            self.inode.update_blocks((new_blocks * data_block_size) as isize);
         }
         self.inode.update_mtime();
         drop(permit);

@@ -302,9 +302,19 @@ impl Inode {
     }
 
     // for non-sparse file
+    /// Set `i_size` only.
+    ///
+    /// Callers are responsible for keeping `i_blocks` consistent
+    /// with the actual amount of storage backed by the bmap. For
+    /// extending writes that allocate new blocks, call
+    /// [`update_blocks`] with the byte delta of newly-allocated
+    /// blocks. For truncate-shrink, count the entries removed from
+    /// the bmap and pass a negative byte delta. The function name
+    /// no longer reflects "non-sparse" since hyperfile is sparse-
+    /// aware everywhere; the doc comment is preserved as a hint
+    /// that the original intent was for fully-dense files.
     pub fn set_size(&mut self, size: usize) {
         self.i_size = size as u64;
-        self.i_blocks = ((size + 511) / 512) as u64;
         self.i_attr_dirty = true;
     }
 
@@ -523,35 +533,72 @@ mod tests {
         assert_eq!(inode.i_nlink, 1);
     }
 
-    // --- set_size ---
+    // --- set_size (size-only contract) ---
 
     #[test]
-    fn set_size_basic() {
+    fn set_size_basic_only_changes_size() {
         let mut inode = Inode::default_file();
+        inode.i_blocks = 100;
         inode.i_attr_dirty = false;
         inode.set_size(4096);
         assert_eq!(inode.size(), 4096);
-        assert_eq!(inode.i_blocks, 8); // 4096 / 512
+        assert_eq!(inode.i_blocks, 100, "set_size must not touch i_blocks");
         assert!(inode.is_attr_dirty());
     }
 
     #[test]
-    fn set_size_zero() {
+    fn set_size_zero_keeps_blocks() {
         let mut inode = Inode::default_file();
+        inode.i_blocks = 7;
         inode.set_size(0);
         assert_eq!(inode.size(), 0);
-        assert_eq!(inode.i_blocks, 0);
+        assert_eq!(inode.i_blocks, 7, "set_size must not touch i_blocks");
     }
 
     #[test]
-    fn set_size_not_512_aligned() {
+    fn set_size_does_not_compute_blocks_from_size() {
+        // The previous behaviour was i_blocks = ceil(size / 512).
+        // Verify that contract is NO LONGER honoured: callers must
+        // maintain i_blocks separately to reflect actually-allocated
+        // bmap entries (the file may be sparse).
         let mut inode = Inode::default_file();
-        inode.set_size(1); // 1 byte → ceil(1/512) = 1 block
-        assert_eq!(inode.i_blocks, 1);
-        inode.set_size(512); // exactly 512 → 1 block
-        assert_eq!(inode.i_blocks, 1);
-        inode.set_size(513); // 513 → 2 blocks
-        assert_eq!(inode.i_blocks, 2);
+        inode.i_blocks = 0;
+        inode.set_size(1024 * 1024 * 1024); // 1 GiB virtual size
+        assert_eq!(
+            inode.i_blocks, 0,
+            "sparse file: virtual size != allocated blocks; \
+             set_size must not infer blocks from size"
+        );
+    }
+
+    // --- update_blocks (the explicit-update path) ---
+
+    #[test]
+    fn update_blocks_positive_diff() {
+        let mut inode = Inode::default_file();
+        inode.i_blocks = 8;
+        inode.i_attr_dirty = false;
+        inode.update_blocks(8192); // 16 of 512-byte blocks
+        assert_eq!(inode.i_blocks, 8 + 16);
+        assert!(inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn update_blocks_negative_diff() {
+        let mut inode = Inode::default_file();
+        inode.i_blocks = 32;
+        inode.update_blocks(-8192);
+        assert_eq!(inode.i_blocks, 32 - 16);
+    }
+
+    #[test]
+    fn update_blocks_zero_diff_no_dirty() {
+        let mut inode = Inode::default_file();
+        inode.i_blocks = 5;
+        inode.i_attr_dirty = false;
+        inode.update_blocks(0);
+        assert_eq!(inode.i_blocks, 5);
+        assert!(!inode.is_attr_dirty(), "zero diff must not dirty attrs");
     }
 
     // --- extend_size (sparse) ---
@@ -762,6 +809,7 @@ mod tests {
     fn save_restore_state_round_trip() {
         let mut inode = Inode::default_file();
         inode.set_size(4096);
+        inode.update_blocks(4096); // 8 of 512-byte blocks (matches a fully-dense 4 KiB file)
         inode.i_mtime = 1000;
         inode.i_mtime_nsec = 500;
         inode.i_attr_dirty = false;
@@ -770,6 +818,7 @@ mod tests {
 
         // Mutate all the fields tracked by the snapshot.
         inode.set_size(8192);
+        inode.update_blocks(4096); // pretend we allocated more
         inode.update_mtime();
         assert_ne!(inode.size(), 4096);
         assert!(inode.is_attr_dirty());

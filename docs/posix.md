@@ -129,6 +129,26 @@ returns zeros, and the persisted block index records no allocation
 for the gap. `i_size` becomes `off + buf.len()`. This is the
 standard POSIX "sparse hole" behaviour.
 
+## `stat()` field semantics
+
+`fs_getattr` / `fh_getattr` populate a `libc::stat`. Field rules:
+
+| Field | Source / behaviour |
+| --- | --- |
+| `st_dev`, `st_rdev` | Always 0. Not modelled — hyperfile is not a device-backed filesystem. (Tracked TODO.) |
+| `st_ino` | The inode number from the on-disk inode. |
+| `st_nlink` | Always 1; hyperfile has no concept of hard links. |
+| `st_mode` | File-type bits (`S_IFREG` / `S_IFDIR`) plus permission bits as last set by `chmod` / `setattr`. |
+| `st_uid`, `st_gid` | As last set by `chown` / `setattr`. Default: 1000 / 1000 at creation. Not enforced by the library; see "Permissions and ownership" below. |
+| `st_size` | Logical file length in bytes (`i_size`). For sparse files this is the **virtual** size, not the storage footprint. |
+| `st_blksize` | The data-block size from the file's `HyperFileMetaConfig` (default 4096). Acts as the I/O hint that POSIX intends. |
+| `st_blocks` | Number of 512-byte units actually allocated. **Sparse-aware**: a 1 GiB sparse file with one 4 KiB written block reports `st_blocks = 8` (= 4096 / 512), not 2 097 152. Maintained incrementally: each newly-allocated bmap entry adds `data_block_size / 512` to the counter; truncate-shrink subtracts the units of the entries it discards. |
+| `st_atime`, `st_mtime`, `st_ctime` (+ `_nsec`) | See the "Inode timestamps" section. |
+
+**Divergence**: `st_dev` and `st_rdev` are not yet plumbed; both
+report 0. If you need a stable device id (e.g. for a FUSE adapter)
+you must inject one in the layer above.
+
 ## Permissions and ownership
 
 `fs_chmod(mode)`, `fs_chown(uid, gid)`, and `fs_setattr(stat)` mutate
