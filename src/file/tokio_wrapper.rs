@@ -139,6 +139,16 @@ impl<'a: 'static> HyperFileTokio<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
+    /// POSIX-`fdatasync` flavoured flush — see
+    /// `Hyper::fs_fdatasync` for semantics. Provided as an
+    /// extension method on top of the tokio AsyncWrite/AsyncRead
+    /// surface.
+    pub async fn fdatasync_ext(&self) -> Result<u64> {
+        let (ctx, rx) = FileContext::new_flush_data(self.inner.clone());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
     pub async fn write_zero(&mut self, len: usize) -> Result<usize> {
         loop {
             match self.state {

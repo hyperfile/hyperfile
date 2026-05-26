@@ -682,6 +682,35 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
     }
 
+    /// POSIX-`fdatasync` flavoured flush.
+    ///
+    /// Acts as `flush_with_rollback` but skips work that
+    /// `fdatasync(2)` is allowed to skip per POSIX: flushing
+    /// metadata that is not required to read the file's data
+    /// correctly. In hyperfile terms, that means skipping the
+    /// inode write when only attribute fields (`atime` / `mtime` /
+    /// `ctime` / `mode` / `uid` / `gid`) are dirty and there is
+    /// no dirty data block and no dirty bmap.
+    ///
+    /// If data or bmap is dirty, this delegates to
+    /// `flush_with_rollback` — those updates are necessary for
+    /// data correctness (`i_size` lives in the inode) and
+    /// `fdatasync` must persist them too.
+    ///
+    /// Returns the last cno currently persisted on staging. When
+    /// the call short-circuits (no data/bmap dirt), no new
+    /// segment is written and the returned cno is the same as
+    /// `last_cno()`.
+    pub async fn flush_data(&mut self) -> Result<SegmentId> {
+        if self.dirty_block_count() == 0 && !self.bmap_dirty() {
+            // Inode may still be attr-dirty, but `fdatasync` is
+            // explicitly allowed to skip persisting attr-only
+            // changes. Return the last persisted cno unchanged.
+            return Ok(self.inode.get_last_ondisk_cno());
+        }
+        self.flush_with_rollback().await
+    }
+
     /// Roll back the in-memory state of this file to match what's persisted
     /// on staging. Used by the failure path of write/truncate/write_zero/flush
     /// to undo in-memory mutations when the flush fails. Steps:

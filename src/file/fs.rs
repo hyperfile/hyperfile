@@ -165,6 +165,22 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.flush_with_rollback().await
     }
 
+    /// POSIX-`fdatasync` flavoured flush. Persists pending data
+    /// and any metadata required for reads to be correct (i.e.
+    /// the bmap and `i_size`), but skips writing the inode when
+    /// only attribute fields (`atime` / `mtime` / `ctime` /
+    /// `mode` / `uid` / `gid`) are dirty. See `docs/posix.md` for
+    /// the full semantic.
+    ///
+    /// Equivalent to `fs_flush` when there's data or bmap dirt;
+    /// strictly cheaper when only attrs are dirty (no S3 PUT
+    /// happens).
+    pub async fn fs_fdatasync(&mut self) -> Result<u64>
+    {
+        debug!("fs_fdatasync - ");
+        self.inner.flush_data().await
+    }
+
     pub async fn fs_truncate(&mut self, offset: usize) -> Result<()>
     {
         debug!("fs_truncate - offset: {}", offset);

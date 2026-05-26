@@ -1163,3 +1163,113 @@ async fn smoke_truncate_shrink_with_unflushed_writes() {
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// fs_fdatasync: when only attribute fields are dirty (e.g. atime
+/// from a read), skip the segment write and leave last_cno
+/// unchanged. Compare against fs_flush which DOES bump last_cno.
+#[tokio::test]
+#[ignore]
+async fn smoke_fdatasync_skips_attr_only_flush() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Create + write some data, then flush so we have a baseline
+    // persisted segment.
+    let payload = vec![0xAAu8; 4096];
+    let baseline_cno = {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        hyper.fs_flush().await.expect("flush baseline")
+    };
+
+    // fdatasync arm: open ro, read (dirties atime in-memory), then
+    // fs_fdatasync. Expect last_cno unchanged AND the attr-dirty
+    // bit unchanged (the fdatasync skip is observable: we didn't
+    // persist the attr change).
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await.expect("open ro");
+        let mut buf = vec![0u8; payload.len()];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+        // Confirm the inode is in the "attr-only dirty" state.
+        assert!(hyper.is_attr_dirty(),
+            "read should have dirtied atime in-memory");
+        assert_eq!(hyper.dirty_block_count(), 0);
+        let cno_after_fdatasync = hyper.fs_fdatasync().await
+            .expect("fdatasync attr-only");
+        assert_eq!(
+            cno_after_fdatasync, baseline_cno,
+            "fdatasync must not bump cno"
+        );
+        assert!(hyper.is_attr_dirty(),
+            "fdatasync must leave attr-dirty bit SET (skip = no inode write)");
+        let _ = hyper.fs_release().await;
+    }
+
+    // Control arm: same setup but use fs_flush — must clear the
+    // attr-dirty bit (it issues an inode-only S3 PUT). Hyperfile's
+    // attr-only flush does NOT bump cno (the segment id is for new
+    // segments; inode-only PUT overwrites the same key).
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await.expect("open ro");
+        let mut buf = vec![0u8; payload.len()];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert!(hyper.is_attr_dirty());
+        let _ = hyper.fs_flush().await.expect("flush attr-only");
+        assert!(!hyper.is_attr_dirty(),
+            "fs_flush must clear attr-dirty bit (inode written to S3)");
+        let _ = hyper.fs_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// fs_fdatasync: when data is dirty, behaves identically to
+/// fs_flush — must persist the data + bmap + size and bump cno.
+#[tokio::test]
+#[ignore]
+async fn smoke_fdatasync_persists_data() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let baseline_cno = {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        hyper.fs_release().await.expect("release")
+    };
+
+    let payload = vec![0xBBu8; 4096];
+    let after_fdatasync_cno = {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr())
+            .await.expect("open rdwr");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let cno = hyper.fs_fdatasync().await.expect("fdatasync data-dirty");
+        let _ = hyper.fs_release().await;
+        cno
+    };
+    assert!(
+        after_fdatasync_cno > baseline_cno,
+        "fdatasync with dirty data must bump cno (got {} <= {})",
+        after_fdatasync_cno, baseline_cno
+    );
+
+    // Verify on reopen that the data made it.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await.expect("reopen ro");
+        let stat = hyper.fs_getattr().expect("ga");
+        assert_eq!(stat.st_size as usize, payload.len());
+        let mut buf = vec![0u8; payload.len()];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert_eq!(buf, payload);
+        let _ = hyper.fs_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}

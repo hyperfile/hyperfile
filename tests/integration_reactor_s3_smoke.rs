@@ -360,3 +360,62 @@ async fn reactor_o_append_single_handle() {
 
     tf.cleanup(&client).await;
 }
+
+/// fh_fdatasync exercises the FlushData reactor path: data must
+/// be persisted (matches fh_flush behavior); attr-only changes
+/// must be skipped.
+#[tokio::test]
+#[ignore]
+async fn reactor_fh_fdatasync_round_trip() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let reactor = make_reactor();
+
+    // Create + write + flush. Note baseline cno.
+    let payload = vec![0xAAu8; 4096];
+    let baseline_cno = {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = fh.fh_write(0, &payload).await.expect("write");
+        let cno = fh.fh_flush().await.expect("flush baseline");
+        let _ = fh.fh_release().await;
+        cno
+    };
+
+    // Reopen, read (atime dirty), fh_fdatasync. cno unchanged.
+    {
+        let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly())
+            .await.expect("open ro");
+        let mut buf = vec![0u8; payload.len()];
+        let _ = fh.fh_read(0, &mut buf).await.expect("read");
+        let cno = fh.fh_fdatasync().await.expect("fdatasync attr-only");
+        assert_eq!(cno, baseline_cno,
+            "fh_fdatasync must not bump cno on attr-only dirt");
+        let _ = fh.fh_release().await;
+    }
+
+    // Reopen, write, fh_fdatasync. Must persist.
+    let new_payload = vec![0xCCu8; 8192];
+    let after_cno = {
+        let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdwr())
+            .await.expect("open rdwr");
+        let _ = fh.fh_write(0, &new_payload).await.expect("write");
+        let cno = fh.fh_fdatasync().await.expect("fdatasync data-dirty");
+        let _ = fh.fh_release().await;
+        cno
+    };
+    assert!(after_cno > baseline_cno,
+        "fh_fdatasync with dirty data must bump cno");
+
+    // Verify content survived.
+    let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen");
+    let mut buf = vec![0u8; new_payload.len()];
+    let _ = fh.fh_read(0, &mut buf).await.expect("read all");
+    assert_eq!(buf, new_payload);
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}

@@ -40,7 +40,7 @@ open` / `Hyper::create`.
 | `O_APPEND` | ✅ | The offset argument to `fs_write` / `fh_write` / `fs_write_zero` / `fh_write_zero` is ignored; the call writes at the current `i_size` and atomically advances `i_size` by the number of bytes written. Atomicity is enforced through the per-file write serializer: in the direct API, `&mut self` enforces it; in the reactor without `range-lock`, the handler dispatches one ctx at a time; in the reactor with `range-lock`, concurrent appenders compute identical-or-overlapping byte ranges starting at the current `i_size` and only one wins the range lock per turn — the loser is re-queued via send_highprio and re-evaluates `i_size` on its next dispatch. The result is whole, contiguous payloads laid down in some serial order; never a torn interleave. **Divergence**: cross-instance / cross-process append (two `Hyper`s opened against the same URI) is **not** atomic — it is governed by the same conflict policy as ordinary writes, not by O_APPEND. |
 | `O_APPEND` (batch APIs) | n/a | `fs_write_aligned_batch` / `fs_write_batch` accept an explicit `offset` per data block; that is the entire point of the batch APIs. They ignore O_APPEND on the open flag set. Use the single-write entry points if you want POSIX append semantics. |
 | `O_DIRECT` | ✅ | Disables the in-memory data block cache. Without WAL: every write triggers an immediate flush. With WAL: writes still go to the WAL synchronously but the data-block cache is sized to zero so there is no in-memory accumulation. |
-| `O_SYNC` / `O_DSYNC` | ✅ | Triggers a flush on every write. With WAL enabled, the WAL persistence already provides the same crash-consistency guarantee, so the explicit flush is skipped. The two flags are treated identically; Hyperfile does not distinguish data-only from data+metadata sync. |
+| `O_SYNC` / `O_DSYNC` | ✅ | Triggers a flush on every write. With WAL enabled, the WAL persistence already provides the same crash-consistency guarantee, so the explicit flush is skipped. The two flags are treated identically at write time: every write in hyperfile already updates `i_size` (which `fdatasync` is required to persist), so there is no work that O_DSYNC could legitimately skip but O_SYNC must do. The fsync vs. fdatasync **distinction is exposed at the syscall-equivalent layer** instead — see `fs_flush` (= `fsync`) and `fs_fdatasync` (= `fdatasync`) below. |
 | `O_NOATIME` | ✅ | Read paths skip `update_atime` on the in-memory inode. Other timestamps (`mtime`, `ctime`) are unaffected. |
 | `O_NONBLOCK` / `O_NDELAY` | ❌ unsupported | These flags govern the read/write blocking discipline of file descriptors in the kernel, where a non-blocking read on an empty pipe returns `EAGAIN` instead of suspending. Hyperfile has no equivalent state machine: every async fn already returns control to the runtime when waiting on S3 I/O, so there is nothing to flip on. Parsed for display only; setting the bit changes no behaviour and there is no plan to add semantics for it. |
 | `O_ASYNC` | ❌ unsupported | Requests SIGIO / SIGURG signal-driven I/O on POSIX file descriptors. Hyperfile is a library, not a process running under a kernel fd; signal delivery is outside the model. Parsed for display only and explicitly **not** going to be implemented. Use the standard async/await flow against the existing `fs_*` / `fh_*` / `HyperFileTokio` APIs instead. |
@@ -100,6 +100,35 @@ with second + nanosecond resolution. They update as follows:
   read on a read-only handle that gets dropped without flushing
   will lose the `atime` advance. Linux behaves the same way under
   default `relatime` mounts but differs from `strictatime`.
+
+## Sync APIs (`fsync` vs `fdatasync`)
+
+POSIX distinguishes two flush primitives:
+
+- `fsync(fd)` — persist data and **all** metadata (data, file
+  size, atime, mtime, ctime, mode, uid, gid).
+- `fdatasync(fd)` — persist data and metadata that's required
+  for the data to be read correctly, allowed to skip pure
+  attribute updates that don't affect retrieval (atime, mtime,
+  ctime, mode, uid, gid).
+
+Hyperfile exposes both:
+
+| Hyperfile API | POSIX equivalent | Behaviour |
+| --- | --- | --- |
+| `Hyper::fs_flush` / `HyperFileHandler::fh_flush` / `HyperFileTokio::flush_ext` | `fsync` | Always persists. If only attrs are dirty, issues an inode-only PUT (overwrites the same S3 key, no new segment, `last_cno` unchanged). If data or bmap is dirty, builds and uploads a new segment. |
+| `Hyper::fs_fdatasync` / `HyperFileHandler::fh_fdatasync` / `HyperFileTokio::fdatasync_ext` | `fdatasync` | Skips when only attrs are dirty (no S3 PUT, no `last_cno` change). When data or bmap is dirty, falls through to the same path as `fs_flush`: hyperfile keeps `i_size` in the inode, so any data flush already needs a new segment that carries the inode along. |
+
+Observable difference: a read on an otherwise-clean file dirties
+`atime` in memory. `fs_flush` writes the inode out; subsequent
+opens see the advanced atime. `fs_fdatasync` skips; the atime
+change is lost if the handle is dropped without an `fs_flush` /
+`fs_release`. This matches the POSIX rule.
+
+When data is dirty, both calls do the same work, including
+issuing a new segment. There is no "data-only segment" path;
+`i_size`, mtime, and the bmap travel together with data in the
+on-disk format.
 
 ## Truncate behaviour
 

@@ -326,6 +326,7 @@ pub enum FileReqOp {
     WriteBatch,
     Trunc,
     Flush,
+    FlushData,
     #[cfg(feature = "wal")]
     WalFlush,
     #[cfg(feature = "wal")]
@@ -524,6 +525,21 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
+    /// Like [`new_flush`] but with `fdatasync` semantics — see
+    /// `Hyper::fs_fdatasync`. Reuses the `FileReqFlush` body and
+    /// `FileResp::Flush` response shape; the only difference is
+    /// the `op` discriminator routes to the
+    /// `FileReqOp::FlushData` arm of `Task::handle`.
+    pub fn new_flush_data(fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespFlush>) {
+        let (tx, rx) = oneshot::channel::<FileRespFlush>();
+        let req = FileReq {
+            op: FileReqOp::FlushData,
+            body: FileReqBody { flush: ManuallyDrop::new(FileReqFlush { fh, }), },
+        };
+        let resp = FileResp::Flush(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
     // only used by internal driven process when wal enabled
     #[cfg(feature = "wal")]
     pub fn new_wal_flush(fh: ChannelGroup<FileContext<'a>>) -> Self {
@@ -610,6 +626,14 @@ impl<'a> FileContext<'a> {
     pub fn reform_flush(req: FileReqFlush<'a>, resp: FileResp) -> Self {
         let req = FileReq {
             op: FileReqOp::Flush,
+            body: FileReqBody { flush: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    pub fn reform_flush_data(req: FileReqFlush<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::FlushData,
             body: FileReqBody { flush: ManuallyDrop::new(req) },
         };
         Self { req: Some(req), resp: Some(resp) }
@@ -858,6 +882,23 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let res = self.inner.flush().await;
                 let _ = resp.to_flush().send(res);
             },
+            // POSIX-`fdatasync` flavoured flush. Under non-WAL,
+            // `inner.flush_data` short-circuits when only attrs
+            // are dirty.
+            #[cfg(not(feature = "wal"))]
+            FileReqOp::FlushData => {
+                let md = unsafe { req.body.flush };
+                let _req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                if self.inner.range_lock.is_locked() {
+                    let fh = _req.fh.clone();
+                    let ctx = FileContext::reform_flush_data(_req, resp);
+                    let _ = fh.send_cb(ctx);
+                    return;
+                }
+                let res = self.inner.flush_data().await;
+                let _ = resp.to_flush().send(res);
+            },
             #[cfg(feature = "wal")]
             FileReqOp::Flush => {
                 let md = unsafe { req.body.flush };
@@ -885,6 +926,47 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                         let ctx = FileContext::reform_flush(req, resp);
                         // move flush op to cb queue
                         // so that flush op can run immediately after all inflight write op finished
+                        let _ = fh.send_cb(ctx);
+                        return;
+                    }
+                    res
+                };
+                let _ = resp.to_flush().send(res);
+            },
+            // POSIX-`fdatasync` flavoured flush, WAL on. Same
+            // routing as `Flush` except we short-circuit when
+            // only attrs are dirty: the WAL kick path doesn't
+            // itself check, so we'd otherwise pay an unnecessary
+            // segment build for a metadata-only change.
+            #[cfg(feature = "wal")]
+            FileReqOp::FlushData => {
+                let md = unsafe { req.body.flush };
+                let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                if self.inner.range_lock.is_locked() {
+                    let fh = req.fh.clone();
+                    let ctx = FileContext::reform_flush_data(req, resp);
+                    let _ = fh.send_cb(ctx);
+                    return;
+                }
+                // Short-circuit: only attr is dirty (or nothing
+                // is dirty) — fdatasync is allowed to skip.
+                if self.inner.dirty_block_count() == 0 && !self.inner.is_bmap_dirty() {
+                    let cno = self.inner.in_memory_last_ondisk_cno();
+                    let _ = resp.to_flush().send(Ok(cno));
+                    return;
+                }
+                // Otherwise fdatasync collapses to fsync — we
+                // need to write a segment for the dirty data /
+                // bmap, which carries the inode along anyway.
+                let res = if self.inner.wal.is_none() {
+                    self.inner.flush().await
+                } else {
+                    let res = self.inner.kick_wal_protected_flush_reactor(req.fh.clone()).await;
+                    if res.is_err() {
+                        debug!("kick wal flush_data failed {:?}, requeue this request", res);
+                        let fh = req.fh.clone();
+                        let ctx = FileContext::reform_flush_data(req, resp);
                         let _ = fh.send_cb(ctx);
                         return;
                     }

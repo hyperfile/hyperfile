@@ -164,6 +164,16 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
+    /// POSIX-`fdatasync` flavoured flush. See
+    /// `Hyper::fs_fdatasync` for semantics. Skips the segment
+    /// write entirely when only attrs are dirty.
+    pub async fn fh_fdatasync(&mut self) -> Result<u64>
+    {
+        let (ctx, rx) = FileContext::new_flush_data(self.inner.clone());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
     pub async fn fh_truncate(&mut self, offset: usize) -> Result<()>
     {
         let (ctx, rx) = FileContext::new_trunc(offset);
