@@ -42,8 +42,8 @@ open` / `Hyper::create`.
 | `O_DIRECT` | ✅ | Disables the in-memory data block cache. Without WAL: every write triggers an immediate flush. With WAL: writes still go to the WAL synchronously but the data-block cache is sized to zero so there is no in-memory accumulation. |
 | `O_SYNC` / `O_DSYNC` | ✅ | Triggers a flush on every write. With WAL enabled, the WAL persistence already provides the same crash-consistency guarantee, so the explicit flush is skipped. The two flags are treated identically; Hyperfile does not distinguish data-only from data+metadata sync. |
 | `O_NOATIME` | ✅ | Read paths skip `update_atime` on the in-memory inode. Other timestamps (`mtime`, `ctime`) are unaffected. |
-| `O_NONBLOCK` / `O_NDELAY` | n/a | Hyperfile is async at the API level; these flags have no meaningful translation. Parsed for display only. |
-| `O_ASYNC` | ❌ | Parsed for display, no signal-based I/O notification. |
+| `O_NONBLOCK` / `O_NDELAY` | ❌ unsupported | These flags govern the read/write blocking discipline of file descriptors in the kernel, where a non-blocking read on an empty pipe returns `EAGAIN` instead of suspending. Hyperfile has no equivalent state machine: every async fn already returns control to the runtime when waiting on S3 I/O, so there is nothing to flip on. Parsed for display only; setting the bit changes no behaviour and there is no plan to add semantics for it. |
+| `O_ASYNC` | ❌ unsupported | Requests SIGIO / SIGURG signal-driven I/O on POSIX file descriptors. Hyperfile is a library, not a process running under a kernel fd; signal delivery is outside the model. Parsed for display only and explicitly **not** going to be implemented. Use the standard async/await flow against the existing `fs_*` / `fh_*` / `HyperFileTokio` APIs instead. |
 
 ### Path resolution flags
 
