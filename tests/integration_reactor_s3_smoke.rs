@@ -311,3 +311,52 @@ async fn reactor_tokio_flush_shutdown_empty() {
 
     tf.cleanup(&client).await;
 }
+
+/// O_APPEND on the reactor handler API: writes through fh_write
+/// land at end-of-file regardless of the offset argument.
+#[tokio::test]
+#[ignore]
+async fn reactor_o_append_single_handle() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let reactor = make_reactor();
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = fh.fh_release().await;
+    }
+
+    let part_a = b"alpha-".to_vec();
+    let part_b = b"beta\n".to_vec();
+    {
+        let flags = FileFlags::from(libc::O_RDWR | libc::O_APPEND);
+        let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), flags)
+            .await
+            .expect("open append");
+        // Misleading offsets in both calls.
+        let _ = fh.fh_write(999, &part_a).await.expect("write A");
+        let _ = fh.fh_write(0, &part_b).await.expect("write B");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await;
+    }
+
+    let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly())
+        .await
+        .expect("reopen");
+    let total = part_a.len() + part_b.len();
+    let mut buf = vec![0u8; total];
+    let n = fh.fh_read(0, &mut buf).await.expect("read");
+    assert_eq!(n, total);
+    let mut want = part_a.clone();
+    want.extend_from_slice(&part_b);
+    assert_eq!(buf, want);
+    let _ = fh.fh_release().await;
+
+    tf.cleanup(&client).await;
+}

@@ -248,3 +248,95 @@ async fn reactor_rl_flush_waits_for_inflight_writes() {
     let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
+
+/// Two concurrent appenders share one HyperFileHandler (same
+/// underlying reactor task) via clone(). Both call fh_write under
+/// O_APPEND. POSIX requires each write() to be atomic — that is,
+/// the (read-i_size, write-buffer-at-i_size, update-i_size) triple
+/// must serialize with respect to other appenders. A torn final
+/// state would either (a) total fewer than expected_total bytes
+/// (one appender clobbered the other), or (b) interleave bytes
+/// from the two payloads.
+///
+/// Under range-lock the appenders compute identical-or-overlapping
+/// ranges starting at i_size; range_lock.try_lock fails for the
+/// second one, which gets re-queued via send_highprio and
+/// re-evaluates i_size on its next dispatch, after the first
+/// appender's absorb_write_bh has committed the size update. The
+/// observable effect is two whole, contiguous payloads — one then
+/// the other — with the file size equal to their sum.
+#[tokio::test]
+#[ignore]
+async fn reactor_rl_concurrent_appenders_serialize() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let reactor = make_reactor();
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = fh.fh_release().await;
+    }
+
+    let flags = FileFlags::from(libc::O_RDWR | libc::O_APPEND);
+    let fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), flags)
+        .await
+        .expect("open");
+
+    let mut fh_a = fh.clone();
+    let mut fh_b = fh.clone();
+    drop(fh);
+
+    let payload_len = 4096;
+    let writer_a = async move {
+        let data = vec![0xAAu8; payload_len];
+        // Misleading offset; O_APPEND must ignore it.
+        fh_a.fh_write(99999, &data).await.expect("A write");
+        fh_a.fh_flush().await.expect("A flush");
+        fh_a.fh_release().await.expect("A release")
+    };
+    let writer_b = async move {
+        let data = vec![0xBBu8; payload_len];
+        fh_b.fh_write(0, &data).await.expect("B write");
+        fh_b.fh_flush().await.expect("B flush");
+        fh_b.fh_release().await.expect("B release")
+    };
+
+    let (a_cno, b_cno) = tokio::join!(writer_a, writer_b);
+    println!("[rl_appenders] A cno={} B cno={}", a_cno, b_cno);
+
+    // Reopen fresh and verify persisted state.
+    let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly())
+        .await
+        .expect("reopen rdonly");
+    let stat = fh.fh_getattr().await.expect("getattr");
+    assert_eq!(
+        stat.st_size as usize,
+        payload_len * 2,
+        "file size must equal sum of the two appended payloads"
+    );
+
+    let mut buf = vec![0u8; payload_len * 2];
+    fh.fh_read(0, &mut buf).await.expect("read all");
+
+    // The first half must be all-AAs or all-BBs (whichever appender
+    // ran first) and the second half must be the other byte. We don't
+    // care which order — we just need atomicity.
+    let first = buf[0];
+    let second = buf[payload_len];
+    assert!(
+        (first == 0xAA && second == 0xBB) || (first == 0xBB && second == 0xAA),
+        "first byte {:#x} or boundary byte {:#x} suggests torn append",
+        first, second
+    );
+    assert!(buf[..payload_len].iter().all(|&b| b == first), "first half is not solid");
+    assert!(buf[payload_len..].iter().all(|&b| b == second), "second half is not solid");
+
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}

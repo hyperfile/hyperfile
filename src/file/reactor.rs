@@ -629,9 +629,23 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     // for spawn_read/spawn_write resp is based on mpsc channel
     // so use try_send() instead send()
     pub async fn spawn_write(&mut self, mut req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
-        let off = req.offset;
         let buf = req.buf;
         let len = buf.len();
+        // O_APPEND: override caller-supplied offset to current
+        // i_size, every time the request is dispatched. If this
+        // request gets re-queued via send_highprio (range-lock /
+        // sema / flush-in-progress conflict), it will re-enter
+        // here on the next dispatch and read the latest i_size,
+        // which by then reflects whatever sibling write completed
+        // first. The borrow on &mut self plus the per-request
+        // sema permit guarantees i_size is stable from this read
+        // through to the inode size update on the absorb path.
+        let off = if self.flags.is_append() {
+            self.inode.size()
+        } else {
+            req.offset
+        };
+        req.offset = off;
 
         // we need to stop world if flush is processing
         if self.state.is_flushing() {
@@ -675,8 +689,15 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn spawn_write_zero(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
-        let off = req.offset;
         let len = req.len;
+        // O_APPEND: same rule as spawn_write(). See the
+        // corresponding comment there.
+        let off = if self.flags.is_append() {
+            self.inode.size()
+        } else {
+            req.offset
+        };
+        req.offset = off;
 
         // we need to stop world if flush is processing
         if self.state.is_flushing() {

@@ -326,3 +326,122 @@ async fn smoke_o_noatime_skips_atime_update_on_read() {
 
     tf.cleanup(&client).await;
 }
+
+/// O_APPEND (single handle, direct API): every fs_write goes to
+/// end of file regardless of the offset argument. Verifies:
+///   - first append on empty file lands at offset 0
+///   - second append lands at end of first
+///   - explicit offset arg is ignored under O_APPEND
+#[tokio::test]
+#[ignore]
+async fn smoke_o_append_writes_at_end() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Create the file empty.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Open with O_APPEND, write twice, both at deliberately-wrong
+    // offsets. POSIX requires the offsets to be ignored.
+    let part_a = b"hello-".to_vec();
+    let part_b = b"world\n".to_vec();
+    {
+        let flags = FileFlags::from(libc::O_RDWR | libc::O_APPEND);
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), flags)
+            .await
+            .expect("open w/ O_APPEND");
+        // Misleading offset: 999 — should be ignored.
+        let n = hyper.fs_write(999, &part_a).await.expect("write A");
+        assert_eq!(n, part_a.len());
+        // Same again — different misleading offset.
+        let n = hyper.fs_write(0, &part_b).await.expect("write B");
+        assert_eq!(n, part_b.len());
+
+        let stat = hyper.fs_getattr().expect("getattr");
+        assert_eq!(stat.st_size as usize, part_a.len() + part_b.len());
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Verify on a fresh open: appended in order.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        let total = part_a.len() + part_b.len();
+        let mut buf = vec![0u8; total];
+        let n = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert_eq!(n, total);
+        let mut want = part_a.clone();
+        want.extend_from_slice(&part_b);
+        assert_eq!(buf, want);
+        let _ = hyper.fs_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// O_APPEND with write_zero: each write_zero appends the requested
+/// number of zero bytes, ignoring the offset argument.
+#[tokio::test]
+#[ignore]
+async fn smoke_o_append_write_zero() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Create with a small payload.
+    let head = vec![0xCDu8; 100];
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("create");
+        let _ = hyper.fs_write(0, &head).await.expect("write head");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Append 200 zeros via write_zero under O_APPEND. The 7777
+    // offset must be ignored.
+    {
+        let flags = FileFlags::from(libc::O_RDWR | libc::O_APPEND);
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), flags)
+            .await
+            .expect("open");
+        let n = hyper.fs_write_zero(7777, 200).await.expect("write_zero");
+        assert_eq!(n, 200);
+        let stat = hyper.fs_getattr().expect("getattr");
+        assert_eq!(stat.st_size as usize, head.len() + 200);
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Verify: head intact, 200 zeros after.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await
+            .expect("reopen");
+        let total = head.len() + 200;
+        let mut buf = vec![0u8; total];
+        let n = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert_eq!(n, total);
+        assert_eq!(&buf[..head.len()], &head[..]);
+        assert!(buf[head.len()..].iter().all(|&b| b == 0));
+        let _ = hyper.fs_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}

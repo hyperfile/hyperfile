@@ -37,7 +37,8 @@ open` / `Hyper::create`.
 
 | Flag | Implemented | Behaviour |
 | --- | --- | --- |
-| `O_APPEND` | ❌ | Parsed but ignored. Writes always go to the explicit offset passed to `fs_write` / `fh_write`. **Future**: see notes in `concurrency.md` — atomic append under a single handle is straightforward; the design open question is how it interacts with the optional `range-lock` feature when multiple writer handles append concurrently. |
+| `O_APPEND` | ✅ | The offset argument to `fs_write` / `fh_write` / `fs_write_zero` / `fh_write_zero` is ignored; the call writes at the current `i_size` and atomically advances `i_size` by the number of bytes written. Atomicity is enforced through the per-file write serializer: in the direct API, `&mut self` enforces it; in the reactor without `range-lock`, the handler dispatches one ctx at a time; in the reactor with `range-lock`, concurrent appenders compute identical-or-overlapping byte ranges starting at the current `i_size` and only one wins the range lock per turn — the loser is re-queued via send_highprio and re-evaluates `i_size` on its next dispatch. The result is whole, contiguous payloads laid down in some serial order; never a torn interleave. **Divergence**: cross-instance / cross-process append (two `Hyper`s opened against the same URI) is **not** atomic — it is governed by the same conflict policy as ordinary writes, not by O_APPEND. |
+| `O_APPEND` (batch APIs) | n/a | `fs_write_aligned_batch` / `fs_write_batch` accept an explicit `offset` per data block; that is the entire point of the batch APIs. They ignore O_APPEND on the open flag set. Use the single-write entry points if you want POSIX append semantics. |
 | `O_DIRECT` | ✅ | Disables the in-memory data block cache. Without WAL: every write triggers an immediate flush. With WAL: writes still go to the WAL synchronously but the data-block cache is sized to zero so there is no in-memory accumulation. |
 | `O_SYNC` / `O_DSYNC` | ✅ | Triggers a flush on every write. With WAL enabled, the WAL persistence already provides the same crash-consistency guarantee, so the explicit flush is skipped. The two flags are treated identically; Hyperfile does not distinguish data-only from data+metadata sync. |
 | `O_NOATIME` | ✅ | Read paths skip `update_atime` on the in-memory inode. Other timestamps (`mtime`, `ctime`) are unaffected. |
@@ -120,10 +121,10 @@ A `fs_read` issued on a file whose `i_size` is 0 returns `Ok(0)`
 immediately, before consulting the bmap or staging. The same
 applies for an offset at or past `i_size`.
 
-## Append-write at offset > size
+## Sparse holes (write past EOF without O_APPEND)
 
-`fs_write(off, buf)` where `off > i_size` is allowed. The
-intervening range is sparse: a subsequent `fs_read` of that range
+`fs_write(off, buf)` where `off > i_size` (and the handle was not
+opened with O_APPEND) is allowed. The intervening range is sparse: a subsequent `fs_read` of that range
 returns zeros, and the persisted block index records no allocation
 for the gap. `i_size` becomes `off + buf.len()`. This is the
 standard POSIX "sparse hole" behaviour.

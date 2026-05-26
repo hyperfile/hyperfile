@@ -404,6 +404,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let fn_start = Instant::now();
         let len = buf.len();
+        // O_APPEND: write at end-of-file, ignoring the caller-
+        // supplied offset. Direct-API writes take &mut self, so
+        // i_size cannot change between this read and the size update
+        // at the end of the function — the borrow checker provides
+        // the atomic-append serialization that POSIX requires.
+        let off = if self.flags.is_append() {
+            self.inode.size()
+        } else {
+            off
+        };
         debug!("WRITE - off: {}, buf len: {}", off, len);
 
         let v = self.write_prepare(off, len);
@@ -459,6 +469,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub async fn write_zero(&mut self, off: usize, len: usize) -> Result<usize> {
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let fn_start = Instant::now();
+        // O_APPEND: same rule as write(). See the corresponding
+        // comment there.
+        let off = if self.flags.is_append() {
+            self.inode.size()
+        } else {
+            off
+        };
         debug!("WRITE ZERO - off: {}, len: {}", off, len);
 
         let v = self.write_prepare(off, len);
