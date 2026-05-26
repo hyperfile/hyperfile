@@ -33,7 +33,18 @@ impl<'a: 'static> Hyper<'a> {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
         let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
-        let file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::open(staging, loader, node_cache, file_config, flags).await?;
+        let mut file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::open(staging, loader, node_cache, file_config, flags.clone()).await?;
+        // POSIX O_TRUNC: when opening an existing regular file with
+        // write access (O_WRONLY or O_RDWR), the file length is
+        // truncated to 0. atime / mtime / ctime get updated by the
+        // truncate path itself. If the caller asked for O_TRUNC but
+        // didn't request write access we silently ignore it, matching
+        // Linux's behaviour (the open(2) man page documents this as
+        // unspecified, but glibc / the kernel both no-op rather than
+        // erroring).
+        if flags.is_trunc() && flags.write {
+            file.truncate(0).await?;
+        }
         Ok(Self {
             inner: file,
         })

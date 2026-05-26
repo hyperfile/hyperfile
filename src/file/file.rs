@@ -394,7 +394,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         let _ = fn_start;
 
-        self.inode.update_atime();
+        if !self.flags.is_noatime() {
+            self.inode.update_atime();
+        }
         Ok(bytes_read)
     }
 

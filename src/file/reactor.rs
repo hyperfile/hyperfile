@@ -294,7 +294,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if joins.iter().all(|x| match x { ImmOrJoinSize::ImmSize(_) => true, ImmOrJoinSize::JoinSize(_) => false, }) {
             let actual_bytes = joins.iter().map(|x| x.size()).sum();
             assert!(total_bytes == actual_bytes);
-            if actual_bytes > 0 {
+            if actual_bytes > 0 && !self.flags.is_noatime() {
                 self.inode.update_atime();
             }
             #[cfg(feature = "range-lock")]
@@ -304,7 +304,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
 
         // no matter load backend data block success or not, update inode atime
-        if total_bytes > 0 {
+        // (unless O_NOATIME was specified at open time)
+        if total_bytes > 0 && !self.flags.is_noatime() {
             self.inode.update_atime();
         }
 

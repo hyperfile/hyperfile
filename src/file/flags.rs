@@ -11,6 +11,7 @@ pub struct HyperFileFlags {
     pub sync: bool,
     pub dsync: bool,
     pub direct: bool,
+    pub noatime: bool,
     sync_flush_mode: bool,
 }
 
@@ -36,6 +37,7 @@ impl HyperFileFlags {
             sync: f.is_sync(),
             dsync: f.is_dsync(),
             direct: f.is_direct(),
+            noatime: f.is_noatime(),
             sync_flush_mode: f.is_direct() | f.is_sync() | f.is_dsync(),
         }
     }
@@ -62,6 +64,7 @@ impl HyperFileFlags {
             sync: true,
             dsync: true,
             direct: true,
+            noatime: true,
             sync_flush_mode: true,
         }
     }
@@ -88,6 +91,10 @@ impl HyperFileFlags {
 
     pub fn is_trunc(&self) -> bool {
         self.trunc
+    }
+
+    pub fn is_noatime(&self) -> bool {
+        self.noatime
     }
 
     // according to hyperfile's nature behavior,
@@ -402,6 +409,47 @@ mod tests {
         assert!(hf.is_sync());
         assert!(hf.is_dsync());
         assert!(hf.is_direct());
+        assert!(hf.is_noatime());
         assert!(hf.is_sync_flush_mode());
+    }
+
+    // --- O_NOATIME plumbing ---
+
+    #[test]
+    fn hyper_flags_noatime_off_by_default() {
+        let hf = HyperFileFlags::from_flags(FileFlags::rdonly());
+        assert!(!hf.is_noatime());
+        let hf = HyperFileFlags::from_flags(FileFlags::wronly());
+        assert!(!hf.is_noatime());
+        let hf = HyperFileFlags::from_flags(FileFlags::rdwr());
+        assert!(!hf.is_noatime());
+    }
+
+    #[test]
+    fn hyper_flags_noatime_set_when_o_noatime() {
+        let f = FileFlags::from(libc::O_RDONLY | libc::O_NOATIME);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.is_noatime());
+        // O_NOATIME alone shouldn't enable sync_flush_mode
+        assert!(!hf.is_sync_flush_mode());
+    }
+
+    #[test]
+    fn hyper_flags_noatime_orthogonal_to_other_flags() {
+        let f = FileFlags::from(libc::O_RDWR | libc::O_NOATIME | libc::O_DIRECT);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.is_noatime());
+        assert!(hf.is_direct());
+        assert!(hf.is_sync_flush_mode());
+    }
+
+    #[test]
+    fn hyper_flags_default_noatime_false() {
+        let hf = HyperFileFlags::default();
+        assert!(!hf.is_noatime());
+        let hf = HyperFileFlags::rdonly();
+        assert!(!hf.is_noatime());
+        let hf = HyperFileFlags::wronly();
+        assert!(!hf.is_noatime());
     }
 }
