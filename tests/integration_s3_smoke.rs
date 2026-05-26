@@ -445,3 +445,150 @@ async fn smoke_o_append_write_zero() {
 
     tf.cleanup(&client).await;
 }
+
+/// O_EXCL with O_CREAT on a missing file: must create successfully.
+/// (fs_open_or_create + the EXCL bit set.)
+#[tokio::test]
+#[ignore]
+async fn smoke_o_excl_creates_when_missing() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let flags = FileFlags::from(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL);
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+        &client,
+        tf.uri(),
+        flags,
+        FileMode::default_file(),
+    )
+    .await
+    .expect("O_CREAT|O_EXCL on missing file must succeed");
+
+    let stat = hyper.fs_getattr().expect("getattr");
+    assert_eq!(stat.st_size, 0);
+    let _ = hyper.fs_release().await;
+
+    tf.cleanup(&client).await;
+}
+
+/// O_EXCL with O_CREAT on an existing file: must error AlreadyExists.
+#[tokio::test]
+#[ignore]
+async fn smoke_o_excl_errors_when_exists() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Pre-create.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("pre-create");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Attempt with O_EXCL: must fail.
+    let flags = FileFlags::from(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL);
+    let res = Hyper::fs_open_or_create_with_default_opt(
+        &client,
+        tf.uri(),
+        flags,
+        FileMode::default_file(),
+    )
+    .await;
+    match res {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("expected AlreadyExists, got {:?}", e),
+        Ok(_) => panic!("O_CREAT|O_EXCL on existing file must fail"),
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// O_CREAT alone (no O_EXCL) on an existing file: must open it,
+/// not error. Verifies the existing open-or-create path still
+/// works after the EXCL change.
+#[tokio::test]
+#[ignore]
+async fn smoke_o_creat_without_excl_opens_existing() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Pre-create with content.
+    let payload = vec![0xEEu8; 256];
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("pre-create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Reopen with O_CREAT (no O_EXCL): must open existing, content preserved.
+    let flags = FileFlags::from(libc::O_RDWR | libc::O_CREAT);
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+        &client,
+        tf.uri(),
+        flags,
+        FileMode::default_file(),
+    )
+    .await
+    .expect("O_CREAT without O_EXCL on existing file must succeed");
+
+    let stat = hyper.fs_getattr().expect("getattr");
+    assert_eq!(stat.st_size as usize, payload.len(), "existing content lost");
+
+    let mut buf = vec![0u8; payload.len()];
+    let n = hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(n, payload.len());
+    assert_eq!(buf, payload);
+    let _ = hyper.fs_release().await;
+
+    tf.cleanup(&client).await;
+}
+
+/// O_EXCL on the bare fs_open path (no O_CREAT): per POSIX this is
+/// undefined and Linux ignores the EXCL bit. Hyperfile follows the
+/// same rule — fs_open + O_EXCL on an existing file should still
+/// open it, on a missing file should still NotFound.
+#[tokio::test]
+#[ignore]
+async fn smoke_o_excl_without_creat_is_ignored_on_open() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Pre-create.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client,
+            tf.uri(),
+            FileFlags::rdwr(),
+            FileMode::default_file(),
+        )
+        .await
+        .expect("pre-create");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // fs_open + O_EXCL: must succeed (EXCL ignored on bare open).
+    let flags = FileFlags::from(libc::O_RDWR | libc::O_EXCL);
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), flags)
+        .await
+        .expect("fs_open + O_EXCL must ignore the EXCL bit");
+    let _ = hyper.fs_release().await;
+
+    tf.cleanup(&client).await;
+}

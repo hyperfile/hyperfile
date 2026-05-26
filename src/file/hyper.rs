@@ -15,6 +15,20 @@ pub struct Hyper<'a> {
 impl<'a: 'static> Hyper<'a> {
     pub(crate) async fn do_open_or_create(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode, create: bool) -> Result<Self>
     {
+        // POSIX O_EXCL: when paired with O_CREAT, the open MUST
+        // create a new file and fail with EEXIST if one already
+        // exists. We honor this by routing straight to create()
+        // (which already errors AlreadyExists on collision)
+        // without first attempting open(). This mirrors what the
+        // Linux kernel does for open(O_CREAT|O_EXCL): a single
+        // atomic create-or-fail attempt, no try-open dance.
+        //
+        // O_EXCL without an effective O_CREAT (i.e. on the bare
+        // fs_open path where create=false) is undefined per POSIX
+        // and silently ignored on Linux; we match that.
+        if create && flags.is_excl() {
+            return Self::create(client, file_config, flags, mode).await;
+        }
         match Self::open(client.clone(), file_config.clone(), flags.clone()).await {
             Ok(hyper) => {
                 return Ok(hyper);

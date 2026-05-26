@@ -6,6 +6,7 @@ pub struct HyperFileFlags {
     pub read: bool,
     pub write: bool,
     pub creat: bool,
+    pub excl: bool,
     pub append: bool,
     pub trunc: bool,
     pub sync: bool,
@@ -32,6 +33,7 @@ impl HyperFileFlags {
             read: read,
             write: write,
             creat: f.is_creat(),
+            excl: f.is_excl(),
             append: f.is_append(),
             trunc: f.is_trunc(),
             sync: f.is_sync(),
@@ -59,6 +61,7 @@ impl HyperFileFlags {
             read: true,
             write: true,
             creat: true,
+            excl: true,
             append: true,
             trunc: true,
             sync: true,
@@ -91,6 +94,10 @@ impl HyperFileFlags {
 
     pub fn is_trunc(&self) -> bool {
         self.trunc
+    }
+
+    pub fn is_excl(&self) -> bool {
+        self.excl
     }
 
     pub fn is_noatime(&self) -> bool {
@@ -451,5 +458,48 @@ mod tests {
         assert!(!hf.is_noatime());
         let hf = HyperFileFlags::wronly();
         assert!(!hf.is_noatime());
+    }
+
+    // --- O_EXCL plumbing ---
+
+    #[test]
+    fn hyper_flags_excl_off_by_default() {
+        let hf = HyperFileFlags::from_flags(FileFlags::rdonly());
+        assert!(!hf.is_excl());
+        let hf = HyperFileFlags::from_flags(FileFlags::wronly());
+        assert!(!hf.is_excl());
+        let hf = HyperFileFlags::from_flags(FileFlags::rdwr());
+        assert!(!hf.is_excl());
+    }
+
+    #[test]
+    fn hyper_flags_excl_set_when_o_excl() {
+        let f = FileFlags::from(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.is_excl());
+        assert!(hf.creat);
+    }
+
+    #[test]
+    fn hyper_flags_excl_without_creat_still_carries_through() {
+        // POSIX leaves O_EXCL without O_CREAT undefined; we still
+        // record the bit so the caller can inspect, even though
+        // do_open_or_create will ignore it on the bare-open path.
+        let f = FileFlags::from(libc::O_RDWR | libc::O_EXCL);
+        let hf = HyperFileFlags::from_flags(f);
+        assert!(hf.is_excl());
+        assert!(!hf.creat);
+    }
+
+    #[test]
+    fn hyper_flags_default_excl_false() {
+        assert!(!HyperFileFlags::default().is_excl());
+        assert!(!HyperFileFlags::rdonly().is_excl());
+        assert!(!HyperFileFlags::wronly().is_excl());
+    }
+
+    #[test]
+    fn hyper_flags_all_includes_excl() {
+        assert!(HyperFileFlags::all().is_excl());
     }
 }
