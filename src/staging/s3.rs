@@ -157,6 +157,24 @@ impl Staging<S3BlockLoader> for S3Staging {
         Ok(())
     }
 
+    async fn load_range(&self, segid: SegmentId, s3_off: usize, buf: &mut [u8]) -> Result<()> {
+        let len = buf.len();
+        debug_assert!(len > 0, "load_range with zero length");
+        let end = s3_off + len - 1;
+        let key = format!(
+            "{}/{}",
+            self.root_path,
+            Segment::segid_to_staging_file_id(segid),
+        );
+        let range = format!("bytes={}-{}", s3_off, end);
+        debug!(
+            "load_range from s3 staging s3://{}/{} at offset: {} range: {} len: {}",
+            &self.bucket, &key, s3_off, &range, len,
+        );
+        let _ = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await?;
+        Ok(())
+    }
+
     fn new_segwr(&self, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> segment::Writer<S3Staging> {
         segment::Writer::<S3Staging>::new(self.clone(), self.runtime_config.segment_buffer_size, segid, hyper_file_config)
     }

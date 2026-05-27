@@ -115,6 +115,16 @@ pub(crate) const DEFAULT_FORWARD_ORIGIN_CONCURRENCY: usize = 10;
 pub(crate) const DEFAULT_FORWARD_ORIGIN_THRESHOLD: usize = 8 * 1024 * 1024;
 pub(crate) const DEFAULT_FORWARD_ORIGIN_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
+// Read-coalescing (Level A read-side perf): when a single read
+// spans multiple consecutive blocks that map to a contiguous range
+// in the same segment, the read path issues ONE byte-range S3 GET
+// instead of one per block. The caps below bound a single
+// coalesced GET (so we don't issue a 1-GiB request) and the number
+// of concurrent in-flight coalesced GETs spawned per single read
+// (backpressure for the SDK connection pool / bandwidth).
+pub(crate) const DEFAULT_READ_GET_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_READ_MAX_CONCURRENCY: usize = 10;
+
 pub(crate) const DEFAULT_SEGMENT_BUFFER_SIZE: usize = 100 * 1024 * 1024;
 pub(crate) const DEFAULT_MIDDLE_SEGMENT_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_LARGE_SEGMENT_BUFFER_SIZE: usize = 1024 * 1024 * 1024;

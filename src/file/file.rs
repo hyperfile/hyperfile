@@ -41,6 +41,59 @@ use super::{HyperTrait, DirtyDataBlocks, FlushTiming};
 use super::lock::RangeLock;
 use super::state::State;
 
+/// One step of a coalesced read plan. Each variant carries a
+/// `dst_len` — the number of bytes it consumes from the user's
+/// destination buffer in iteration order. The executor walks the
+/// ops, repeatedly `split_at_mut(dst_len)` on the user buffer,
+/// and dispatches the slice to the right source.
+///
+/// `Range` is the coalesced variant: it covers a contiguous
+/// byte range of one segment, possibly spanning multiple data
+/// blocks. The Level-A planner merges adjacent
+/// `is_on_staging` blocks whose decoded `(segid, staging_off)`
+/// are contiguous, capped by `runtime.read_get_max_bytes`.
+#[derive(Debug)]
+pub(crate) enum ReadOp {
+    /// Block is in the in-memory data cache (dirty or clean).
+    /// Copy bytes out of the cached block.
+    Cache {
+        blk_idx: BlockIndex,
+        src_off_in_block: usize,
+        dst_len: usize,
+    },
+    /// Block has no backing storage (zero-block ptr or sparse
+    /// hole). Fill destination with zero.
+    Zero { dst_len: usize },
+    /// Block lives in an in-flight (not-yet-flushed-to-S3) WAL
+    /// segment whose contents are still pinned in memory. Copy
+    /// from the in-memory segment buffer.
+    #[cfg(feature = "wal")]
+    Inmem {
+        segid: SegmentId,
+        s3_off: usize,
+        dst_len: usize,
+    },
+    /// Coalesced ranged GET against the staging segment. May
+    /// cover multiple consecutive blocks.
+    Range {
+        segid: SegmentId,
+        s3_off: usize,
+        dst_len: usize,
+    },
+}
+
+impl ReadOp {
+    pub(crate) fn dst_len(&self) -> usize {
+        match self {
+            Self::Cache { dst_len, .. } => *dst_len,
+            Self::Zero { dst_len } => *dst_len,
+            #[cfg(feature = "wal")]
+            Self::Inmem { dst_len, .. } => *dst_len,
+            Self::Range { dst_len, .. } => *dst_len,
+        }
+    }
+}
+
 pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> {
     pub(crate) staging: T,
     pub(crate) bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L, C>,
@@ -356,40 +409,52 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             debug!("READ - buf len shrink to: {}, due to file size {}", mid, self.inode.size());
             (buf, _) = buf.split_at_mut(mid);
         }
-
-        let data_block_size = self.config.meta.data_block_size;
-        let buf_len = buf.len();
-        let blk_idx = (off / data_block_size) as BlockIndex;
-        let blk_off = off % data_block_size;
-        let blk_count = (buf_len + data_block_size - 1) / data_block_size;
-        debug!("READ - block index {blk_idx}, block offset {blk_off}, block count {blk_count}");
-        let mut bytes_read = 0;
-
-        let blk_iter = BlockIndexIter::new(off, buf_len, data_block_size);
-        let mut next_slice = buf;
-        for (blk_idx, off, len) in blk_iter {
-            let (this, next) = next_slice.split_at_mut(len);
-            if let Some(block) = self.cache.get(&blk_idx) {
-                // fast path check on dirty list
-                debug!("      - BlockIndex {blk_idx} CACHE HIT");
-                block.copy_out(off, this);
-                block.unlock();
-            } else {
-                debug!("      - lookup BlockIndex {blk_idx} for BlockPtr");
-                let blk_ptr = self.bmap.lookup(&blk_idx).await
-                                        .or_else(|e| {
-                                            // translate NotFound -> zero block from bmap
-                                            if e.kind() == ErrorKind::NotFound {
-                                                return Ok(BlockPtrFormat::new_zero_block());
-                                            }
-                                            warn!("READ - lookup bmap for block index {blk_idx} error: {}", e);
-                                            Err(e)
-                                        })?;
-                debug!("      - load data block for block ptr {} at offset {} len {}", self.blk_ptr_decode_display(&blk_ptr), off, this.len());
-                let _ = self.load_data_block_read_path(blk_idx, blk_ptr, off, this).await?;
+        if buf.is_empty() {
+            let _ = fn_start;
+            if !self.flags.is_noatime() {
+                self.inode.update_atime();
             }
-            bytes_read += this.len();
-            next_slice = next;
+            return Ok(0);
+        }
+
+        let buf_len = buf.len();
+
+        // Stage 1: walk blocks and build a coalesced plan.
+        let plan = self.plan_read(off, buf_len).await?;
+        debug!("READ - planned {} ops for {} bytes", plan.len(), buf_len);
+
+        // Stage 2: execute. Walk ops, splitting `buf` as we go.
+        let mut bytes_read = 0;
+        let mut remaining = buf;
+        for op in plan {
+            let dst_len = op.dst_len();
+            let (this, next) = remaining.split_at_mut(dst_len);
+            match op {
+                ReadOp::Cache { blk_idx, src_off_in_block, dst_len: _ } => {
+                    let block = self.cache.get(&blk_idx)
+                        .expect("planner classified as cache hit but block is gone");
+                    block.copy_out(src_off_in_block, this);
+                    block.unlock();
+                }
+                ReadOp::Zero { dst_len: _ } => {
+                    this.fill(0);
+                }
+                #[cfg(feature = "wal")]
+                ReadOp::Inmem { segid, s3_off, dst_len: _ } => {
+                    let lock = self.flushing_segments.read().await;
+                    let weak = lock.get(&segid)
+                        .unwrap_or_else(|| panic!("inflight segid {segid} not registered"));
+                    let data = weak.upgrade()
+                        .unwrap_or_else(|| panic!("inflight data for segid {segid} dropped"));
+                    let end = s3_off + this.len();
+                    this.copy_from_slice(&data[s3_off..end]);
+                }
+                ReadOp::Range { segid, s3_off, dst_len: _ } => {
+                    self.staging.load_range(segid, s3_off, this).await?;
+                }
+            }
+            bytes_read += dst_len;
+            remaining = next;
         }
 
         let _ = fn_start;
@@ -398,6 +463,136 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             self.inode.update_atime();
         }
         Ok(bytes_read)
+    }
+
+    /// Walk the read range and produce a coalesced op list. See
+    /// `ReadOp` for the coalescing rules; in short, contiguous
+    /// blocks that all map to one segment with consecutive
+    /// staging offsets get merged into one `ReadOp::Range`,
+    /// capped at `runtime.read_get_max_bytes`. Cache hits, zero
+    /// blocks, and in-flight WAL blocks each break the run and
+    /// produce their own per-block op.
+    pub(crate) async fn plan_read(&mut self, off: usize, buf_len: usize) -> Result<Vec<ReadOp>> {
+        let data_block_size = self.config.meta.data_block_size;
+        let max_get = self.config.runtime.read_get_max_bytes;
+
+        let mut ops: Vec<ReadOp> = Vec::new();
+        // (segid, s3_off_start, accumulated_len)
+        let mut current_range: Option<(SegmentId, usize, usize)> = None;
+        let flush_range = |ops: &mut Vec<ReadOp>,
+                           current_range: &mut Option<(SegmentId, usize, usize)>| {
+            if let Some((seg, off, len)) = current_range.take() {
+                ops.push(ReadOp::Range { segid: seg, s3_off: off, dst_len: len });
+            }
+        };
+
+        let mut consumed = 0usize;
+        let mut blk_idx = (off / data_block_size) as BlockIndex;
+        let mut block_off = off % data_block_size;
+
+        while consumed < buf_len {
+            let block_remaining = data_block_size - block_off;
+            let dst_len = block_remaining.min(buf_len - consumed);
+
+            // Cache check first — `cache.get` does NOT promote
+            // clean→dirty (only `contains` does), so this is a
+            // safe peek with a side-effect of bumping LRU on
+            // clean hits, which mirrors the pre-coalescing read.
+            let cache_hit = self.cache.get(&blk_idx).is_some();
+            if cache_hit {
+                flush_range(&mut ops, &mut current_range);
+                ops.push(ReadOp::Cache {
+                    blk_idx,
+                    src_off_in_block: block_off,
+                    dst_len,
+                });
+                consumed += dst_len;
+                blk_idx += 1;
+                block_off = 0;
+                continue;
+            }
+
+            // bmap lookup; NotFound → treat as zero block.
+            let blk_ptr = match self.bmap.lookup(&blk_idx).await {
+                Ok(p) => p,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    BlockPtrFormat::new_zero_block()
+                }
+                Err(e) => {
+                    warn!("plan_read - lookup bmap for block index {blk_idx} error: {}", e);
+                    return Err(e);
+                }
+            };
+
+            if BlockPtrFormat::is_zero_block(&blk_ptr) {
+                flush_range(&mut ops, &mut current_range);
+                ops.push(ReadOp::Zero { dst_len });
+            } else if BlockPtrFormat::is_on_staging(&blk_ptr) {
+                let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
+
+                // WAL feature: a staging-pointer for a segid
+                // greater than the on-disk last_cno means the
+                // segment is in flight (memory-pinned, not yet
+                // on S3). Read from memory, no S3 GET, no
+                // coalescing.
+                #[cfg(feature = "wal")]
+                let is_inflight = self.wal.is_some()
+                    && self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()
+                    && segid > self.inode().get_last_ondisk_cno();
+                #[cfg(not(feature = "wal"))]
+                let is_inflight = false;
+
+                if is_inflight {
+                    flush_range(&mut ops, &mut current_range);
+                    #[cfg(feature = "wal")]
+                    ops.push(ReadOp::Inmem {
+                        segid,
+                        s3_off: staging_off + block_off,
+                        dst_len,
+                    });
+                    #[cfg(not(feature = "wal"))]
+                    {
+                        let _ = staging_off;
+                        unreachable!()
+                    }
+                } else {
+                    let s3_off = staging_off + block_off;
+                    let extended = match &current_range {
+                        Some((cur_seg, cur_off, cur_len)) => {
+                            *cur_seg == segid
+                                && cur_off + cur_len == s3_off
+                                && cur_len + dst_len <= max_get
+                        }
+                        None => false,
+                    };
+                    if extended {
+                        let (seg, off, len) = current_range.take().unwrap();
+                        current_range = Some((seg, off, len + dst_len));
+                    } else {
+                        flush_range(&mut ops, &mut current_range);
+                        current_range = Some((segid, s3_off, dst_len));
+                    }
+                }
+            } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
+                panic!(
+                    "plan_read - dummy block ptr at blk_idx {} (write path leaked into read?)",
+                    blk_idx,
+                );
+            } else {
+                panic!(
+                    "plan_read - unknown block ptr {} at blk_idx {}",
+                    self.blk_ptr_decode_display(&blk_ptr),
+                    blk_idx,
+                );
+            }
+
+            consumed += dst_len;
+            blk_idx += 1;
+            block_off = 0;
+        }
+
+        flush_range(&mut ops, &mut current_range);
+        Ok(ops)
     }
 
     pub async fn write(&mut self, off: usize, buf: &[u8]) -> Result<usize> {

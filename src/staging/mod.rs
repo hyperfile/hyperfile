@@ -35,6 +35,14 @@ pub trait Staging<L> {
     fn flush_inode(&self, buf: &[u8], inode_state: &Option<OnDiskState>, flag: FlushInodeFlag) -> impl Future<Output = Result<Option<OnDiskState>>> + Send;
     fn remove_inode(&self, inode_state: &Option<OnDiskState>) -> impl Future<Output = Result<()>>;
     fn load_data_block(&self, segid: SegmentId, staging_off: usize, offset: usize, block_size: usize, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send;
+    /// Coalesced range read: fetch `buf.len()` bytes starting at
+    /// byte offset `s3_off` of the segment file for `segid`,
+    /// writing the bytes directly into `buf`. Used by the Level-A
+    /// read coalescing planner to pack many block-sized fetches
+    /// into one ranged S3 GET. The caller has already done all
+    /// bmap lookups; this is a thin wrapper around the
+    /// staging-layer ranged GET.
+    fn load_range(&self, segid: SegmentId, s3_off: usize, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send;
     fn new_segwr(&self, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> segment::Writer<Self> where Self: Sized;
     fn dir_filename(&self) -> (&str, &str);
     fn root_path(&self) -> &str;

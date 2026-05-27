@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 #[cfg(feature = "wal")]
 use std::pin::Pin;
+#[cfg(not(feature = "wal"))]
 use bytes::Bytes;
 use crate::SegmentId;
 use crate::ondisk::{SegmentHeader, SegmentBlockEntryRaw};

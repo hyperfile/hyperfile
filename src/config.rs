@@ -110,12 +110,24 @@ pub struct HyperFileRuntimeConfig {
     pub data_cache_dirty_max_flush_interval: u64,
     // bmap node cache
     pub node_cache_blocks: usize,
+    /// Cap on the number of bytes a single S3 GET issued by the
+    /// read path's coalescing logic may cover. Larger contiguous
+    /// regions are split into this-sized sub-ranges.
+    #[serde(default = "default_read_get_max_bytes")]
+    pub read_get_max_bytes: usize,
+    /// Backpressure cap on in-flight S3 GETs spawned by a single
+    /// `fs_read` / `fh_read` after Level-A coalescing.
+    #[serde(default = "default_read_max_concurrency")]
+    pub read_max_concurrency: usize,
     /// How to resolve flush conflicts when another writer has modified
     /// the same file between our read and our write. See
     /// `FlushConflictPolicy` for details.
     #[serde(default)]
     pub flush_conflict_policy: FlushConflictPolicy,
 }
+
+fn default_read_get_max_bytes() -> usize { DEFAULT_READ_GET_MAX_BYTES }
+fn default_read_max_concurrency() -> usize { DEFAULT_READ_MAX_CONCURRENCY }
 
 /// Policy that controls how `flush` handles a concurrent modification
 /// detected at the storage layer (S3 PutObject returns 412 Precondition
@@ -159,6 +171,8 @@ impl Default for HyperFileRuntimeConfig {
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
             node_cache_blocks: DEFAULT_NODE_CACHE_BLOCKS,
             flush_conflict_policy: FlushConflictPolicy::default(),
+            read_get_max_bytes: DEFAULT_READ_GET_MAX_BYTES,
+            read_max_concurrency: DEFAULT_READ_MAX_CONCURRENCY,
         }
     }
 }
@@ -177,6 +191,8 @@ impl HyperFileRuntimeConfig {
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
             node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
             flush_conflict_policy: FlushConflictPolicy::default(),
+            read_get_max_bytes: DEFAULT_READ_GET_MAX_BYTES,
+            read_max_concurrency: DEFAULT_READ_MAX_CONCURRENCY,
         }
     }
 
@@ -193,6 +209,8 @@ impl HyperFileRuntimeConfig {
             data_cache_dirty_max_flush_interval: DEFAULT_MAX_DIRTY_DATA_FLUSH_INTERVAL,
             node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
             flush_conflict_policy: FlushConflictPolicy::default(),
+            read_get_max_bytes: DEFAULT_READ_GET_MAX_BYTES,
+            read_max_concurrency: DEFAULT_READ_MAX_CONCURRENCY,
         }
     }
 }
