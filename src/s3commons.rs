@@ -440,4 +440,223 @@ impl S3Ops {
         }
         Ok(())
     }
+
+    /// Scatter-gather variant of [`Self::do_put_object`]: the
+    /// body is delivered as a list of `Bytes` pieces, streamed
+    /// to the SDK via `http_body::Body` rather than copied into
+    /// a single contiguous buffer. Used by the segment flush
+    /// path under `done_pieces`. See `src/segment_body.rs` for
+    /// the plumbing.
+    pub(crate) async fn do_put_object_pieces(
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        body: crate::segment_body::SegmentBody,
+        inode_state: &Option<OnDiskState>,
+    ) -> Result<Option<OnDiskState>> {
+        let sdk_body = body.into_sdk_body();
+        let builder = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(sdk_body.into());
+        let op = if let Some(state) = inode_state {
+            builder.if_match(state.checksum.as_str())
+        } else {
+            builder.if_none_match('*')
+        };
+        match op.send().await {
+            Ok(output) => {
+                let od_state = OnDiskState {
+                    checksum: output.e_tag.unwrap().replace("\"", ""),
+                    timestamp: 0,
+                };
+                Ok(Some(od_state))
+            }
+            Err(sdk_err) => {
+                if let Some(resp) = sdk_err.raw_response() {
+                    match resp.status().as_u16() {
+                        412 | 409 => {
+                            // Same semantics as do_put_object's conflict branch.
+                            let err_str = format!(
+                                "Conditional PutObject (pieces) failed on s3://{}/{}, status: {} (concurrent modification)",
+                                bucket, key, resp.status().as_u16(),
+                            );
+                            warn!("{}", err_str);
+                            return Err(Error::new(ErrorKind::AlreadyExists, err_str));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut err_str = format!("PutObject (pieces) s3://{}/{} error: ", bucket, key);
+                if let Some(serv_err) = sdk_err.as_service_error() {
+                    err_str.push_str(&format!("{}", serv_err));
+                } else {
+                    err_str.push_str(&format!("{}", sdk_err));
+                }
+                error!("{}", err_str);
+                Err(Error::new(ErrorKind::Other, err_str))
+            }
+        }
+    }
+
+    /// Scatter-gather variant of [`Self::do_mp_upload`]. Each
+    /// part is a `SegmentBody::slice(...)` covering a contiguous
+    /// sub-range; slicing a piece list is O(N_pieces_in_range)
+    /// and copies no bytes (`Bytes::slice` is refcount).
+    pub(crate) async fn do_mp_upload_pieces(
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        body: crate::segment_body::SegmentBody,
+        _inode_state: &Option<OnDiskState>,
+        mpu_chunk_size: usize,
+    ) -> Result<Option<OnDiskState>> {
+        let total_len = body.len();
+
+        // Open the multipart upload.
+        let upload_id;
+        let res = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        match res {
+            Ok(output) => {
+                if let Some(id) = output.upload_id {
+                    upload_id = id;
+                } else {
+                    let err_str = format!(
+                        "CreateMultipartUpload s3://{}/{} error: unable to get a valid upload id",
+                        bucket, key,
+                    );
+                    error!("{}", err_str);
+                    return Err(Error::new(ErrorKind::Other, err_str));
+                }
+            }
+            Err(sdk_err) => {
+                let mut err_str = format!("CreateMultipartUpload s3://{}/{} error: ", bucket, key);
+                if let Some(serv_err) = sdk_err.as_service_error() {
+                    err_str.push_str(&format!("{}", serv_err));
+                } else {
+                    err_str.push_str(&format!("{}", sdk_err));
+                }
+                error!("{}", err_str);
+                return Err(Error::new(ErrorKind::Other, err_str));
+            }
+        }
+
+        // Slice the body into per-part sub-bodies and upload in
+        // parallel. Slicing only touches piece ref-counts; no
+        // bytes are copied.
+        let parts = total_len.div_ceil(mpu_chunk_size).max(1);
+        let mut set: tokio::task::JoinSet<Result<(usize, String)>> =
+            tokio::task::JoinSet::new();
+        for part_id in 1..=parts {
+            let start = (part_id - 1) * mpu_chunk_size;
+            let part_len = if part_id == parts {
+                total_len - start
+            } else {
+                mpu_chunk_size
+            };
+            let sub = body.slice(start, part_len);
+            let uid = upload_id.clone();
+            let pid = part_id;
+            let k = key.to_owned();
+            let c = client.clone();
+            let b = bucket.to_owned();
+            set.spawn(async move {
+                let etag =
+                    Self::do_upload_parts_pieces(&c, &b, &k, sub, pid, &uid).await?;
+                Ok((part_id, etag))
+            });
+        }
+
+        let mut complete_parts: Vec<(i32, String)> = Vec::new();
+        while let Some(res) = set.join_next().await {
+            let (pid, etag) = res??;
+            complete_parts.push((pid as i32, etag));
+        }
+        complete_parts.sort_by_key(|t| t.0);
+        let parts_built = complete_parts
+            .into_iter()
+            .map(|p| {
+                aws_sdk_s3::types::builders::CompletedPartBuilder::default()
+                    .part_number(p.0)
+                    .e_tag(p.1)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+        let completed = aws_sdk_s3::types::builders::CompletedMultipartUploadBuilder::default()
+            .set_parts(Some(parts_built))
+            .build();
+
+        let res = client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await;
+        match res {
+            Ok(output) => {
+                let od_state = output.e_tag.map(|t| OnDiskState {
+                    checksum: t.replace("\"", ""),
+                    timestamp: 0,
+                });
+                Ok(od_state)
+            }
+            Err(sdk_err) => {
+                let mut err_str = format!(
+                    "CompleteMultipartUpload (pieces) s3://{}/{} upload_id: {}, error: ",
+                    bucket, key, upload_id,
+                );
+                if let Some(serv_err) = sdk_err.as_service_error() {
+                    err_str.push_str(&format!("{}", serv_err));
+                } else {
+                    err_str.push_str(&format!("{}", sdk_err));
+                }
+                error!("{}", err_str);
+                Err(Error::new(ErrorKind::Other, err_str))
+            }
+        }
+    }
+
+    async fn do_upload_parts_pieces(
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        body: crate::segment_body::SegmentBody,
+        part_id: usize,
+        upload_id: &str,
+    ) -> Result<String> {
+        let sdk_body = body.into_sdk_body();
+        let res = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .part_number(part_id as i32)
+            .upload_id(upload_id)
+            .body(sdk_body.into())
+            .send()
+            .await;
+        match res {
+            Ok(output) => Ok(output.e_tag.unwrap()),
+            Err(sdk_err) => {
+                let mut err_str = format!(
+                    "UploadPart (pieces) s3://{}/{} upload_id: {}, part_id: {}, error: ",
+                    bucket, key, upload_id, part_id,
+                );
+                if let Some(serv_err) = sdk_err.as_service_error() {
+                    err_str.push_str(&format!("{}", serv_err));
+                } else {
+                    err_str.push_str(&format!("{}", sdk_err));
+                }
+                error!("{}", err_str);
+                Err(Error::new(ErrorKind::Other, err_str))
+            }
+        }
+    }
 }

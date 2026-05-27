@@ -24,6 +24,7 @@ pub mod staging;
 pub mod meta_loader;
 pub mod data_cache;
 pub(crate) mod s3commons;
+pub(crate) mod segment_body;
 #[cfg(feature = "wal")]
 pub mod wal;
 pub mod node_cache;

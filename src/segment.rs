@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 #[cfg(feature = "wal")]
 use std::pin::Pin;
+use bytes::Bytes;
 use crate::SegmentId;
 use crate::ondisk::{SegmentHeader, SegmentBlockEntryRaw};
 use crate::{BlockIndex, BlockPtr};
@@ -14,6 +15,7 @@ use crate::inode::Inode;
 use crate::ondisk::InodeRaw;
 #[cfg(feature = "concurrent-segment-build")]
 use crate::buffer::DataBlock;
+use crate::segment_body::SegmentBody;
 
 pub struct Segment;
 
@@ -26,7 +28,20 @@ impl Segment {
 pub trait SegmentReadWrite {
     // writer
     fn append(&self, segid: SegmentId, buf: &[u8]) -> Result<()>;
+
+    /// Upload a fully-built segment whose contents live in a
+    /// single contiguous `&[u8]`. Used by the WAL feature path,
+    /// which needs the segment buffer pinned in memory across the
+    /// upload+replay window.
     fn done(&self, segid: SegmentId, buf: &[u8], len: usize) -> impl Future<Output = Result<()>> + Send;
+
+    /// Upload a fully-built segment whose contents live as a
+    /// list of `Bytes` pieces. Implementations should stream the
+    /// pieces straight to the remote (e.g. via
+    /// `http_body::Body`) rather than concatenating them, which
+    /// is the whole point of having this entry point separate
+    /// from `done`.
+    fn done_pieces(&self, segid: SegmentId, body: SegmentBody) -> impl Future<Output = Result<()>> + Send;
     fn remove(&self, segid: SegmentId) -> impl Future<Output = Result<()>>;
     // reader
     fn open(&self, segid: SegmentId) -> impl Future<Output = Result<SegmentSum>>;
@@ -159,8 +174,17 @@ impl SegmentSum {
 
 pub struct Writer<T> {
     ctx: T,
+    /// Header / segment summary buffer. Small (a few KiB), built
+    /// in place by `realize_ss`. Promoted to a `Bytes` and pushed
+    /// into `body` as the first piece during `done`.
     #[cfg(not(feature = "wal"))]
-    data: Vec<u8>,
+    header: Vec<u8>,
+    /// Scatter list of pieces (meta blocks + data blocks) appended
+    /// in order, each as its own refcounted `Bytes`. The S3 staging
+    /// uploads them via `http_body::Body` streaming, so they never
+    /// get concatenated into one allocation.
+    #[cfg(not(feature = "wal"))]
+    body: SegmentBody,
     #[cfg(feature = "wal")]
     data: Arc<Pin<Box<Vec<u8>>>>,
     offset: usize,
@@ -171,7 +195,11 @@ pub struct Writer<T> {
 // router stub to real impl of writer function in Staging
 impl<T: SegmentReadWrite> Writer<T> {
     pub fn new(ctx: T, buf_size: usize, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> Self {
-        let data = Vec::with_capacity(buf_size);
+        // _buf_size is intentionally unused on the non-WAL path:
+        // we no longer pre-allocate one big segment buffer up
+        // front. Pieces are appended as they arrive and total
+        // memory is the sum of pieces.
+        let _ = buf_size;
 
         let mut hdr = SegmentHeader::new();
         hdr.s_meta_blk_shift = hyper_file_config.meta_block_size.checked_ilog2().unwrap() as u8;
@@ -183,9 +211,11 @@ impl<T: SegmentReadWrite> Writer<T> {
         Self {
             ctx: ctx,
             #[cfg(not(feature = "wal"))]
-            data: data,
+            header: Vec::new(),
+            #[cfg(not(feature = "wal"))]
+            body: SegmentBody::new(),
             #[cfg(feature = "wal")]
-            data: Arc::new(Box::pin(data)),
+            data: Arc::new(Box::pin(Vec::with_capacity(buf_size))),
             offset: 0,
             segid: segid,
             ss: SegmentSum {
@@ -210,13 +240,14 @@ impl<T: SegmentReadWrite> Writer<T> {
         #[cfg(not(feature = "wal"))]
         let ss_aligned_bytes = {
 
-        self.data.resize(ss_bytes, 0);
-        self.ss.write_to(&mut self.data);
-
+        // Build the header / summary into a small contiguous Vec
+        // that becomes the first piece of the body.
+        self.header.resize(ss_bytes, 0);
+        self.ss.write_to(&mut self.header);
         // calc 4KiB aligned bytes from real size of ss
         let ss_aligned_bytes = (ss_bytes + 4096 - 1) >> 12 << 12;
         // extend current ss to aligned size
-        self.data.resize(ss_aligned_bytes, 0);
+        self.header.resize(ss_aligned_bytes, 0);
 
         ss_aligned_bytes
 
@@ -245,13 +276,11 @@ impl<T: SegmentReadWrite> Writer<T> {
     pub fn append(&mut self, buf: &[u8]) -> Result<()> {
         let len = buf.len();
         #[cfg(not(feature = "wal"))]
-        let slice_start = {
-
-        self.data.resize(self.offset + len, 0);
-        let slice_start = &mut self.data[self.offset..];
-        slice_start
-
-        };
+        {
+            // Push a refcounted copy of `buf` as a single piece;
+            // no contiguous-buffer concat happens.
+            self.body.push(Bytes::copy_from_slice(buf));
+        }
         #[cfg(feature = "wal")]
         let slice_start = {
 
@@ -264,24 +293,24 @@ impl<T: SegmentReadWrite> Writer<T> {
 
         };
 
-        let (data, _) = slice_start.split_at_mut(len);
-        data.copy_from_slice(buf);
+        #[cfg(feature = "wal")]
+        {
+            let (data, _) = slice_start.split_at_mut(len);
+            data.copy_from_slice(buf);
+        }
         self.offset += len;
         self.ctx.append(self.segid, buf)
     }
 
-    #[cfg(feature = "concurrent-segment-build")]
+    /// Concurrent segment-build path for the WAL feature only.
+    /// Without WAL the segment body lives as a `Vec<Bytes>`
+    /// already, so there is no contiguous buffer to concat into
+    /// and parallelizing memcpy via `spawn_blocking` would be
+    /// pure overhead — the non-WAL `flush_process_build_segment`
+    /// call site uses sequential `append` instead.
+    #[cfg(all(feature = "concurrent-segment-build", feature = "wal"))]
     pub fn spawn_append(&mut self, chunk: Vec<&DataBlock>) -> Result<tokio::task::JoinHandle<()>> {
         let len = chunk.iter().map(|block| block.size()).sum();
-        #[cfg(not(feature = "wal"))]
-        let slice_start = {
-
-        self.data.resize(self.offset + len, 0);
-        let slice_start = &mut self.data[self.offset..];
-        slice_start
-
-        };
-        #[cfg(feature = "wal")]
         let slice_start = {
 
         let Some(data) = Arc::get_mut(&mut self.data) else {
@@ -319,11 +348,34 @@ impl<T: SegmentReadWrite> Writer<T> {
     }
 
     pub async fn done(self) -> Result<()> {
-        let _ = self.ctx.done(self.segid, &self.data, self.offset).await?;
+        #[cfg(not(feature = "wal"))]
+        {
+            // Stitch the header (one piece) and the appended
+            // meta+data pieces (already in `body`) into the
+            // final scatter body, then hand it to the staging
+            // for streaming upload. Total memory footprint of
+            // the body equals the sum of its pieces — no
+            // contiguous segment buffer is allocated.
+            let mut body = SegmentBody::with_capacity(self.body.pieces().len() + 1);
+            // Header / summary is the first frame.
+            body.push(Bytes::from(self.header));
+            for piece in self.body.pieces() {
+                body.push(piece.clone());
+            }
+            assert_eq!(
+                body.len(),
+                self.offset,
+                "scatter body length must match the cumulative writer offset",
+            );
+            self.ctx.done_pieces(self.segid, body).await
+        }
         #[cfg(feature = "wal")]
-        // force a strong count to keep data's life until wal_clear_mem_segment()
-        unsafe { Arc::increment_strong_count(Arc::as_ptr(&self.data)) };
-        Ok(())
+        {
+            let _ = self.ctx.done(self.segid, &self.data, self.offset).await?;
+            // force a strong count to keep data's life until wal_clear_mem_segment()
+            unsafe { Arc::increment_strong_count(Arc::as_ptr(&self.data)) };
+            Ok(())
+        }
     }
 
     #[cfg(feature = "wal")]

@@ -371,11 +371,11 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         for n in &dirty_meta_vec {
             let _ = segwr.append(n.as_slice())?;
         }
-        #[cfg(not(feature = "concurrent-segment-build"))]
+        #[cfg(any(not(feature = "concurrent-segment-build"), not(feature = "wal")))]
         for (_, n) in dirty_data_blocks.data().iter() {
             let _ = segwr.append(n.as_slice())?;
         }
-        #[cfg(feature = "concurrent-segment-build")]
+        #[cfg(all(feature = "concurrent-segment-build", feature = "wal"))]
         {
 
         const TARGET_CHUNKS: usize = 50;

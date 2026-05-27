@@ -301,6 +301,46 @@ impl segment::SegmentReadWrite for S3Staging {
         Ok(())
     }
 
+    async fn done_pieces(&self, segid: SegmentId, body: crate::segment_body::SegmentBody) -> Result<()> {
+        // The fault-injection interceptors used in
+        // `tests/integration_s3_*.rs` take a `&[u8]` snapshot of
+        // the body. To preserve their ergonomics we build a
+        // contiguous copy here ONLY when an interceptor is
+        // installed (i.e. during tests). The production fast path
+        // skips this and goes straight to the scatter upload.
+        if let Some(i) = &self.interceptor {
+            let mut snapshot = Vec::with_capacity(body.len());
+            for piece in body.pieces() {
+                snapshot.extend_from_slice(piece);
+            }
+            let _ = i.before_segment_done(&self, segid, &snapshot, snapshot.len()).await?;
+        }
+        let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
+        let len = body.len();
+        debug!("bufwr done s3://{}/{} {} (scatter)", &self.bucket, &key, len);
+
+        if self.segment_should_mp_upload(len) {
+            let _ = S3Ops::do_mp_upload_pieces(
+                &self.client,
+                &self.bucket,
+                &key,
+                body,
+                &None,
+                self.runtime_config.segment_mpu_chunk_size,
+            ).await?;
+            return Ok(());
+        }
+
+        let _ = S3Ops::do_put_object_pieces(
+            &self.client,
+            &self.bucket,
+            &key,
+            body,
+            &None,
+        ).await?;
+        Ok(())
+    }
+
     async fn remove(&self, segid: SegmentId) -> Result<()> {
         let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
         Self::do_remove(&self.client, &self.bucket, &key).await
