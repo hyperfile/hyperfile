@@ -10,6 +10,25 @@ use super::flags::FileFlags;
 use super::mode::FileMode;
 use super::handler::FileContext;
 
+/// Reactor-mode handle to a hyperfile-backed file.
+///
+/// Wraps a [`hyperfile_reactor::Reactor`]-spawned task that
+/// owns the underlying [`Hyper`] and serializes operations
+/// through a request/response channel. Cloning is cheap (just
+/// duplicates channel senders); use [`Self::clone`] to share a
+/// handle across tasks. The reactor task winds down when every
+/// `HyperFileHandler` clone (and any sibling `HyperFileTokio`)
+/// has been dropped.
+///
+/// # Security: hyperfile does not enforce POSIX permissions
+///
+/// `fh_chmod` / `fh_chown` / `fh_setattr` record the
+/// `mode` / `uid` / `gid` you give them, and `fh_getattr` reads
+/// them back, but the read/write/truncate paths **do not check
+/// the bits**. There is no `PermissionDenied` / `EACCES` path.
+/// Permission enforcement is the caller's responsibility (FUSE
+/// kernel checks, app-level IAM, etc.); see `docs/posix.md`'s
+/// "Permissions and ownership" section.
 #[derive(Clone)]
 pub struct HyperFileHandler<'a> {
     inner: ChannelGroup<FileContext<'a>>,

@@ -525,7 +525,7 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
-    /// Like [`new_flush`] but with `fdatasync` semantics — see
+    /// Like `new_flush` but with `fdatasync` semantics — see
     /// `Hyper::fs_fdatasync`. Reuses the `FileReqFlush` body and
     /// `FileResp::Flush` response shape; the only difference is
     /// the `op` discriminator routes to the

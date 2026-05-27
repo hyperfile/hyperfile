@@ -8,6 +8,25 @@ use super::file::HyperFile;
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 
+/// Direct, single-task entry point to a hyperfile-backed file
+/// living on S3.
+///
+/// Use this type when you call `fs_*` methods directly from one
+/// task at a time. For multi-task / multi-handle access through
+/// a reactor, see [`crate::file::fh::HyperFileHandler`].
+///
+/// # Security: hyperfile does not enforce POSIX permissions
+///
+/// `fs_chmod` / `fs_chown` / `fs_setattr` record the
+/// `mode` / `uid` / `gid` you give them, and `fs_getattr` reads
+/// them back, but the read/write/truncate paths **do not check
+/// the bits**. A handle opened against a file with `mode = 0`
+/// is fully read/writable. There is no `PermissionDenied` /
+/// `EACCES` path. The fields are opaque metadata for upper
+/// layers (FUSE adapter / IAM / your app) to enforce; see
+/// `docs/posix.md`'s "Permissions and ownership" section for
+/// the full rationale and the recommended enforcement
+/// integration patterns.
 pub struct Hyper<'a> {
     pub(crate) inner: HyperFile<'a, S3Staging, S3BlockLoader, LocalDiskNodeCache>,
 }

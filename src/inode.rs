@@ -328,7 +328,7 @@ impl Inode {
     /// Callers are responsible for keeping `i_blocks` consistent
     /// with the actual amount of storage backed by the bmap. For
     /// extending writes that allocate new blocks, call
-    /// [`update_blocks`] with the byte delta of newly-allocated
+    /// `update_blocks` with the byte delta of newly-allocated
     /// blocks. For truncate-shrink, count the entries removed from
     /// the bmap and pass a negative byte delta. The function name
     /// no longer reflects "non-sparse" since hyperfile is sparse-

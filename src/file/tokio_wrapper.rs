@@ -37,6 +37,19 @@ enum Operation {
     Seek(oneshot::Receiver<FileRespGetAttr>),
 }
 
+/// Reactor-mode handle that exposes the file through tokio's
+/// `AsyncRead` / `AsyncWrite` / `AsyncSeek` traits. Owns its
+/// internal reactor; one `HyperFileTokio` corresponds to one
+/// open file.
+///
+/// # Security: hyperfile does not enforce POSIX permissions
+///
+/// The mode / uid / gid stored on the file are opaque metadata
+/// — `read` / `write` / `seek` / `flush_ext` / `fdatasync_ext`
+/// all proceed regardless of the bits. There is no
+/// `PermissionDenied` / `EACCES` path. Enforce in your own
+/// layer (FUSE, IAM); see `docs/posix.md`'s "Permissions and
+/// ownership" section.
 pub struct HyperFileTokio<'a> {
     inner: ChannelGroup<FileContext<'a>>,
     #[allow(dead_code)]

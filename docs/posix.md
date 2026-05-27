@@ -178,13 +178,59 @@ you must inject one in the layer above.
 
 ## Permissions and ownership
 
-`fs_chmod(mode)`, `fs_chown(uid, gid)`, and `fs_setattr(stat)` mutate
-the in-memory inode. Hyperfile does **not** enforce permission bits
-on subsequent reads/writes — there is no `EACCES` path. The bits
-exist for callers that layer their own access control on top
-(e.g. a FUSE mount layer asking the kernel to enforce). Callers
-relying on permission bits should be aware that hyperfile-the-library
-treats them as opaque metadata.
+Hyperfile **does not enforce** the POSIX permission model. The
+`mode`, `uid`, and `gid` fields stored in the inode are
+**opaque metadata** from the library's perspective: hyperfile
+records what callers ask it to record, persists it across
+flushes, and surfaces it back through `fs_getattr`, but every
+read / write / truncate / chmod / chown / setattr succeeds
+**regardless of the bits stored**. There is no `EACCES` /
+`PermissionDenied` code path anywhere in the read/write
+pipeline.
+
+Concretely:
+
+- A handle opened with `FileFlags::rdonly()` will accept
+  `fs_write` calls (the access-mode bits influence cache
+  sizing and sync-flush behaviour, but they do not gate
+  mutation operations).
+- A file with `mode = 0o000` and `uid = 0` is just as
+  read/writable through the hyperfile API as `0o777`.
+- `fs_chmod` / `fs_chown` succeed even when the caller is not
+  the file's nominal owner.
+
+This is by design. Hyperfile is a Rust library, not a process
+running as a specific user; it has no notion of a "current
+user" to check the bits against, and inventing one
+(thread-local "set-uid" or per-call credentials) would only
+provide self-attestation, not security.
+
+### How to enforce, if you need to
+
+Build the access-control layer **outside** hyperfile:
+
+- **FUSE adapters**: rely on the kernel's `default_permissions`
+  mode or its FUSE-protocol equivalent. The kernel does the
+  uid/gid comparison against the inode bits hyperfile returns
+  via `fs_getattr` before any read/write reaches hyperfile.
+- **Multi-tenant services**: use IAM / app-level auth to
+  decide whether a request gets to call hyperfile at all. The
+  hyperfile mode bits then become a documentation /
+  reflection-only field, not a security boundary.
+- **Single-tenant tools**: typically don't need enforcement;
+  the process owns its files and the POSIX bits are
+  cosmetic.
+
+If you build a layer that DOES check, remember:
+
+- Hyperfile has no `O_EXEC`-equivalent gate. A reader-only
+  layer must reject writes itself; hyperfile won't.
+- `fs_chmod` on a file you "shouldn't be able to chmod" still
+  succeeds at the hyperfile level. Either don't surface the
+  call, or check before forwarding.
+- `umask`, supplementary groups, set-uid/set-gid bits,
+  capabilities, ACLs, and POSIX file capabilities are all
+  out of scope.
 
 ## Related reading
 
