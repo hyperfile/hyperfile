@@ -13,7 +13,6 @@ use crate::{BlockIndex, BlockPtr};
 use crate::config::HyperFileMetaConfig;
 use crate::inode::Inode;
 use crate::ondisk::InodeRaw;
-#[cfg(feature = "concurrent-segment-build")]
 use crate::buffer::DataBlock;
 use crate::segment_body::SegmentBody;
 
@@ -300,6 +299,35 @@ impl<T: SegmentReadWrite> Writer<T> {
         }
         self.offset += len;
         self.ctx.append(self.segid, buf)
+    }
+
+    /// Append one cached data block to the segment.
+    ///
+    /// Non-WAL: pushes a zero-copy `Bytes` view over the block's
+    /// internal `Arc<AllocDataBlock>` (no memcpy of the 4 KiB
+    /// payload). The cache continues to hold the block; the
+    /// segment body holds an extra `Arc` clone via the `Bytes`,
+    /// so the buffer lives as long as the upload needs it.
+    ///
+    /// WAL: falls back to the buffer-based `append` path because
+    /// the WAL feature requires the segment body to live as one
+    /// contiguous `Vec<u8>` for in-memory replay.
+    pub fn append_data_block(&mut self, block: &DataBlock) -> Result<()> {
+        #[cfg(not(feature = "wal"))]
+        {
+            let bytes = block.bytes_view();
+            let len = bytes.len();
+            self.body.push(bytes);
+            self.offset += len;
+            // Mirror the side-effect of the buffer-based append:
+            // notify staging context. No-op for S3, kept for
+            // trait conformance.
+            self.ctx.append(self.segid, block.as_slice())
+        }
+        #[cfg(feature = "wal")]
+        {
+            self.append(block.as_slice())
+        }
     }
 
     /// Concurrent segment-build path for the WAL feature only.

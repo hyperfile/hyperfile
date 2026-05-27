@@ -1,7 +1,9 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::alloc::GlobalAlloc;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::sync::atomic::{AtomicU64, Ordering};
+use bytes::Bytes;
 use crate::BlockIndex;
 use crate::utils;
 
@@ -62,6 +64,22 @@ impl Drop for AllocDataBlock {
     }
 }
 
+/// Owner type used by [`DataBlock::bytes_view`] to satisfy
+/// `bytes::Bytes::from_owner`'s `T: AsRef<[u8]> + Send +
+/// 'static` bound. Holds an `Arc<AllocDataBlock>` so the buffer
+/// stays alive for the lifetime of the `Bytes`. The `as_ref`
+/// returns a `&[u8]` over the same memory the
+/// `AllocDataBlock::as_slice` would.
+struct AllocBytesView {
+    inner: Arc<AllocDataBlock>,
+}
+
+impl AsRef<[u8]> for AllocBytesView {
+    fn as_ref(&self) -> &[u8] {
+        self.inner.as_slice()
+    }
+}
+
 pub struct MmapDataBlock {
     ptr: *mut u8,
     size: usize,
@@ -115,7 +133,16 @@ impl MmapDataBlock {
 }
 
 pub enum AlignedDataBlock {
-    Alloc(Pin<Box<AllocDataBlock>>),
+    /// Heap-allocated, owned by an `Arc` so the cache can share
+    /// the underlying buffer with the segment-flush path via
+    /// [`DataBlock::bytes_view`] without copying. The
+    /// `AllocDataBlock` itself uses raw-pointer interior
+    /// mutability for `as_mut_slice` (no &mut required), so
+    /// `Arc<AllocDataBlock>` works for both reads and writes.
+    /// Mutators must guarantee no concurrent `bytes_view` is
+    /// outstanding (which holds in hyperfile's flush flow: the
+    /// dirty cache is locked across the flush window).
+    Alloc(Arc<AllocDataBlock>),
     Mmap(MmapDataBlock),
 }
 
@@ -136,7 +163,7 @@ impl DataBlock {
 
     pub fn new_alloc(index: BlockIndex, size: usize) -> Self {
         Self {
-            data: AlignedDataBlock::Alloc(Box::pin(AllocDataBlock::new(size))),
+            data: AlignedDataBlock::Alloc(Arc::new(AllocDataBlock::new(size))),
             index: index,
             flags: AtomicU64::new(0),
         }
@@ -153,7 +180,7 @@ impl DataBlock {
     // duplicate a data block by copy
     pub fn dup(&self) -> Self {
         let n = Self {
-            data: AlignedDataBlock::Alloc(Box::pin(AllocDataBlock::new(self.size()))),
+            data: AlignedDataBlock::Alloc(Arc::new(AllocDataBlock::new(self.size()))),
             index: self.index(),
             flags: AtomicU64::new(self.flags.load(Ordering::Relaxed)),
         };
@@ -223,6 +250,37 @@ impl DataBlock {
         match &self.data {
             AlignedDataBlock::Alloc(alloc) => alloc.as_mut_slice(),
             AlignedDataBlock::Mmap(mmap) => mmap.as_mut_slice(),
+        }
+    }
+
+    /// Zero-copy view of the block's full buffer as a `Bytes`.
+    ///
+    /// For the `Alloc` variant, this is genuinely zero-copy:
+    /// `bytes::Bytes::from_owner` keeps the `Arc<AllocDataBlock>`
+    /// alive for the lifetime of the returned `Bytes`, and the
+    /// `Bytes` exposes the inner buffer directly. The cache can
+    /// continue to hold the `DataBlock`; the segment-flush path
+    /// holds its own `Arc` clone via the returned `Bytes`.
+    ///
+    /// For the `Mmap` variant we fall back to a copy. The mmap
+    /// region's lifetime is owned externally (by the local-disk
+    /// cache file) and we can't safely hand a `Bytes` that
+    /// out-lives the cache; copying preserves correctness with
+    /// no extra invariant.
+    ///
+    /// Safety contract for callers: while a `bytes_view`-returned
+    /// `Bytes` is outstanding for an `Alloc`-variant block, no
+    /// concurrent mutator (`copy`, `as_mut_slice`,
+    /// `cache.update_cache`, etc.) may touch the same block.
+    /// Hyperfile's flush flow guarantees this by holding the
+    /// per-file write semaphore across the whole flush window.
+    pub fn bytes_view(&self) -> Bytes {
+        match &self.data {
+            AlignedDataBlock::Alloc(alloc) => {
+                let view = AllocBytesView { inner: alloc.clone() };
+                Bytes::from_owner(view)
+            }
+            AlignedDataBlock::Mmap(mmap) => Bytes::copy_from_slice(mmap.as_slice()),
         }
     }
 

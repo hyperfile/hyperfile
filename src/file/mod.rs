@@ -373,7 +373,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         }
         #[cfg(any(not(feature = "concurrent-segment-build"), not(feature = "wal")))]
         for (_, n) in dirty_data_blocks.data().iter() {
-            let _ = segwr.append(n.as_slice())?;
+            let _ = segwr.append_data_block(n)?;
         }
         #[cfg(all(feature = "concurrent-segment-build", feature = "wal"))]
         {
@@ -733,7 +733,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             let _ = segwr.append(n.as_slice())?;
         }
         for (_, n) in dirty_data_blocks.data().iter() {
-            let _ = segwr.append(n.as_slice())?;
+            let _ = segwr.append_data_block(n)?;
         }
         let _ = _start.elapsed();
 
