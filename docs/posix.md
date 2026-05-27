@@ -83,18 +83,15 @@ with second + nanosecond resolution. They update as follows:
 | --- | --- | --- | --- |
 | `read` (cache hit, `bytes_read > 0`) | updated unless `O_NOATIME` | — | — |
 | `read` (cache miss) | updated unless `O_NOATIME` | — | — |
-| `write` / `write_zero` / `write_aligned_batch` / `write_batch` | — | updated | — |
-| `truncate` (size changed) | — | updated | — (see Divergence) |
+| `write` / `write_zero` / `write_aligned_batch` / `write_batch` | — | updated | updated |
+| `truncate` (size changed) | — | updated | updated |
+| `chmod` | — | — | updated |
+| `chown` | — | — | updated |
+| `setattr` | from caller (if differs) | from caller (if differs) | updated to NOW (caller's `st_ctime` is ignored — POSIX says `ctime` is not user-settable) |
 | `flush` / `release` | — | — | — (timestamps are persisted as-is) |
-| `setattr` / `chmod` / `chown` | — | — | not currently auto-bumped |
 
 **Divergences from POSIX**:
 
-- POSIX says `ctime` updates on every metadata-affecting operation
-  (write, truncate, chmod, chown, link/unlink). Hyperfile's
-  `update_mtime` does not also bump `ctime`. This is a tracked gap;
-  fix is straightforward but not yet applied to avoid breaking
-  consumers that compare `ctime` between snapshots.
 - `atime` updates only land on the in-memory inode. They are
   flushed lazily as part of the next data-or-metadata flush. A
   read on a read-only handle that gets dropped without flushing

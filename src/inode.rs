@@ -107,11 +107,22 @@ impl Inode {
         self.i_attr_dirty = true;
     }
 
+    /// Bump `mtime` and `ctime` to the current wall clock.
+    ///
+    /// POSIX requires `ctime` to advance on every operation that
+    /// changes the file's content (write, truncate, write_zero):
+    /// changing content also changes a piece of inode-resident
+    /// metadata (`i_size`, `i_blocks`), so the "status change"
+    /// timestamp must move. Calling `update_mtime` is the single
+    /// place hyperfile signals "data was just modified", so the
+    /// ctime bump lives here too.
     #[inline]
     pub fn update_mtime(&mut self) {
         let (sec, nsec) = Self::get_now();
         self.i_mtime = sec;
         self.i_mtime_nsec = nsec;
+        self.i_ctime = sec;
+        self.i_ctime_nsec = nsec;
         self.i_attr_dirty = true;
     }
 
@@ -291,10 +302,20 @@ impl Inode {
         self.i_atime_nsec = stat.st_atime_nsec as u32;
         self.i_mtime = stat.st_mtime as u64;
         self.i_mtime_nsec = stat.st_mtime_nsec as u32;
-        self.i_ctime = stat.st_ctime as u64;
-        self.i_ctime_nsec = stat.st_ctime_nsec as u32;
+        // POSIX: any setattr-style call (chmod / chown / setattr)
+        // is itself a metadata change, so `ctime` must advance,
+        // overriding whatever the caller put in `stat.st_ctime`.
+        // The mtime is taken from the caller because some
+        // futimens-style call sites legitimately set it
+        // explicitly; ctime is never user-settable.
+        let (now_sec, now_nsec) = Self::get_now();
+        self.i_ctime = now_sec;
+        self.i_ctime_nsec = now_nsec;
         self.i_attr_dirty = true;
-        *stat
+        let mut out = *stat;
+        out.st_ctime = now_sec as i64;
+        out.st_ctime_nsec = now_nsec as i64;
+        out
     }
 
     pub fn size(&self) -> usize {
@@ -692,11 +713,35 @@ mod tests {
         stat.st_uid = 999;
         stat.st_gid = 888;
         stat.st_size = 12345;
-        inode.update_stat(&stat);
+        let returned = inode.update_stat(&stat);
         assert_eq!(inode.i_uid, 999);
         assert_eq!(inode.i_gid, 888);
         assert_eq!(inode.size(), 12345);
         assert!(inode.is_attr_dirty());
+        // The returned stat must reflect the bumped ctime (it
+        // doesn't echo back the caller's st_ctime).
+        assert_eq!(returned.st_ctime as u64, inode.i_ctime);
+        assert_eq!(returned.st_ctime_nsec as u32, inode.i_ctime_nsec);
+    }
+
+    #[test]
+    fn update_stat_overrides_caller_ctime() {
+        let mut inode = Inode::default_file();
+        // Pretend a previous setattr left ctime at a specific value.
+        inode.i_ctime = 1_000_000_000;
+        inode.i_ctime_nsec = 0;
+
+        let mut stat = inode.to_stat(0, 0);
+        // Caller passes a stale (or even fabricated) ctime — the
+        // POSIX rule is "ctime is not user-settable; any setattr
+        // bumps it to NOW". Verify that's what update_stat does.
+        stat.st_ctime = 42;
+        stat.st_ctime_nsec = 7;
+
+        inode.update_stat(&stat);
+        assert!(inode.i_ctime > 1_000_000_000,
+            "update_stat must bump ctime to NOW (got {})", inode.i_ctime);
+        assert_ne!(inode.i_ctime as i64, 42);
     }
 
     // --- time updates ---
@@ -712,6 +757,20 @@ mod tests {
     }
 
     #[test]
+    fn update_atime_does_not_bump_ctime() {
+        // POSIX: atime updates are the only metadata change that
+        // does NOT bump ctime — otherwise every read would also
+        // bump ctime (feedback loop) and ctime would lose its
+        // "metadata change" meaning.
+        let mut inode = Inode::default_file();
+        inode.i_ctime = 1_000_000_000;
+        inode.i_ctime_nsec = 12345;
+        inode.update_atime();
+        assert_eq!(inode.i_ctime, 1_000_000_000);
+        assert_eq!(inode.i_ctime_nsec, 12345);
+    }
+
+    #[test]
     fn update_mtime_sets_timestamp() {
         let mut inode = Inode::default_file();
         inode.i_mtime = 0;
@@ -719,6 +778,21 @@ mod tests {
         inode.update_mtime();
         assert!(inode.i_mtime > 0);
         assert!(inode.is_attr_dirty());
+    }
+
+    #[test]
+    fn update_mtime_also_bumps_ctime() {
+        // POSIX: a content change (write / truncate) is a metadata
+        // change too (it changes i_size at minimum), so mtime and
+        // ctime advance together.
+        let mut inode = Inode::default_file();
+        inode.i_ctime = 0;
+        inode.i_ctime_nsec = 0;
+        inode.update_mtime();
+        // mtime and ctime should hold the same wall-clock reading.
+        assert_eq!(inode.i_mtime, inode.i_ctime);
+        assert_eq!(inode.i_mtime_nsec, inode.i_ctime_nsec);
+        assert!(inode.i_ctime > 0);
     }
 
     // --- seq / cno ---

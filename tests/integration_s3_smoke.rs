@@ -1273,3 +1273,113 @@ async fn smoke_fdatasync_persists_data() {
 
     tf.cleanup(&client).await;
 }
+
+/// POSIX: ctime advances on every metadata-affecting operation.
+/// This test exercises write / truncate / chmod / chown and
+/// asserts each strictly bumps st_ctime relative to the prior
+/// observation. As a control, a read does NOT bump ctime.
+#[tokio::test]
+#[ignore]
+async fn smoke_ctime_bumps_on_metadata_changes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Helper: sleep slightly more than the 1-second granularity of
+    // st_ctime (whole seconds field) so each successive bump is
+    // observable. Inode timestamps are sub-second internally but
+    // libc::stat exposes only sec + nsec; we don't assume nsec is
+    // monotonic-strict between same-second events, so we wait.
+    let tick = || async {
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    };
+
+    // --- create empty
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+        &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("create");
+
+    let ctime0 = hyper.fs_getattr().expect("ga0").st_ctime;
+    tick().await;
+
+    // --- write: bumps mtime + ctime
+    let _ = hyper.fs_write(0, &vec![0xAAu8; 100]).await.expect("write");
+    let st1 = hyper.fs_getattr().expect("ga1");
+    assert!(st1.st_ctime > ctime0,
+        "write must bump ctime ({} > {})", st1.st_ctime, ctime0);
+    assert_eq!(st1.st_ctime, st1.st_mtime,
+        "write should bump mtime and ctime to the same instant");
+    tick().await;
+
+    // --- read: does NOT bump ctime (control)
+    let mut buf = vec![0u8; 100];
+    let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+    let st2 = hyper.fs_getattr().expect("ga2");
+    assert_eq!(st2.st_ctime, st1.st_ctime,
+        "read must NOT bump ctime (got {} != {})", st2.st_ctime, st1.st_ctime);
+    tick().await;
+
+    // --- truncate: bumps ctime
+    hyper.fs_truncate(50).await.expect("truncate");
+    let st3 = hyper.fs_getattr().expect("ga3");
+    assert!(st3.st_ctime > st2.st_ctime,
+        "truncate must bump ctime ({} > {})", st3.st_ctime, st2.st_ctime);
+    tick().await;
+
+    // --- chmod: bumps ctime
+    let _ = hyper.fs_chmod(0o600).await.expect("chmod");
+    let st4 = hyper.fs_getattr().expect("ga4");
+    assert!(st4.st_ctime > st3.st_ctime,
+        "chmod must bump ctime ({} > {})", st4.st_ctime, st3.st_ctime);
+    // mtime must NOT have advanced (chmod doesn't change content)
+    assert_eq!(st4.st_mtime, st3.st_mtime,
+        "chmod must not bump mtime (got {} != {})", st4.st_mtime, st3.st_mtime);
+    tick().await;
+
+    // --- chown: bumps ctime
+    let _ = hyper.fs_chown(1234, 5678).await.expect("chown");
+    let st5 = hyper.fs_getattr().expect("ga5");
+    assert!(st5.st_ctime > st4.st_ctime,
+        "chown must bump ctime ({} > {})", st5.st_ctime, st4.st_ctime);
+    assert_eq!(st5.st_mtime, st4.st_mtime,
+        "chown must not bump mtime");
+
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// POSIX: ctime is not user-settable. fs_setattr ignores
+/// stat.st_ctime and bumps ctime to NOW. Verifies that even a
+/// caller who passes a stale or fabricated st_ctime does not
+/// rewind the field.
+#[tokio::test]
+#[ignore]
+async fn smoke_setattr_overrides_caller_ctime() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+        &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("create");
+
+    let ctime0 = hyper.fs_getattr().expect("ga0").st_ctime;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let mut stat = hyper.fs_getattr().expect("ga1");
+    // Caller submits a way-back-in-time ctime.
+    stat.st_ctime = 0;
+    stat.st_ctime_nsec = 0;
+    // Also flip ownership so update_stat has something to do.
+    stat.st_uid = 4242;
+    let returned = hyper.fs_setattr(&stat).await.expect("setattr");
+
+    assert!(returned.st_ctime > ctime0,
+        "setattr must bump ctime to NOW, ignoring caller's value (got {})",
+        returned.st_ctime);
+    assert_ne!(returned.st_ctime, 0);
+    assert_eq!(returned.st_uid, 4242);
+
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
