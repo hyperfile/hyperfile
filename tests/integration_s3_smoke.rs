@@ -1383,3 +1383,46 @@ async fn smoke_setattr_overrides_caller_ctime() {
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// `fs_rename` is currently a placeholder that returns
+/// `ErrorKind::Unsupported`. Verify the contract: the call
+/// fails with the right error kind AND does not perturb the
+/// source file.
+#[tokio::test]
+#[ignore]
+async fn smoke_fs_rename_returns_unsupported() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Create the source file.
+    let payload = vec![0xCDu8; 128];
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &payload).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Attempt rename. Should fail with Unsupported.
+    let dst = format!("{}-renamed-target", tf.uri());
+    let res = Hyper::fs_rename(&client, tf.uri(), &dst).await;
+    match res {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(e) => panic!("expected Unsupported, got {:?}", e),
+        Ok(()) => panic!("fs_rename returned Ok but is not yet implemented"),
+    }
+
+    // Source must still be intact and openable.
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("source still openable");
+    let stat = hyper.fs_getattr().expect("ga");
+    assert_eq!(stat.st_size as usize, payload.len());
+    let mut buf = vec![0u8; payload.len()];
+    let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(buf, payload);
+    let _ = hyper.fs_release().await;
+
+    tf.cleanup(&client).await;
+}

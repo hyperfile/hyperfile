@@ -120,6 +120,18 @@ impl<'a: 'static> HyperFileHandler<'a> {
         Hyper::fs_unlink(client, uri).await
     }
 
+    /// Rename the file at `src_uri` to `dst_uri`.
+    ///
+    /// **Not yet implemented.** Delegates to
+    /// [`Hyper::fs_rename`], which currently returns
+    /// [`std::io::ErrorKind::Unsupported`]. See that method's
+    /// docs (and `docs/posix.md`) for the design issues blocking
+    /// implementation.
+    pub async fn fh_rename(client: &Client, src_uri: &str, dst_uri: &str) -> Result<()>
+    {
+        Hyper::fs_rename(client, src_uri, dst_uri).await
+    }
+
     pub async fn fh_release(&mut self) -> Result<u64>
     {
         let (ctx, rx) = FileContext::new_release(self.inner.clone());

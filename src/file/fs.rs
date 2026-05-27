@@ -1,4 +1,4 @@
-use std::io::Result;
+use std::io::{Result, Error, ErrorKind};
 use log::debug;
 use aws_sdk_s3::Client;
 use crate::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
@@ -121,6 +121,52 @@ impl<'a: 'static> Hyper<'a> {
         let mut staging = S3Staging::from(client, staging_config, HyperFileRuntimeConfig::default()).await?;
         staging.interceptor(interceptor);
         staging.unlink().await
+    }
+
+    /// Rename the file at `src_uri` to `dst_uri`.
+    ///
+    /// **Not yet implemented.** This entry point is a placeholder
+    /// for a future POSIX-`rename(2)`-equivalent operation. It
+    /// will return [`std::io::ErrorKind::Unsupported`] until the
+    /// implementation lands.
+    ///
+    /// # Why it isn't here yet
+    ///
+    /// Hyperfile stores a file as multiple S3 objects under a URI
+    /// prefix (the inode object, segment objects, optional WAL
+    /// chunks, optional local cache files). A POSIX-faithful
+    /// rename has to:
+    ///
+    /// 1. Atomically move every object from the source prefix to
+    ///    the destination prefix. S3 has no native cross-key
+    ///    atomic-rename primitive; the natural implementation is
+    ///    a copy-then-delete loop, which is not atomic across
+    ///    multiple objects.
+    /// 2. Decide what happens if `dst_uri` already exists. POSIX
+    ///    requires atomic replacement; under copy-then-delete the
+    ///    intermediate state is observable to a concurrent reader
+    ///    on either prefix.
+    /// 3. Coordinate with any open `Hyper` / `HyperFileHandler` /
+    ///    `HyperFileTokio` instances pointing at either URI; an
+    ///    in-flight write or flush must not race the rename.
+    /// 4. Handle the WAL-enabled case (the WAL prefix lives at a
+    ///    sibling URI and would need to move in lock-step) and
+    ///    the local-cache case (cached blocks under one URI must
+    ///    be invalidated on rename).
+    ///
+    /// None of those problems are unsolvable, but each requires
+    /// design decisions (acceptable atomicity, retention of the
+    /// destination URI's prior content if the rename half-fails,
+    /// behavior under concurrent open handles) that haven't been
+    /// made yet. See `docs/posix.md`'s "Rename" section for the
+    /// status and the recommended workaround until then.
+    pub async fn fs_rename(_client: &Client, src_uri: &str, dst_uri: &str) -> Result<()>
+    {
+        debug!("fs_rename - src: {}, dst: {} (not implemented)", src_uri, dst_uri);
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "fs_rename is not yet implemented; see docs/posix.md for the rationale",
+        ))
     }
 
     pub async fn fs_release(&mut self) -> Result<u64>

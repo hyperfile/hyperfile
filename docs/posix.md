@@ -176,6 +176,65 @@ standard POSIX "sparse hole" behaviour.
 report 0. If you need a stable device id (e.g. for a FUSE adapter)
 you must inject one in the layer above.
 
+## Rename
+
+Hyperfile exposes `Hyper::fs_rename(client, src_uri, dst_uri)`
+and the `HyperFileHandler::fh_rename` mirror, but **the
+operation is not yet implemented** — the call returns
+[`ErrorKind::Unsupported`] today.
+
+The interface is reserved at the API layer so that callers can
+write code today that targets the eventual rename without
+reaching for a different namespace later. Any such code will
+fail with `Unsupported` until the implementation lands; treat
+this as a hard signal, not a transient error.
+
+### Why it isn't done yet
+
+A POSIX-faithful `rename(2)` requires:
+
+1. **Atomic move of every backing object.** A hyperfile lives
+   as several S3 objects under a shared URI prefix (the inode
+   key, segment keys, optional WAL chunks, optional local cache
+   files). S3 has no native cross-key atomic-rename primitive;
+   the natural implementation is a copy-each-object,
+   then-delete-the-originals loop, which is **not** atomic.
+2. **Atomic replacement of the destination.** POSIX requires
+   that if `dst_uri` already exists, the old destination is
+   atomically replaced. Under copy-then-delete, a concurrent
+   reader on either prefix can observe an intermediate state.
+3. **Coordination with open handles.** An in-flight
+   `fs_write` / `fs_flush` against either URI would race the
+   rename. Either rename has to fail when handles are open, or
+   the handles need to be re-pointed atomically (currently they
+   bind to a fixed URI at construction).
+4. **Feature interactions.** With WAL on, the WAL prefix lives
+   at a sibling URI and would need to move in lock-step with
+   the file. With a local cache, cached blocks under the source
+   URI need to be invalidated or rewritten under the destination
+   URI.
+
+Each item is solvable on its own; the open question is which
+non-strict atomicity guarantees are acceptable, and that's a
+design decision rather than a coding task.
+
+### Recommended workaround until rename lands
+
+The closest hand-rolled alternative is application-driven:
+
+1. Open the source URI with `Hyper::fs_open`, read the data,
+   close.
+2. Create the destination URI with
+   `Hyper::fs_open_or_create_with_default_opt`, write the data,
+   release.
+3. Call `Hyper::fs_unlink(source_uri)` once the destination is
+   safely persisted.
+
+This is **not atomic**, makes a full data copy, and breaks any
+open handles to the source. It is fine for offline /
+single-tenant relocations of small-to-medium files; do not
+build "atomic rename" semantics on top of it.
+
 ## Permissions and ownership
 
 Hyperfile **does not enforce** the POSIX permission model. The
