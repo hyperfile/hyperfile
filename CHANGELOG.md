@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.3.1] - 2026-05-30
+
+### Added
+
+- **SEEK_DATA / SEEK_HOLE**: `Hyper::fs_seek_data(off)` and
+  `Hyper::fs_seek_hole(off)` for sparse-file extent discovery.
+  `fs_seek_data` returns the smallest offset `>= off` holding data
+  (or `None`, which the caller maps to `ENXIO`, if only holes remain
+  to EOF); `fs_seek_hole` returns the smallest offset `>= off` in a
+  hole, treating EOF as an implicit hole.
+  - A block counts as data if it is an unflushed write in the dirty
+    cache or a non-zero block in the bmap; a hole is an absent or
+    zero block that is also not in the dirty cache. The seek path is
+    therefore consistent with `fs_read`, including for
+    written-but-not-yet-flushed blocks.
+  - The bmap scan uses `BMap::seek_key` to skip runs of absent keys
+    in O(log n), so SEEK_DATA over a large fully-sparse file is
+    cheap. SEEK_HOLE over a large fully-dense region remains O(n)
+    because zero blocks are present bmap keys indistinguishable from
+    data without a per-key lookup.
+  - `fs_seek_hole(off == size)` returns `size`; `off > size` returns
+    `None`.
+
 ## [0.3.0] - 2026-05-27
 
 ### Highlights
