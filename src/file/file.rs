@@ -1,5 +1,5 @@
 use std::fmt;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{HashMap, BTreeMap, BTreeSet};
 use std::sync::Arc;
 #[cfg(feature = "wal")]
 use std::sync::Weak;
@@ -393,6 +393,127 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let stat = self.inode.update_stat(stat);
         let _ = self.flush().await?;
         Ok(stat)
+    }
+
+    /// Sorted set of dirty (cache-only, not-yet-flushed) data block
+    /// indices that are `>= from`. These are unflushed writes that
+    /// live only in the data cache and are not yet in the bmap, but
+    /// the read path serves them, so for SEEK_DATA / SEEK_HOLE they
+    /// count as data. The dirty set is bounded by the flush
+    /// threshold, so collecting it is cheap.
+    fn dirty_blocks_from(&self, from: BlockIndex) -> BTreeSet<BlockIndex> {
+        self.cache.get_dirty().data().into_keys().filter(|k| *k >= from).collect()
+    }
+
+    /// `SEEK_DATA`: the smallest offset >= `off` that holds data, or
+    /// `None` (the caller maps to `ENXIO`) if there is no data
+    /// between `off` and EOF.
+    ///
+    /// Data lives in two places: unflushed writes in the dirty cache
+    /// and flushed blocks in the bmap. We take the minimum of the
+    /// first data block from each source. The bmap scan uses
+    /// `seek_key` to skip runs of absent (hole) keys in O(log n) per
+    /// jump, so a fully-sparse flushed file is cheap; only runs of
+    /// zero-block keys are stepped through one block at a time.
+    pub async fn seek_data(&self, off: usize) -> Result<Option<usize>> {
+        let size = self.inode.size();
+        if off >= size {
+            return Ok(None);
+        }
+        let bsize = self.config.meta.data_block_size;
+        let last = ((size - 1) / bsize) as BlockIndex;
+        let start = (off / bsize) as BlockIndex;
+
+        // Source 1: unflushed writes (always data).
+        let dirty_next = self.dirty_blocks_from(start).into_iter().next();
+
+        // Source 2: flushed, non-zero blocks in the bmap.
+        let mut bmap_next = None;
+        let mut blk = start;
+        loop {
+            match self.bmap.seek_key(&blk).await {
+                Ok(k) => {
+                    if k > last {
+                        break; // no present key within the file
+                    }
+                    if !BlockPtrFormat::is_zero_block(&self.bmap.lookup(&k).await?) {
+                        bmap_next = Some(k);
+                        break;
+                    }
+                    if k == last {
+                        break; // trailing zero block: no data to EOF
+                    }
+                    blk = k + 1; // skip this zero block
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        let cand = match (dirty_next, bmap_next) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        // Within the starting block, data begins at `off` itself.
+        Ok(cand.map(|b| ((b as usize) * bsize).max(off)))
+    }
+
+    /// `SEEK_HOLE`: the smallest offset >= `off` that is in a hole.
+    /// EOF is an implicit hole, so a file with no internal hole
+    /// returns its size. `off == size` returns `size`; `off > size`
+    /// returns `None` (the caller maps to `ENXIO`).
+    ///
+    /// Complexity note: runs of holes are skipped in O(log n) via
+    /// `seek_key`, but a run of data blocks must be checked one block
+    /// at a time (zero blocks are present bmap keys and are
+    /// indistinguishable from data without a per-key lookup), so
+    /// SEEK_HOLE over a large fully-dense region is O(n).
+    pub async fn seek_hole(&self, off: usize) -> Result<Option<usize>> {
+        let size = self.inode.size();
+        if off > size {
+            return Ok(None);
+        }
+        if off == size {
+            return Ok(Some(size)); // EOF is an implicit hole
+        }
+        let bsize = self.config.meta.data_block_size;
+        let last = ((size - 1) / bsize) as BlockIndex;
+        let start = (off / bsize) as BlockIndex;
+
+        let dirty = self.dirty_blocks_from(start);
+
+        let mut blk = start;
+        loop {
+            if blk > last {
+                return Ok(Some(size)); // data through EOF: hole is at EOF
+            }
+            if dirty.contains(&blk) {
+                blk += 1; // unflushed write: data
+                continue;
+            }
+            match self.bmap.seek_key(&blk).await {
+                // No present key >= blk, and blk is not dirty:
+                // blk and everything after it is a hole.
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    return Ok(Some(((blk as usize) * bsize).max(off)));
+                }
+                Err(e) => return Err(e),
+                // blk is absent in the bmap (next present key is
+                // beyond it) and not dirty: blk is a hole.
+                Ok(k) if k > blk => {
+                    return Ok(Some(((blk as usize) * bsize).max(off)));
+                }
+                // blk is present; a zero block is a hole.
+                Ok(_) => {
+                    if BlockPtrFormat::is_zero_block(&self.bmap.lookup(&blk).await?) {
+                        return Ok(Some(((blk as usize) * bsize).max(off)));
+                    }
+                    blk += 1; // data, keep scanning
+                }
+            }
+        }
     }
 
     pub async fn read(&mut self, off: usize, mut buf: &mut [u8]) -> Result<usize> {

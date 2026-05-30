@@ -1426,3 +1426,88 @@ async fn smoke_fs_rename_returns_unsupported() {
 
     tf.cleanup(&client).await;
 }
+
+/// SEEK_DATA / SEEK_HOLE over a flushed sparse file.
+/// Layout (4 KiB blocks): block 0 = data, block 1 = hole (never
+/// written), block 2 = data, blocks 3.. = absent up to size.
+#[tokio::test]
+#[ignore]
+async fn smoke_seek_data_hole_flushed() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        hyper.fs_write(0, &vec![0xAAu8; BLOCK]).await.expect("write block 0");
+        hyper.fs_write(BLOCK * 2, &vec![0xCCu8; BLOCK]).await.expect("write block 2");
+        // Extend to 4 blocks: block 3 is a trailing hole.
+        hyper.fs_truncate(BLOCK * 4).await.expect("truncate to 16 KiB");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+
+    // SEEK_DATA from 0 -> 0 (block 0 is data).
+    assert_eq!(hyper.fs_seek_data(0).await.expect("sd0"), Some(0));
+    // SEEK_HOLE from 0 -> BLOCK (block 1 is the first hole).
+    assert_eq!(hyper.fs_seek_hole(0).await.expect("sh0"), Some(BLOCK));
+    // SEEK_DATA from inside the hole (block 1) -> BLOCK*2 (block 2).
+    assert_eq!(hyper.fs_seek_data(BLOCK).await.expect("sd1"), Some(BLOCK * 2));
+    // SEEK_DATA partway into block 0 -> the offset itself.
+    assert_eq!(hyper.fs_seek_data(100).await.expect("sd100"), Some(100));
+    // SEEK_HOLE from inside block 2 (data) -> BLOCK*3 (trailing hole).
+    assert_eq!(hyper.fs_seek_hole(BLOCK * 2 + 10).await.expect("sh2"), Some(BLOCK * 3));
+    // SEEK_DATA from the trailing hole -> None (no data to EOF).
+    assert_eq!(hyper.fs_seek_data(BLOCK * 3).await.expect("sd3"), None);
+    // off == size -> SEEK_HOLE returns size, SEEK_DATA returns None.
+    assert_eq!(hyper.fs_seek_hole(BLOCK * 4).await.expect("shEOF"), Some(BLOCK * 4));
+    assert_eq!(hyper.fs_seek_data(BLOCK * 4).await.expect("sdEOF"), None);
+    // off > size -> both None.
+    assert_eq!(hyper.fs_seek_hole(BLOCK * 5).await.expect("sh>"), None);
+
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// Regression: SEEK_DATA / SEEK_HOLE must see unflushed writes that
+/// live only in the dirty cache (not yet in the bmap). Before the
+/// fix, the seek path consulted only the bmap and reported a block
+/// that fs_read would happily return as a hole.
+#[tokio::test]
+#[ignore]
+async fn smoke_seek_data_hole_unflushed() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+        &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("create");
+
+    // Write block 1 only, do NOT flush. Extend size to 3 blocks so
+    // block 0 is a leading hole and block 2 a trailing hole.
+    hyper.fs_write(BLOCK, &vec![0xBBu8; BLOCK]).await.expect("write block 1");
+    // truncate-extend updates i_size; block 1 stays dirty in cache.
+    if hyper.fs_getattr().expect("ga").st_size < (BLOCK * 3) as i64 {
+        hyper.fs_truncate(BLOCK * 3).await.expect("extend");
+    }
+
+    // SEEK_DATA from 0 must find block 1 (the unflushed write),
+    // not skip past it.
+    assert_eq!(hyper.fs_seek_data(0).await.expect("sd0"), Some(BLOCK));
+    // SEEK_HOLE from 0 -> 0 (block 0 is a hole).
+    assert_eq!(hyper.fs_seek_hole(0).await.expect("sh0"), Some(0));
+    // SEEK_HOLE from block 1 (data) -> BLOCK*2 (trailing hole).
+    assert_eq!(hyper.fs_seek_hole(BLOCK).await.expect("sh1"), Some(BLOCK * 2));
+
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}

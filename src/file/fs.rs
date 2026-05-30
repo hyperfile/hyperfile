@@ -181,6 +181,22 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.read(off, buf).await
     }
 
+    /// `lseek(SEEK_DATA)`: smallest offset >= `off` holding data, or `None`
+    /// (caller maps to `ENXIO`) if none before EOF.
+    pub async fn fs_seek_data(&self, off: usize) -> Result<Option<usize>>
+    {
+        debug!("fs_seek_data - offset: {}", off);
+        self.inner.seek_data(off).await
+    }
+
+    /// `lseek(SEEK_HOLE)`: smallest offset >= `off` in a hole (EOF counts), or
+    /// `None` (`ENXIO`) if `off` is at/past EOF.
+    pub async fn fs_seek_hole(&self, off: usize) -> Result<Option<usize>>
+    {
+        debug!("fs_seek_hole - offset: {}", off);
+        self.inner.seek_hole(off).await
+    }
+
     pub async fn fs_write(&mut self, off: usize, buf: &[u8]) -> Result<usize>
     {
         debug!("fs_write - offset: {}, size: {}", off, buf.len());
