@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.3.2] - 2026-05-31
+
+### Fixed
+
+- **Create-time timestamps**: a freshly created, never-written file
+  or directory left `atime` and `mtime` at epoch 0; only `ctime`
+  was set. POSIX requires a newly created object to report `atime`,
+  `mtime` and `ctime` all at creation time. `Inode::default_dir` /
+  `default_file` now stamp all three (from a single clock reading,
+  so they are equal) instead of only `ctime`. No change to
+  write / chmod / chown / utimens timestamp semantics.
+
 ## [0.3.1] - 2026-05-30
 
 ### Added
