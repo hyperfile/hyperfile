@@ -91,11 +91,19 @@ impl Inode {
         (now.as_secs(), now.subsec_nanos())
     }
 
+    /// Stamp `atime`, `ctime` and `mtime` to a single "now" reading.
+    /// Used at create time so a freshly created, never-written
+    /// object reports all three timestamps as its creation time
+    /// (POSIX), rather than leaving atime/mtime at epoch 0.
     #[inline]
-    fn update_ctime(&mut self) {
+    fn init_times(&mut self) {
         let (sec, nsec) = Self::get_now();
+        self.i_atime = sec;
+        self.i_atime_nsec = nsec;
         self.i_ctime = sec;
         self.i_ctime_nsec = nsec;
+        self.i_mtime = sec;
+        self.i_mtime_nsec = nsec;
         self.i_attr_dirty = true;
     }
 
@@ -134,7 +142,7 @@ impl Inode {
         inode.i_uid = 1000;
         inode.i_gid = 1000;
         inode.i_nlink = 1;
-        inode.update_ctime();
+        inode.init_times();
         inode
     }
 
@@ -146,7 +154,7 @@ impl Inode {
         inode.i_uid = 1000;
         inode.i_gid = 1000;
         inode.i_nlink = 1;
-        inode.update_ctime();
+        inode.init_times();
         inode
     }
 
@@ -542,8 +550,17 @@ mod tests {
         assert_eq!(inode.i_uid, 1000);
         assert_eq!(inode.i_gid, 1000);
         assert_eq!(inode.i_nlink, 1);
-        assert!(inode.is_attr_dirty()); // ctime was set
-        assert!(inode.i_ctime > 0);
+        assert!(inode.is_attr_dirty()); // times were set
+        // POSIX: a freshly created object has atime, ctime, mtime
+        // all stamped to creation time (not left at epoch 0), and
+        // from a single "now" reading they are equal.
+        assert!(inode.i_atime > 0, "atime must be set on create");
+        assert!(inode.i_ctime > 0, "ctime must be set on create");
+        assert!(inode.i_mtime > 0, "mtime must be set on create");
+        assert_eq!(inode.i_atime, inode.i_mtime);
+        assert_eq!(inode.i_atime, inode.i_ctime);
+        assert_eq!(inode.i_atime_nsec, inode.i_mtime_nsec);
+        assert_eq!(inode.i_atime_nsec, inode.i_ctime_nsec);
     }
 
     #[test]
@@ -552,6 +569,11 @@ mod tests {
         assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFDIR);
         assert_eq!(inode.i_uid, 1000);
         assert_eq!(inode.i_nlink, 1);
+        assert!(inode.i_atime > 0, "atime must be set on create");
+        assert!(inode.i_ctime > 0, "ctime must be set on create");
+        assert!(inode.i_mtime > 0, "mtime must be set on create");
+        assert_eq!(inode.i_atime, inode.i_mtime);
+        assert_eq!(inode.i_atime, inode.i_ctime);
     }
 
     // --- set_size (size-only contract) ---

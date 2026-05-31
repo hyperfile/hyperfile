@@ -1511,3 +1511,41 @@ async fn smoke_seek_data_hole_unflushed() {
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// A freshly created, never-written file must report atime, mtime
+/// and ctime all ≈ now (POSIX), not epoch 0. Regression for the
+/// create path leaving atime/mtime at 0.
+#[tokio::test]
+#[ignore]
+async fn smoke_create_stamps_all_times() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Create, no write, reopen read-only and stat.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+    let st = hyper.fs_getattr().expect("getattr");
+
+    assert!(st.st_atime > 0, "atime must not be epoch 0");
+    assert!(st.st_mtime > 0, "mtime must not be epoch 0");
+    assert!(st.st_ctime > 0, "ctime must not be epoch 0");
+    // within a generous window of the wall clock at creation
+    for (name, t) in [("atime", st.st_atime), ("mtime", st.st_mtime), ("ctime", st.st_ctime)] {
+        assert!((t - now).abs() < 120, "{} ({}) should be ≈ now ({})", name, t, now);
+    }
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
