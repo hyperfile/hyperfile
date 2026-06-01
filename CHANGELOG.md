@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.3.3] - 2026-06-01
+
+### Fixed
+
+- **Precise error kinds for S3 failures**: S3 operations previously
+  collapsed most failures into `ErrorKind::Other`. They now map the
+  SDK error to the semantically closest `std::io::ErrorKind` (404 →
+  `NotFound`, 403 → `PermissionDenied`, 409/412 → `AlreadyExists`,
+  429/5xx → `ResourceBusy`, 400-class → `InvalidInput`, timeouts →
+  `TimedOut` / `ConnectionReset`), so consumers (e.g. a FUSE layer)
+  can react precisely instead of treating every failure as EIO.
+  Call sites with bespoke handling (OCC conflict detection on the
+  conditional inode write/delete, 404 on inode read) keep their
+  explicit checks, so that behavior is unchanged.
+
+### Changed
+
+- During flush, a `429`/`5xx` from the inode write now maps to
+  `ResourceBusy` and is retried by the flush retry loop with
+  backoff (bounded by the existing max-retries cap) instead of
+  failing immediately.
+
 ## [0.3.2] - 2026-05-31
 
 ### Fixed
