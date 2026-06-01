@@ -13,7 +13,7 @@ use crate::ondisk::{SegmentHeader, InodeRaw};
 use crate::s3uri::S3Uri;
 use crate::meta_loader::s3::S3BlockLoader;
 use crate::inode::OnDiskState;
-use crate::s3commons::S3Ops;
+use crate::s3commons::{S3Ops, s3_error_kind};
 use btree_ondisk::node::{BtreeNode, BTREE_NODE_LEVEL_DATA};
 use super::StagingIntercept;
 
@@ -117,7 +117,7 @@ impl Staging<S3BlockLoader> for S3Staging {
                 }
                 let err_str = format!("HeadObject s3://{}/{} error: {}", self.bucket, key, sdk_err);
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             },
         }
     }

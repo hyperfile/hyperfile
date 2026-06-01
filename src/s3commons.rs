@@ -2,12 +2,43 @@ use std::io::{Error, ErrorKind, Result};
 use log::{error, warn};
 use bytes::Buf;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::types::{Object, ObjectIdentifier};
 #[cfg(feature = "wal")]
 use aws_sdk_s3::types::CommonPrefix;
 use crate::inode::OnDiskState;
+
+/// Map an S3 SDK error to the semantically closest [`std::io::ErrorKind`] so
+/// callers (and crates layered on top of hyperfile) can react precisely
+/// instead of treating every S3 failure as an opaque `Other`:
+///
+/// * missing object (404)                         -> `NotFound`
+/// * auth/authorization (403)                     -> `PermissionDenied`
+/// * conditional-write conflict (409/412)         -> `AlreadyExists`
+/// * throttling / server-side (429, 5xx)          -> `ResourceBusy` (retryable)
+/// * malformed / unsupported request (400/405/..) -> `InvalidInput`
+/// * no HTTP response (timeout/dispatch/build)    -> `TimedOut`/`ConnectionReset`/`InvalidInput`
+///
+/// Conditional-write conflicts (409/412) are normally caught at the call site
+/// for OCC; they are mapped here too for completeness.
+pub(crate) fn s3_error_kind<E>(err: &SdkError<E>) -> ErrorKind {
+    match err {
+        SdkError::TimeoutError(_) => ErrorKind::TimedOut,
+        SdkError::DispatchFailure(_) => ErrorKind::ConnectionReset,
+        SdkError::ConstructionFailure(_) => ErrorKind::InvalidInput,
+        _ => match err.raw_response().map(|r| r.status().as_u16()) {
+            Some(404) => ErrorKind::NotFound,
+            Some(403) => ErrorKind::PermissionDenied,
+            Some(408) => ErrorKind::TimedOut,
+            Some(409 | 412) => ErrorKind::AlreadyExists,
+            Some(429 | 500 | 502 | 503 | 504) => ErrorKind::ResourceBusy,
+            Some(400 | 405 | 411 | 416 | 501) => ErrorKind::InvalidInput,
+            _ => ErrorKind::Other,
+        },
+    }
+}
 
 pub(crate) struct S3Ops;
 
@@ -37,7 +68,7 @@ impl S3Ops {
                         err_str.push_str(&format!("{}", sdk_err));
                     };
                     error!("{}", err_str);
-                    return Err(Error::new(ErrorKind::Other, err_str));
+                    return Err(Error::new(s3_error_kind(&sdk_err), err_str));
                 },
             }
         }
@@ -67,7 +98,7 @@ impl S3Ops {
                         err_str.push_str(&format!("{}", sdk_err));
                     };
                     error!("{}", err_str);
-                    return Err(Error::new(ErrorKind::Other, err_str));
+                    return Err(Error::new(s3_error_kind(&sdk_err), err_str));
                 },
             }
         }
@@ -97,7 +128,7 @@ impl S3Ops {
                     return Err(Error::new(ErrorKind::NotFound, err_str));
                 }
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             }
         }
     }
@@ -139,7 +170,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 };
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             }
         }
         Ok(())
@@ -192,7 +223,7 @@ impl S3Ops {
                     return Err(Error::new(ErrorKind::NotFound, err_str));
                 }
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             },
         }
     }
@@ -244,7 +275,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 };
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             }
         }
     }
@@ -267,7 +298,7 @@ impl S3Ops {
                 } else {
                     let err_str = format!("CreateMultipartUpload s3://{}/{} error: unable to get a valid upload id", bucket, key);
                     error!("{}", err_str);
-                    return Err(Error::new(ErrorKind::Other, err_str));
+                    return Err(Error::new(ErrorKind::InvalidData, err_str));
                 }
             },
             Err(sdk_err) => {
@@ -278,7 +309,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 };
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             }
         }
 
@@ -369,7 +400,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 };
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             }
         }
     }
@@ -401,7 +432,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 };
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             },
         }
     }
@@ -495,7 +526,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 }
                 error!("{}", err_str);
-                Err(Error::new(ErrorKind::Other, err_str))
+                Err(Error::new(s3_error_kind(&sdk_err), err_str))
             }
         }
     }
@@ -532,7 +563,7 @@ impl S3Ops {
                         bucket, key,
                     );
                     error!("{}", err_str);
-                    return Err(Error::new(ErrorKind::Other, err_str));
+                    return Err(Error::new(ErrorKind::InvalidData, err_str));
                 }
             }
             Err(sdk_err) => {
@@ -543,7 +574,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 }
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
             }
         }
 
@@ -619,7 +650,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 }
                 error!("{}", err_str);
-                Err(Error::new(ErrorKind::Other, err_str))
+                Err(Error::new(s3_error_kind(&sdk_err), err_str))
             }
         }
     }
@@ -655,7 +686,7 @@ impl S3Ops {
                     err_str.push_str(&format!("{}", sdk_err));
                 }
                 error!("{}", err_str);
-                Err(Error::new(ErrorKind::Other, err_str))
+                Err(Error::new(s3_error_kind(&sdk_err), err_str))
             }
         }
     }
