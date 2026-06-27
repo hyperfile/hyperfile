@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.4.0] - 2026-06-27
+
+### Breaking changes
+
+- **`InodeRaw` on-disk layout reordered.** The tail fields are now laid out
+  contiguously as `i_size, i_blocks, i_last_seq, i_last_cno, i_bmap` (previously
+  `i_blocks`/`i_size` sat near the top). `size_of::<InodeRaw>()` is unchanged
+  (160 bytes), but the **serialized byte layout differs**, so inodes written by
+  `0.3.x` are not readable by `0.4.0` and vice versa. There is no in-place
+  migration; this is intended for fresh trees. Consumers that embed `InodeRaw`
+  (e.g. `hyperdir` dirents/scatter) must be rebuilt against the same version so
+  both sides agree on the layout.
+
+### Added
+
+- **Inline-small-file format primitives on `InodeRaw`** (foundation for storing
+  a tiny file entirely within its inode, with no separate `FILE/<uuid>` object):
+  - `InodeRaw::FLAG_INLINE` — `i_flags` bit marking a fully-inlined file.
+  - `InodeRaw::inline_offset()` / `inline_cap()` — the inline payload region (the
+    contiguous `i_blocks..i_bmap` tail), `80` bytes on the current layout,
+    computed via `offset_of!` so they track the layout automatically.
+  - `is_inline()`, `inline_data()`, `set_inline(&[u8])`, `clear_inline()` — read
+    and populate the inline bytes, with `i_size` as the length.
+  - No behavior change on its own: this commit ships the format + accessors only;
+    the create/read/write/spill paths that use it land in a later change.
+
 ## [0.3.3] - 2026-06-01
 
 ### Fixed
