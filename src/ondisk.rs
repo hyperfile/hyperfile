@@ -9,8 +9,6 @@ pub type BMapRawType = [u8; DEFAULT_INODE_BMAP_SIZE];
 #[repr(C, align(8))]
 pub struct InodeRaw {
     pub i_ino: u64,
-    pub i_blocks: u64,
-    pub i_size: u64,
     pub i_atime: u64,
     pub i_ctime: u64,
     pub i_mtime: u64,
@@ -23,6 +21,13 @@ pub struct InodeRaw {
     pub i_mode: u32,
     pub i_flags: u32,
     pub i_nlink: u64,
+    // The tail below (i_blocks, i_last_seq, i_last_cno, i_bmap) is laid out
+    // contiguously so that, for an inlined small file (no data blocks / no
+    // segments), the 80 bytes from `i_blocks` through `i_bmap` can be reused as
+    // an inline-data payload (with `i_size` above as its length). See the INLINE
+    // inode flag.
+    pub i_size: u64,
+    pub i_blocks: u64,
     pub i_last_seq: u64,
     pub i_last_cno: u64,
     pub i_bmap: BMapRawType,
@@ -32,8 +37,6 @@ impl Default for InodeRaw {
     fn default() -> Self {
         Self {
             i_ino: 0,
-            i_blocks: 0,
-            i_size: 0,
             i_atime: 0,
             i_ctime: 0,
             i_mtime: 0,
@@ -46,6 +49,8 @@ impl Default for InodeRaw {
             i_mode: 0,
             i_flags: 0,
             i_nlink: 0,
+            i_size: 0,
+            i_blocks: 0,
             i_last_seq: 0,
             i_last_cno: 0,
             i_bmap: [0u8; DEFAULT_INODE_BMAP_SIZE],
@@ -77,6 +82,49 @@ impl InodeRaw {
         raw.as_mut_u8_slice().copy_from_slice(buf);
         raw
     }
+
+    /// `i_flags` bit marking a fully-inlined small file: its bytes live in this
+    /// inode's tail region (`i_blocks`..`i_bmap`) instead of in data blocks, and
+    /// the file has NO separate `FILE/<uuid>` object. `i_size` is the length.
+    pub const FLAG_INLINE: u32 = 0x1;
+
+    /// Byte offset of the inline-data region within the raw inode (the start of
+    /// the contiguous tail `i_blocks, i_last_seq, i_last_cno, i_bmap`).
+    pub const fn inline_offset() -> usize { std::mem::offset_of!(InodeRaw, i_blocks) }
+
+    /// Maximum inline payload (the size of that tail region).
+    pub const fn inline_cap() -> usize { std::mem::size_of::<InodeRaw>() - Self::inline_offset() }
+
+    /// True if this inode is a fully-inlined small file.
+    pub fn is_inline(&self) -> bool { self.i_flags & Self::FLAG_INLINE != 0 }
+
+    /// The inlined bytes (`i_size` of them); empty if not inlined.
+    pub fn inline_data(&self) -> &[u8] {
+        if !self.is_inline() { return &[]; }
+        let off = Self::inline_offset();
+        let n = (self.i_size as usize).min(Self::inline_cap());
+        &self.as_u8_slice()[off..off + n]
+    }
+
+    /// Mark this inode inline and store `data` (must fit `inline_cap()`):
+    /// sets the flag, `i_size = data.len()`, zeroes the tail region, copies in.
+    /// Caller is responsible for there being no `FILE/<uuid>` object/segments.
+    pub fn set_inline(&mut self, data: &[u8]) {
+        debug_assert!(data.len() <= Self::inline_cap());
+        let off = Self::inline_offset();
+        self.i_flags |= Self::FLAG_INLINE;
+        self.i_blocks = 0;
+        self.i_last_seq = 0;
+        self.i_last_cno = 0;
+        self.i_size = data.len() as u64;
+        let buf = self.as_mut_u8_slice();
+        buf[off..].fill(0);
+        buf[off..off + data.len()].copy_from_slice(data);
+    }
+
+    /// Clear the inline flag (e.g. when spilling to a real segmented file). Does
+    /// not touch the tail region; the caller rebuilds the bmap.
+    pub fn clear_inline(&mut self) { self.i_flags &= !Self::FLAG_INLINE; }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -247,6 +295,36 @@ mod tests {
     fn inode_raw_size() {
         // InodeRaw is #[repr(C, align(8))] — verify it stays stable
         assert_eq!(std::mem::size_of::<InodeRaw>(), 160);
+    }
+
+    #[test]
+    fn inode_inline_region() {
+        // The inline tail (i_blocks..i_bmap) starts at 80 and spans 80 bytes.
+        assert_eq!(InodeRaw::inline_offset(), 80);
+        assert_eq!(InodeRaw::inline_cap(), 80);
+
+        let mut raw = InodeRaw::default();
+        assert!(!raw.is_inline());
+        assert_eq!(raw.inline_data(), b"");
+
+        let data = b"hello inline world";
+        raw.set_inline(data);
+        assert!(raw.is_inline());
+        assert_eq!(raw.i_size as usize, data.len());
+        assert_eq!(raw.inline_data(), data);
+
+        // round-trips through the raw byte serialization
+        let raw2 = InodeRaw::from_u8_slice(raw.as_u8_slice());
+        assert!(raw2.is_inline());
+        assert_eq!(raw2.inline_data(), data);
+
+        // full-capacity payload
+        let full = vec![0xABu8; InodeRaw::inline_cap()];
+        raw.set_inline(&full);
+        assert_eq!(raw.inline_data(), &full[..]);
+
+        raw.clear_inline();
+        assert!(!raw.is_inline());
     }
 
     #[test]
