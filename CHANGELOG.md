@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.4.1] - 2026-06-28
+
+### Added
+
+- **Device-node `rdev` accessors on `InodeRaw`** (so a filesystem can persist
+  character/block device nodes):
+  - `InodeRaw::set_rdev(rdev)` / `InodeRaw::rdev()` — store/read a device node's
+    `rdev`. A device node has no data segments, so the value is kept in the
+    otherwise-unused `i_last_cno` slot; call `set_rdev` after `set_inline(&[])`
+    (which zeroes the tail).
+  - `Inode::to_stat` now reports `st_rdev` from the inode for char/block
+    (`S_IFCHR`/`S_IFBLK`) modes, ignoring the passed `rdev`; non-device inodes
+    are unchanged (they use the passed value).
+
+### Compatibility
+
+- Additive and on-disk compatible with `0.4.0`: no layout change
+  (`size_of::<InodeRaw>()` is still 160) and the new behavior only affects
+  device-mode inodes, which `0.4.0` never produced.
+
 ## [0.4.0] - 2026-06-27
 
 ### Breaking changes

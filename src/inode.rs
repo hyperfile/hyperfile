@@ -271,7 +271,10 @@ impl Inode {
         stat.st_mode = self.i_mode;
         stat.st_uid = self.i_uid;
         stat.st_gid = self.i_gid;
-        stat.st_rdev = rdev;
+        // A char/block device node persists its rdev in i_last_cno (it has no
+        // segments, so that slot is free); other inodes use the passed value.
+        let fmt = self.i_mode & libc::S_IFMT;
+        stat.st_rdev = if fmt == libc::S_IFCHR || fmt == libc::S_IFBLK { self.i_last_cno } else { rdev };
         stat.st_size = self.i_size as i64;
         #[cfg(target_arch = "x86_64")]
         {

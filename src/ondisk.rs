@@ -125,6 +125,16 @@ impl InodeRaw {
     /// Clear the inline flag (e.g. when spilling to a real segmented file). Does
     /// not touch the tail region; the caller rebuilds the bmap.
     pub fn clear_inline(&mut self) { self.i_flags &= !Self::FLAG_INLINE; }
+
+    /// Persist a char/block device node's `rdev`. A device node has no data
+    /// segments, so the otherwise-unused `i_last_cno` slot holds it. Call after
+    /// `set_inline(&[])` (which zeroes the tail). `Inode::to_stat` reads it back
+    /// for device-mode inodes.
+    pub fn set_rdev(&mut self, rdev: u64) { self.i_last_cno = rdev; }
+
+    /// The persisted device `rdev` (see [`set_rdev`]); meaningful only for a
+    /// char/block device-mode inode.
+    pub fn rdev(&self) -> u64 { self.i_last_cno }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -325,6 +335,37 @@ mod tests {
 
         raw.clear_inline();
         assert!(!raw.is_inline());
+    }
+
+    #[test]
+    fn device_node_rdev_round_trips() {
+        // A char device node: dataless (inline, i_size 0) with rdev persisted in
+        // the otherwise-unused i_last_cno slot.
+        let rdev: u64 = 0x1234_5678;
+        let mut raw = InodeRaw::default();
+        raw.i_mode = libc::S_IFCHR | 0o644;
+        raw.set_inline(&[]);   // zeroes the tail, sets FLAG_INLINE, i_size = 0
+        raw.set_rdev(rdev);
+        assert_eq!(raw.rdev(), rdev);
+        assert_eq!(raw.i_size, 0, "device node has no size");
+        assert_eq!(raw.inline_data(), b"", "no inline data");
+
+        // survives raw byte serialization (scatter/bmap)
+        let raw2 = InodeRaw::from_u8_slice(raw.as_u8_slice());
+        assert_eq!(raw2.rdev(), rdev);
+
+        // to_stat surfaces rdev for a device-mode inode (ignoring the param),
+        // and 0 for a non-device inode.
+        let st = crate::inode::Inode::from_raw(&raw2, None).to_stat(0, 0);
+        assert_eq!(st.st_rdev, rdev, "char device rdev in stat");
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFCHR);
+        assert_eq!(st.st_size, 0);
+
+        let mut reg = InodeRaw::default();
+        reg.i_mode = libc::S_IFREG | 0o644;
+        reg.set_rdev(rdev); // i_last_cno set, but mode isn't a device
+        let streg = crate::inode::Inode::from_raw(&reg, None).to_stat(0, 7);
+        assert_eq!(streg.st_rdev, 7, "non-device inode uses the passed rdev, not i_last_cno");
     }
 
     #[test]
