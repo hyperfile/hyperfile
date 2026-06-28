@@ -395,6 +395,17 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(stat)
     }
 
+    /// Opt this file in/out of cross-mount open-but-unlinked
+    /// ([`InodeRaw::FLAG_KEEP_OPEN`]) and persist the change.
+    pub async fn set_keep_open(&mut self, on: bool) -> Result<()> {
+        self.inode.set_keep_open(on);
+        let _ = self.flush().await?;
+        Ok(())
+    }
+
+    /// True if this file opts in to cross-mount open-but-unlinked.
+    pub fn is_keep_open(&self) -> bool { self.inode.is_keep_open() }
+
     /// Sorted set of dirty (cache-only, not-yet-flushed) data block
     /// indices that are `>= from`. These are unflushed writes that
     /// live only in the data cache and are not yet in the bmap, but

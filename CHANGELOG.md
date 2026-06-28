@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.4.2] - 2026-06-28
+
+### Added
+
+- **Keep-open inode flag** (foundation for opt-in cross-mount open-but-unlinked
+  in a filesystem layer):
+  - `InodeRaw::FLAG_KEEP_OPEN` (`i_flags` bit) + `is_keep_open()` /
+    `set_keep_open(bool)`.
+  - `Inode::is_keep_open()` / `set_keep_open(bool)` (marks the inode attr-dirty).
+  - `HyperFile::set_keep_open(bool)` / `is_keep_open()` and
+    `Hyper::fs_set_keep_open(bool)` / `fs_is_keep_open()` — set (and persist on
+    flush) or read the flag on an open file.
+
+### Compatibility
+
+- Additive and on-disk compatible with `0.4.0`/`0.4.1`: no layout change
+  (`size_of::<InodeRaw>()` is still 160) and the flag is a previously-unused
+  `i_flags` bit.
+
 ## [0.4.1] - 2026-06-28
 
 ### Added

@@ -88,6 +88,23 @@ impl InodeRaw {
     /// the file has NO separate `FILE/<uuid>` object. `i_size` is the length.
     pub const FLAG_INLINE: u32 = 0x1;
 
+    /// `i_flags` bit marking a file that opts in to **cross-mount
+    /// open-but-unlinked** semantics: while any mount holds it open (tracked by
+    /// an S3 open-lease), an unlink from another mount silly-renames it instead
+    /// of tombstoning, so its storage survives until the last close. Set via the
+    /// `user.hyperfs.keep_open` xattr; off by default (no extra coordination
+    /// cost). Independent of `FLAG_INLINE`.
+    pub const FLAG_KEEP_OPEN: u32 = 0x2;
+
+    /// True if this inode opts in to cross-mount open-but-unlinked (see
+    /// [`FLAG_KEEP_OPEN`]).
+    pub fn is_keep_open(&self) -> bool { self.i_flags & Self::FLAG_KEEP_OPEN != 0 }
+
+    /// Set/clear [`FLAG_KEEP_OPEN`].
+    pub fn set_keep_open(&mut self, on: bool) {
+        if on { self.i_flags |= Self::FLAG_KEEP_OPEN; } else { self.i_flags &= !Self::FLAG_KEEP_OPEN; }
+    }
+
     /// Byte offset of the inline-data region within the raw inode (the start of
     /// the contiguous tail `i_blocks, i_last_seq, i_last_cno, i_bmap`).
     pub const fn inline_offset() -> usize { std::mem::offset_of!(InodeRaw, i_blocks) }
@@ -366,6 +383,26 @@ mod tests {
         reg.set_rdev(rdev); // i_last_cno set, but mode isn't a device
         let streg = crate::inode::Inode::from_raw(&reg, None).to_stat(0, 7);
         assert_eq!(streg.st_rdev, 7, "non-device inode uses the passed rdev, not i_last_cno");
+    }
+
+    #[test]
+    fn keep_open_flag_round_trips() {
+        let mut raw = InodeRaw::default();
+        assert!(!raw.is_keep_open());
+        raw.set_keep_open(true);
+        assert!(raw.is_keep_open());
+        assert_eq!(raw.i_flags & InodeRaw::FLAG_KEEP_OPEN, InodeRaw::FLAG_KEEP_OPEN);
+        // independent of the inline flag
+        raw.set_inline(b"x");
+        assert!(raw.is_keep_open() && raw.is_inline());
+        // survives serialization + Inode round-trip
+        let raw2 = InodeRaw::from_u8_slice(raw.as_u8_slice());
+        assert!(raw2.is_keep_open());
+        assert!(crate::inode::Inode::from_raw(&raw2, None).is_keep_open());
+        // clears cleanly without touching the inline flag
+        let mut r3 = raw2;
+        r3.set_keep_open(false);
+        assert!(!r3.is_keep_open() && r3.is_inline());
     }
 
     #[test]

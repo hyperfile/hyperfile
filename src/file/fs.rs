@@ -287,6 +287,16 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.update_stat(stat).await
     }
 
+    /// Opt this open file in/out of cross-mount open-but-unlinked
+    /// ([`InodeRaw::FLAG_KEEP_OPEN`]); persists on flush.
+    pub async fn fs_set_keep_open(&mut self, on: bool) -> Result<()> {
+        debug!("fs_set_keep_open - {}", on);
+        self.inner.set_keep_open(on).await
+    }
+
+    /// True if this open file opts in to cross-mount open-but-unlinked.
+    pub fn fs_is_keep_open(&self) -> bool { self.inner.is_keep_open() }
+
     pub async fn fs_setattr_fast(client: &Client, uri: &str, stat: &libc::stat) -> Result<libc::stat>
     {
         debug!("fs_setattr_fast - uri: {}", uri);

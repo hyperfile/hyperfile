@@ -329,6 +329,18 @@ impl Inode {
         out
     }
 
+    /// True if this inode opts in to cross-mount open-but-unlinked
+    /// ([`InodeRaw::FLAG_KEEP_OPEN`]).
+    pub fn is_keep_open(&self) -> bool { self.i_flags & crate::ondisk::InodeRaw::FLAG_KEEP_OPEN != 0 }
+
+    /// Set/clear the keep-open flag (marks the inode attr-dirty so the change is
+    /// persisted on the next flush).
+    pub fn set_keep_open(&mut self, on: bool) {
+        if on { self.i_flags |= crate::ondisk::InodeRaw::FLAG_KEEP_OPEN; }
+        else { self.i_flags &= !crate::ondisk::InodeRaw::FLAG_KEEP_OPEN; }
+        self.i_attr_dirty = true;
+    }
+
     pub fn size(&self) -> usize {
         self.i_size as usize
     }
