@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.4.3] - 2026-08-14
+
+### Fixed
+
+- **Data integrity: a shrinking truncate left stale clean-cached
+  blocks above the new EOF.** On an open handle, `write` at offset
+  X → `flush` → truncate below X → truncate back above X → read at
+  X returned the pre-truncate bytes instead of zeros. POSIX requires
+  the grown-back region to read as a hole.
+
+  The truncate path discarded only *dirty* cache entries above the
+  boundary. The `flush` is what makes a block clean, and a clean
+  block lives solely in the clean cache tier, which was never swept
+  — while the read path consults that tier first. Only the handle
+  that performed the truncate was affected; the persisted state was
+  always correct, so a close/reopen hid the problem.
+
+  Both cache tiers are now swept. The local-disk cache additionally
+  punches the backing hole for each dropped block, because its
+  blocks are unzeroed mmap views and a later partial write to the
+  same index could otherwise resurface pre-truncate bytes from the
+  cache file.
+
+  Found by `fsx` (xfstests) against a FUSE filesystem layered on
+  hyperfile. `write_zero` and the (absent) hole-punch paths were
+  audited and have no equivalent gap.
+
+### Changed
+
+- The internal `Cache` trait method `truncate_dirty_blocks_above` is
+  renamed `truncate_blocks_above`, reflecting that it now drops clean
+  entries too. The trait is `pub(crate)`, so this is not a public API
+  change. Its return value still counts dirty removals only, for
+  `i_blocks` accounting.
+
 ## [0.4.2] - 2026-06-28
 
 ### Added
