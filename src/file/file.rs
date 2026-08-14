@@ -727,7 +727,45 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(ops)
     }
 
+    /// The error a write-side operation must return when the handle
+    /// was not opened for writing.
+    ///
+    /// POSIX `write()` lists `[EBADF] The fildes argument is not a
+    /// valid file descriptor open for writing` as a mandatory
+    /// ("shall fail") error. `ftruncate()` permits `[EBADF] or
+    /// [EINVAL]` for the same condition; we use `EBADF` there too so
+    /// every write-side operation reports one errno.
+    ///
+    /// Built with `from_raw_os_error` because `std::io::ErrorKind`
+    /// has no `EBADF` variant: `PermissionDenied` would surface as
+    /// `EACCES` (which POSIX reserves for permission-bit failures at
+    /// `open` time) and `InvalidInput` would surface as `EINVAL`
+    /// (conformant for `ftruncate` but not for `write`). Callers get
+    /// the exact errno via `Error::raw_os_error()`; note that
+    /// `Error::kind()` is `Uncategorized` for EBADF and so cannot be
+    /// matched on. This is also why the error carries no custom
+    /// message: an `io::Error` can have a raw errno or a custom
+    /// message, not both.
+    #[inline]
+    pub(crate) fn ebadf_not_writable() -> Error {
+        Error::from_raw_os_error(libc::EBADF)
+    }
+
     pub async fn write(&mut self, off: usize, buf: &[u8]) -> Result<usize> {
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_not_writable());
+        }
+        self.write_inner(off, buf).await
+    }
+
+    /// `write` without the write-access check.
+    ///
+    /// Used by WAL crash recovery, which replays previously
+    /// acknowledged writes while opening the file and must therefore
+    /// run regardless of the access mode the caller opened with —
+    /// otherwise a read-only open of a file that crashed mid-flush
+    /// could not be served correctly.
+    async fn write_inner(&mut self, off: usize, buf: &[u8]) -> Result<usize> {
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let fn_start = Instant::now();
         let len = buf.len();
@@ -804,6 +842,15 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn write_zero(&mut self, off: usize, len: usize) -> Result<usize> {
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_not_writable());
+        }
+        self.write_zero_inner(off, len).await
+    }
+
+    /// `write_zero` without the write-access check. See
+    /// [`Self::write_inner`] for why WAL recovery needs this.
+    async fn write_zero_inner(&mut self, off: usize, len: usize) -> Result<usize> {
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let fn_start = Instant::now();
         // O_APPEND: same rule as write(). See the corresponding
@@ -896,6 +943,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     // write in batch style, all blocks in input vec should be full block
     pub(crate) async fn write_aligned_batch(&mut self, mut blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize> {
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_not_writable());
+        }
         if blocks.len() == 0 {
             return Ok(0);
         }
@@ -1207,12 +1257,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         // retrieve all chunks and write to file
         // TODO: currently one by one, make it concurrent in future
+        //
+        // The `_inner` variants bypass the write-access check on
+        // purpose: recovery replays writes that were already
+        // acknowledged before the crash, and it runs during `open`
+        // regardless of the access mode the caller asked for. A
+        // read-only open of a file that crashed mid-flush still has
+        // to replay the WAL to present correct contents.
         for (_, chunk) in map.iter() {
             if chunk.is_zero {
-                let _ = self.write_zero(chunk.offset, chunk.len).await?;
+                let _ = self.write_zero_inner(chunk.offset, chunk.len).await?;
             } else {
                 let data = wal.as_ref().unwrap().read(chunk.seq, chunk.segid, chunk.offset, chunk.len).await?;
-                let _ = self.write(chunk.offset, &data).await?;
+                let _ = self.write_inner(chunk.offset, &data).await?;
             }
         }
 
@@ -1291,6 +1348,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     // truncate
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
+        // POSIX ftruncate: "If fildes is not a valid file descriptor
+        // open for writing, the ftruncate() function shall fail."
+        // The spec allows EBADF or EINVAL here; we use EBADF to match
+        // the write path.
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_not_writable());
+        }
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         let size = self.inode.size();
         debug!("truncate - file size from {} to {}", size, new_size);
@@ -1626,6 +1690,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static, C: NodeCache<BlockPtr> + Clone> HyperFile<'a, T, L, C> {
     // write in batch style, input blocks could be incomplete
     pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_not_writable());
+        }
         if blocks.len() == 0 {
             return Ok(0);
         }

@@ -20,9 +20,37 @@ open` / `Hyper::create`.
 
 | Flag | Behaviour | Notes |
 | --- | --- | --- |
-| `O_RDONLY` | Read-only handle. | `fs_write` / `fs_truncate` return `EBADF`-shaped errors from the underlying staging layer. |
-| `O_WRONLY` | Write-only handle. | Reads return zeros / errors from the underlying layer; not commonly tested. |
+| `O_RDONLY` | Read-only handle. | Every write-side operation (`fs_write`, `fs_write_zero`, `fs_write_batch`, `fs_write_aligned_batch`, `fs_truncate`, and the `fh_*` / tokio equivalents) fails with `EBADF`. See [Write access enforcement](#write-access-enforcement). |
+| `O_WRONLY` | Write-only handle. | Writes behave as with `O_RDWR`. Reads are **not** rejected — hyperfile does not yet return `EBADF` for a read on a write-only handle, which POSIX requires. |
 | `O_RDWR` | Read+write handle. | Recommended for any mutation flow. |
+
+### Write access enforcement
+
+A handle opened without write access rejects every write-side
+operation with `EBADF`:
+
+* POSIX `write()` lists `[EBADF] The fildes argument is not a valid
+  file descriptor open for writing` as a mandatory ("shall fail")
+  error.
+* POSIX `ftruncate()` permits either `[EBADF]` or `[EINVAL]` for the
+  same condition. Hyperfile uses `EBADF` so that all write-side
+  operations report one errno.
+
+The check keys off the access mode only: `O_APPEND` does not grant
+write access on its own, matching Linux, where
+`open(O_RDONLY | O_APPEND)` followed by a `write` fails with `EBADF`.
+
+Because `std::io::ErrorKind` has no `EBADF` variant, the error is
+constructed with [`std::io::Error::from_raw_os_error`]. Callers should
+test it with `err.raw_os_error() == Some(libc::EBADF)`; `err.kind()`
+is the unmatchable `Uncategorized` and must not be used. (The
+alternatives were rejected as inaccurate: `PermissionDenied` maps to
+`EACCES`, which POSIX reserves for permission-bit failures at `open`
+time, and `InvalidInput` maps to `EINVAL`, conformant for `ftruncate`
+but not for `write`.)
+
+Not covered yet: a read on an `O_WRONLY` handle should also fail with
+`EBADF` and currently does not.
 
 ### File-creation flags
 

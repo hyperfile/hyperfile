@@ -84,6 +84,20 @@ impl HyperFileFlags {
         self.read && !self.write && !self.append
     }
 
+    /// True if the handle was opened for writing, i.e. `O_WRONLY`
+    /// or `O_RDWR`.
+    ///
+    /// This is the predicate POSIX uses to decide whether `write`,
+    /// `ftruncate` and friends may proceed ("a file descriptor open
+    /// for writing"); when it is false those operations must fail
+    /// with `EBADF`. Note it keys purely off the access mode:
+    /// `O_APPEND` does not grant write access on its own, matching
+    /// Linux, where `open(O_RDONLY | O_APPEND)` followed by a
+    /// `write` fails with `EBADF`.
+    pub fn is_writable(&self) -> bool {
+        self.write
+    }
+
     pub fn is_direct(&self) -> bool {
         self.direct
     }
@@ -501,5 +515,28 @@ mod tests {
     #[test]
     fn hyper_flags_all_includes_excl() {
         assert!(HyperFileFlags::all().is_excl());
+    }
+
+    // --- is_writable (POSIX "open for writing") ---
+
+    #[test]
+    fn hyper_flags_rdonly_is_not_writable() {
+        assert!(!HyperFileFlags::from_flags(FileFlags::rdonly()).is_writable());
+    }
+
+    #[test]
+    fn hyper_flags_wronly_and_rdwr_are_writable() {
+        assert!(HyperFileFlags::from_flags(FileFlags::wronly()).is_writable());
+        assert!(HyperFileFlags::from_flags(FileFlags::rdwr()).is_writable());
+    }
+
+    /// O_APPEND does not grant write access on its own: on Linux,
+    /// `open(O_RDONLY | O_APPEND)` followed by a write fails with
+    /// EBADF. Note this differs from `is_rdonly()`, which treats
+    /// O_APPEND as clearing read-only-ness.
+    #[test]
+    fn hyper_flags_rdonly_append_is_not_writable() {
+        let f = HyperFileFlags::from_flags(FileFlags(libc::O_RDONLY | libc::O_APPEND));
+        assert!(!f.is_writable(), "O_RDONLY|O_APPEND must not be writable");
     }
 }

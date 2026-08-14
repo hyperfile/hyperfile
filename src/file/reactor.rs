@@ -570,6 +570,22 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     // for spawn_read/spawn_write resp is based on mpsc channel
     // so use try_send() instead send()
     pub async fn spawn_write(&mut self, mut req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
+        // POSIX: a write on a handle not opened for writing fails
+        // with EBADF. Checked before the flush-state test and the
+        // range lock, so the request never acquires state that the
+        // caller's error path would have to unwind. The handler
+        // forwards this error to the caller because its kind is not
+        // ResourceBusy.
+        //
+        // The handler's error path does call `range_lock.try_unlock`
+        // for a range this request never locked. That is a no-op on
+        // the underlying RangeSet unless a concurrent write holds an
+        // overlapping range — impossible here, because every write on
+        // a read-only handle is rejected at this same guard, so no
+        // sibling writer can exist.
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_not_writable());
+        }
         let buf = req.buf;
         let len = buf.len();
         // O_APPEND: override caller-supplied offset to current
@@ -630,6 +646,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn spawn_write_zero(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
+        // See spawn_write() for why this is checked here.
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_not_writable());
+        }
         let len = req.len;
         // O_APPEND: same rule as spawn_write(). See the
         // corresponding comment there.

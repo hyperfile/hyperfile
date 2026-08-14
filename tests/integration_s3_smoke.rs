@@ -1617,3 +1617,61 @@ async fn smoke_truncate_shrink_drops_clean_cached_blocks() {
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// POSIX: every write-side operation on a handle that was not
+/// opened for writing must fail with EBADF.
+///
+/// - `write()`: "[EBADF] The fildes argument is not a valid file
+///   descriptor open for writing" is a mandatory ("shall fail")
+///   error.
+/// - `ftruncate()`: the spec allows "[EBADF] or [EINVAL]" for the
+///   same condition; hyperfile uses EBADF so all write-side
+///   operations report one errno.
+///
+/// The errno is checked via `raw_os_error()`, because
+/// `std::io::ErrorKind` has no EBADF variant (its `kind()` is the
+/// unmatchable `Uncategorized`).
+#[tokio::test]
+#[ignore]
+async fn smoke_rdonly_handle_write_ops_are_ebadf() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Create with real content so the reads below have something to
+    // return, then reopen read-only.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &vec![0xAAu8; 4096]).await.expect("write rdwr");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen rdonly");
+
+    let expect_ebadf = |res: std::io::Result<usize>, what: &str| {
+        let err = res.err().unwrap_or_else(|| panic!("{what} on a read-only handle must fail"));
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF),
+            "{what} must fail with EBADF, got {:?} (kind {:?})", err.raw_os_error(), err.kind());
+    };
+
+    expect_ebadf(hyper.fs_write(0, &[0xBBu8; 8]).await, "fs_write");
+    expect_ebadf(hyper.fs_write_zero(0, 8).await, "fs_write_zero");
+    // fs_truncate returns Result<()>; adapt to the same helper.
+    expect_ebadf(hyper.fs_truncate(0).await.map(|_| 0usize), "fs_truncate");
+    expect_ebadf(hyper.fs_truncate(1 << 20).await.map(|_| 0usize), "fs_truncate (extend)");
+
+    // Reads still work, and the file was not modified by any of the
+    // rejected operations.
+    let mut buf = vec![0u8; 4096];
+    let n = hyper.fs_read(0, &mut buf).await.expect("read on rdonly handle");
+    assert_eq!(n, 4096);
+    assert!(buf.iter().all(|&b| b == 0xAA), "content must be untouched");
+    let st = hyper.fs_getattr().expect("getattr");
+    assert_eq!(st.st_size, 4096, "size must be untouched by the rejected truncates");
+
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}

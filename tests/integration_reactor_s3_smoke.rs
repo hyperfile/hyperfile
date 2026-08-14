@@ -419,3 +419,58 @@ async fn reactor_fh_fdatasync_round_trip() {
     let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
+
+/// Handler: write-side operations on a read-only handle must fail
+/// with EBADF (POSIX). The reactor has its own write paths
+/// (`spawn_write` / `spawn_write_zero`) separate from the direct
+/// API, so it needs its own coverage; `fh_truncate` and the batch
+/// writes share `HyperFile::*` with the direct API.
+#[tokio::test]
+#[ignore]
+async fn reactor_handler_rdonly_write_ops_are_ebadf() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let reactor = make_reactor();
+    let payload = vec![0xAAu8; 4096];
+
+    // Create with content, then reopen read-only.
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("fh create");
+        let _ = fh.fh_write(0, &payload).await.expect("fh_write");
+        let _ = fh.fh_release().await.expect("fh_release");
+    }
+
+    let mut fh = HyperFileHandler::fh_open(
+        &reactor, &client, tf.uri(), FileFlags::rdonly(),
+    )
+    .await
+    .expect("fh open rdonly");
+
+    let expect_ebadf = |res: std::io::Result<usize>, what: &str| {
+        let err = res.err().unwrap_or_else(|| panic!("{what} on a read-only handle must fail"));
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF),
+            "{what} must fail with EBADF, got {:?} (kind {:?})", err.raw_os_error(), err.kind());
+    };
+
+    expect_ebadf(fh.fh_write(0, &[0xBBu8; 8]).await, "fh_write");
+    expect_ebadf(fh.fh_write_zero(0, 8).await, "fh_write_zero");
+    expect_ebadf(fh.fh_truncate(0).await.map(|_| 0usize), "fh_truncate");
+
+    // The handler is still alive and reads are unaffected.
+    let mut buf = vec![0u8; payload.len()];
+    let n = fh.fh_read(0, &mut buf).await.expect("fh_read after rejected writes");
+    assert_eq!(n, payload.len());
+    assert_eq!(buf, payload, "content must be untouched");
+    let stat = fh.fh_getattr().await.expect("fh_getattr");
+    assert_eq!(stat.st_size as usize, payload.len(),
+        "size must be untouched by the rejected truncate");
+
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}
