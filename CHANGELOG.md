@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.4.4] - 2026-08-14
+
+### Added
+
+- **POSIX access mode enforcement.** An operation the handle's access
+  mode does not permit now fails with `EBADF`:
+
+  | Handle | Rejected |
+  | --- | --- |
+  | `O_RDONLY` | `write`, `write_zero`, `write_batch`, `write_aligned_batch`, `truncate` |
+  | `O_WRONLY` | `read` |
+
+  Previously a write on a read-only handle landed in the data cache
+  and a subsequent flush could persist it, and a read on a
+  write-only handle succeeded. POSIX lists `[EBADF] ... not a valid
+  file descriptor open for writing` (`write()`) and `... open for
+  reading` (`read()`) as mandatory errors. `ftruncate()` permits
+  `[EBADF]` or `[EINVAL]`; `EBADF` is used so every access-mode
+  violation reports one errno. Enforced on the direct `fs_*` API, the
+  reactor `fh_*` API, and the tokio wrapper.
+
+  `lseek` is not gated — POSIX requires no particular access mode for
+  it, and neither do the `SEEK_DATA` / `SEEK_HOLE` extensions behind
+  `fs_seek_data` / `fs_seek_hole`.
+
+  Two categories of internal I/O deliberately bypass the checks and
+  keep working: write-side operations that read (a sub-block write's
+  read-modify-write, and a shrink to a non-block-aligned size reading
+  the tail block), and WAL crash recovery, which replays previously
+  acknowledged writes during `open` — including a read-only open, so
+  a file that crashed mid-flush still presents correct contents.
+
+- `HyperFileFlags::is_readable()` and `is_writable()`, keyed off the
+  access mode alone. `O_APPEND` does not grant write access on its
+  own, matching Linux, where `open(O_RDONLY | O_APPEND)` followed by
+  a `write` fails with `EBADF`.
+
+### Changed
+
+- **Compatibility note.** Callers that relied on the previous
+  permissive behaviour — writing through an `O_RDONLY` handle, or
+  reading through an `O_WRONLY` handle — now receive an error where
+  the call used to succeed. Open with `O_RDWR` if a handle needs both
+  directions.
+- Because `std::io::ErrorKind` has no `EBADF` variant, the error is
+  built with `std::io::Error::from_raw_os_error`. Test it with
+  `err.raw_os_error() == Some(libc::EBADF)`; `err.kind()` is the
+  unmatchable `Uncategorized`. See `docs/posix.md` for why
+  `PermissionDenied` (EACCES) and `InvalidInput` (EINVAL) were
+  rejected as inaccurate.
+
+### Documentation
+
+- `docs/posix.md`: the open-mode table previously claimed `fs_write` /
+  `fs_truncate` "return `EBADF`-shaped errors from the underlying
+  staging layer", which was never true — S3 has no notion of the
+  handle's access mode. Replaced with an "Access mode enforcement"
+  section carrying a rejected/allowed matrix and the errno rationale.
+
 ## [0.4.3] - 2026-08-14
 
 ### Fixed
