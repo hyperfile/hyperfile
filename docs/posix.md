@@ -278,6 +278,51 @@ open handles to the source. It is fine for offline /
 single-tenant relocations of small-to-medium files; do not
 build "atomic rename" semantics on top of it.
 
+## Unlink
+
+`Hyper::fs_unlink(uri)` removes a file. It reports
+`ErrorKind::NotFound` (`ENOENT`) when the file does not exist, as
+POSIX `unlink(2)` requires. The check is a `HEAD` on the inode
+object in `S3Staging::from`, which runs before any deletion: the
+inode is the authoritative "this file exists" marker, and
+`load_inode` returning `NotFound` is likewise what makes
+`fs_open` report `ENOENT`.
+
+On success, every object under the URI prefix is removed — the
+inode, all segments, and any WAL chunks that live under the same
+prefix.
+
+### Known gap: orphaned objects are not reclaimable
+
+`unlink` deletes the inode **first** and the remaining objects
+**second**. If it fails in between — throttling, a partially
+failed `DeleteObjects`, a crash — the prefix is left holding
+segments with no inode. That state cannot be cleaned up through
+the library:
+
+* `fs_unlink` returns `ENOENT` from the inode `HEAD` before the
+  list-and-delete sweep runs, so re-running it does not help.
+* `hyperfile-cleaner`'s `prune` cannot help either: it reads
+  `inode.get_last_seq()` to locate the latest checkpoint before
+  walking the metadata tree.
+
+Both reclaim paths key off the inode, so the leftover objects are
+unreachable and keep costing storage. Recovering them currently
+requires deleting the prefix out of band, e.g.:
+
+```bash
+aws s3 rm --recursive s3://<your-bucket>/<prefix-of-the-file>
+```
+
+Be sure the prefix really is an abandoned hyperfile before doing
+this; the command is not selective.
+
+This is a design gap rather than a simple bug — it needs a
+decision on which component owns orphan collection (a `force`
+mode on `unlink` that skips the inode check, a prefix-level sweep
+in the cleaner that does not need an inode, or an external
+reaper) — so it is recorded here rather than worked around.
+
 ## Permissions and ownership
 
 Hyperfile **does not enforce** the POSIX permission model. The

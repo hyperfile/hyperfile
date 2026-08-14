@@ -1834,3 +1834,65 @@ async fn smoke_wronly_handle_seek_data_hole_still_work() {
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// Helper: list every object key under a `s3://bucket/prefix` URI.
+async fn list_keys_under(client: &aws_sdk_s3::Client, uri: &str) -> Vec<String> {
+    let rest = uri.strip_prefix("s3://").expect("s3:// uri");
+    let (bucket, prefix) = rest.split_once('/').expect("uri has a key part");
+    let mut out = Vec::new();
+    let mut stream = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(format!("{}/", prefix))
+        .into_paginator()
+        .send();
+    while let Some(page) = stream.next().await {
+        let page = page.expect("list_objects_v2");
+        for obj in page.contents.unwrap_or_default() {
+            if let Some(k) = obj.key {
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
+/// POSIX unlink(2): removing a file that does not exist fails with
+/// ENOENT. Backed by a conditional `DeleteObject` (`If-Match: *`) on
+/// the inode, which is the authoritative "file exists" marker.
+#[tokio::test]
+#[ignore]
+async fn smoke_unlink_nonexistent_is_enoent() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // Never created.
+    let err = Hyper::fs_unlink(&client, tf.uri()).await
+        .expect_err("unlink of a non-existent file must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound,
+        "expected ENOENT, got {:?}", err.kind());
+
+    // Create, then unlink succeeds.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &vec![0xAAu8; 4096]).await.expect("write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+    Hyper::fs_unlink(&client, tf.uri()).await.expect("unlink of an existing file");
+    assert!(list_keys_under(&client, tf.uri()).await.is_empty(),
+        "unlink must remove every object under the prefix");
+
+    // Unlinking again reports ENOENT.
+    let err = Hyper::fs_unlink(&client, tf.uri()).await
+        .expect_err("second unlink must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound,
+        "expected ENOENT on the second unlink, got {:?}", err.kind());
+}
+
+// Not covered here: once the inode is gone, the remaining objects
+// under the prefix cannot be reclaimed through `fs_unlink` (or the
+// cleaner). See "Known gap: orphaned objects are not reclaimable" in
+// docs/posix.md.

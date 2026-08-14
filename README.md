@@ -65,6 +65,9 @@ Hyperfile guaranteed to be consistent after each successful flush.
 * Extra storage space for metadata blocks.
 * On-disk data layout changed (in contrast of a real S3 object).
 * Segments prune/compaction effort.
+* An `unlink` interrupted after the inode is deleted leaves objects
+  that neither `unlink` nor the cleaner can reclaim — see
+  [Known gap: orphaned objects](docs/posix.md#known-gap-orphaned-objects-are-not-reclaimable).
 
 ## Examples
 
