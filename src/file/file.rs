@@ -1362,12 +1362,18 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
         }
 
-        // Drop any dirty cache entry whose key is about to be
-        // truncated from the bmap. Without this the next flush
-        // would iterate the dirty list, find a block with no
-        // matching bmap entry, and fail
-        // `bmap.assign(blk_idx, ptr) -> NotFound`.
-        let _ = self.cache.truncate_dirty_blocks_above(tgt_blk_idx);
+        // Drop every cached entry whose key is about to be
+        // truncated from the bmap, dirty and clean alike.
+        //
+        // Dirty: without this the next flush would iterate the
+        // dirty list, find a block with no matching bmap entry, and
+        // fail `bmap.assign(blk_idx, ptr) -> NotFound`.
+        //
+        // Clean: a block that was already flushed is no longer part
+        // of the file. Leaving it cached lets the read path serve
+        // the pre-truncate bytes if the file is later grown back
+        // past the old EOF, where POSIX requires a hole (zeros).
+        let _ = self.cache.truncate_blocks_above(tgt_blk_idx);
 
         // if need to shrink bmap
         if let Err(e) = self.bmap.truncate(&tgt_blk_idx).await {

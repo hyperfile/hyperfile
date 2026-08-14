@@ -23,15 +23,27 @@ pub(crate) trait Cache {
     fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex>;
     fn update_cache(&mut self, blk_idx: &BlockIndex, off: usize, buf: &[u8]);
     fn truncate_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> bool;
-    /// Remove every dirty entry whose key is `>= boundary` from
-    /// the cache. Used by `truncate_shrink` to keep the dirty
-    /// list consistent with the bmap, which is about to drop the
-    /// same range of keys: a stale dirty entry would otherwise
-    /// surface during the next flush as
-    /// `bmap.assign(blk_idx, ...) -> NotFound("assign key not
-    /// found in direct node")`. Returns the number of entries
-    /// removed.
-    fn truncate_dirty_blocks_above(&mut self, boundary: BlockIndex) -> usize;
+    /// Remove every cached entry whose key is `>= boundary`,
+    /// **dirty and clean alike**. Used by `truncate_shrink`, where
+    /// the bmap is about to drop the same range of keys.
+    ///
+    /// Both tiers must be dropped, for two different reasons:
+    ///
+    /// * dirty entries: a stale dirty entry would surface during
+    ///   the next flush as `bmap.assign(blk_idx, ...) ->
+    ///   NotFound("assign key not found in direct node")`.
+    /// * clean entries: their contents are no longer part of the
+    ///   file. If the file is later grown past the old EOF again,
+    ///   the read path consults the clean tier first and would
+    ///   serve the pre-truncate bytes where POSIX requires a hole
+    ///   (zeros).
+    ///
+    /// Returns the number of *dirty* entries removed. Clean
+    /// evictions are deliberately not counted: callers use the
+    /// return value for `i_blocks` accounting, and clean blocks
+    /// were already accounted for by the bmap walk that computes
+    /// `removed_blocks`.
+    fn truncate_blocks_above(&mut self, boundary: BlockIndex) -> usize;
     fn dirty_count(&self) -> usize;
     fn get_dirty(&self) -> DirtyDataBlocks<'_>;
     fn clear_dirty(&mut self);

@@ -371,18 +371,36 @@ impl Cache for LocalDiskCache {
         self.data_blocks_dirty.len()
     }
 
-    fn truncate_dirty_blocks_above(&mut self, boundary: BlockIndex) -> usize {
+    fn truncate_blocks_above(&mut self, boundary: BlockIndex) -> usize {
         let mut removed = 0;
-        let to_remove: Vec<BlockIndex> = self.data_blocks_dirty
+        let dirty: Vec<BlockIndex> = self.data_blocks_dirty
             .range(boundary..)
             .map(|(k, _)| *k)
             .collect();
-        for k in to_remove {
+        for k in dirty {
             if self.data_blocks_dirty.remove(&k).is_some() {
                 removed += 1;
             }
-            if self.data_cache_blocks > 0 {
+            // Punch the backing hole: `new_dirty_block` hands out a
+            // raw mmap view without zeroing it, so a later write to
+            // this index would otherwise observe the pre-truncate
+            // bytes still sitting in the cache file.
+            self.discard(k);
+        }
+        // Sweep the clean tier independently. A block that was
+        // already flushed lives only here; enumerating candidates
+        // from the dirty map alone would leave it behind for the
+        // read path to serve after the file grows back past the old
+        // EOF. LruCache has no range API, so collect first.
+        if self.data_cache_blocks > 0 {
+            let clean: Vec<BlockIndex> = self.data_blocks_cache
+                .iter()
+                .map(|(k, _)| *k)
+                .filter(|k| *k >= boundary)
+                .collect();
+            for k in clean {
                 let _ = self.data_blocks_cache.pop(&k);
+                self.discard(k);
             }
         }
         removed

@@ -1549,3 +1549,71 @@ async fn smoke_create_stamps_all_times() {
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// Regression: a shrinking truncate must drop CLEAN cached blocks
+/// above the new EOF, not just dirty ones. Sequence (all on one
+/// open handle):
+///
+///   write at X -> flush (makes the block clean) -> shrink below X
+///   -> grow back above X -> read at X
+///
+/// The read must see zeros: the bytes at X were discarded by the
+/// shrink, and after the grow the region is a hole. Before the fix
+/// the clean cached block survived the truncate and the read path
+/// (which consults the clean tier first) served the pre-truncate
+/// bytes. The persisted state was already correct, so this only
+/// reproduced on the handle that did the truncate.
+///
+/// Found by fsx (xfstests) against a FUSE fs layered on hyperfile.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_shrink_drops_clean_cached_blocks() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const OFF: usize = 200_000;
+    const LEN: usize = 4096;
+
+    let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+        &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("create");
+
+    // 1. write data at OFF
+    let n = hyper.fs_write(OFF, &vec![0xABu8; LEN]).await.expect("write");
+    assert_eq!(n, LEN);
+
+    // 2. flush — REQUIRED: this moves the block from the dirty list
+    //    into the clean cache tier. Without it the block stays dirty
+    //    and the old dirty-only cleanup already handled it.
+    let _ = hyper.fs_flush().await.expect("flush");
+
+    // 3. shrink below OFF, discarding those bytes
+    hyper.fs_truncate(1000).await.expect("shrink to 1000");
+    let st = hyper.fs_getattr().expect("ga after shrink");
+    assert_eq!(st.st_size as usize, 1000);
+
+    // 4. grow back past OFF; the region is now a hole
+    hyper.fs_truncate(300_000).await.expect("grow to 300000");
+    let st = hyper.fs_getattr().expect("ga after grow");
+    assert_eq!(st.st_size as usize, 300_000);
+
+    // 5. read at OFF must be all zeros, on THIS handle
+    let mut buf = vec![0xFFu8; LEN]; // sentinel: must be overwritten with 0
+    let n = hyper.fs_read(OFF, &mut buf).await.expect("read");
+    assert_eq!(n, LEN);
+    let nonzero = buf.iter().filter(|&&b| b != 0).count();
+    assert_eq!(nonzero, 0,
+        "grown-back region must read as a hole, found {} stale bytes (first={:#x})",
+        nonzero, buf.iter().find(|&&b| b != 0).copied().unwrap_or(0));
+
+    // The persisted state must agree after a reopen too.
+    let _ = hyper.fs_release().await.expect("release");
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+    let mut buf = vec![0xFFu8; LEN];
+    let _ = hyper.fs_read(OFF, &mut buf).await.expect("read after reopen");
+    assert!(buf.iter().all(|&b| b == 0), "reopened handle must also read zeros");
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}

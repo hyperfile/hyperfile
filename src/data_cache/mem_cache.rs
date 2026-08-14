@@ -190,24 +190,35 @@ impl Cache for MemCache {
         self.data_blocks_dirty.len()
     }
 
-    fn truncate_dirty_blocks_above(&mut self, boundary: BlockIndex) -> usize {
+    fn truncate_blocks_above(&mut self, boundary: BlockIndex) -> usize {
         let mut removed = 0;
         // BTreeMap doesn't expose a `split_off_keys_above` so we
         // collect the keys first and then drop. The dirty map is
         // bounded by the dirty-blocks threshold (defaults from
         // lib.rs are in the tens to thousands range), so the
-        // intermediate Vec is fine. Also drop any clean cached
-        // entry at the same key — its content is a snapshot of a
-        // block that's about to be dropped.
-        let to_remove: Vec<BlockIndex> = self.data_blocks_dirty
+        // intermediate Vec is fine.
+        let dirty: Vec<BlockIndex> = self.data_blocks_dirty
             .range(boundary..)
             .map(|(k, _)| *k)
             .collect();
-        for k in to_remove {
+        for k in dirty {
             if self.data_blocks_dirty.remove(&k).is_some() {
                 removed += 1;
             }
-            if self.data_cache_blocks > 0 {
+        }
+        // The clean tier must be swept independently: a block that
+        // was already flushed lives only here, and enumerating
+        // candidates from the dirty map alone would leave it
+        // behind for the read path to serve after the file grows
+        // back past the old EOF. LruCache has no range API, so
+        // collect the keys to evict first.
+        if self.data_cache_blocks > 0 {
+            let clean: Vec<BlockIndex> = self.data_blocks_cache
+                .iter()
+                .map(|(k, _)| *k)
+                .filter(|k| *k >= boundary)
+                .collect();
+            for k in clean {
                 let _ = self.data_blocks_cache.pop(&k);
             }
         }
@@ -389,6 +400,69 @@ mod tests {
     fn truncate_missing_block() {
         let mut cache = new_cache();
         assert!(!cache.truncate_data_block(&99, 0));
+    }
+
+    // --- truncate_blocks_above ---
+
+    #[test]
+    fn truncate_blocks_above_drops_dirty() {
+        let mut cache = new_cache();
+        cache.insert(1, DataBlock::new(1, 4096));
+        cache.insert(9, DataBlock::new(9, 4096));
+
+        let removed = cache.truncate_blocks_above(5);
+        assert_eq!(removed, 1, "only the dirty block at 9 is above the boundary");
+        assert!(cache.get(&9).is_none(), "dirty block above boundary must be dropped");
+        assert!(cache.get(&1).is_some(), "block below boundary must be kept");
+    }
+
+    /// Regression: a block that was already flushed lives only in
+    /// the clean tier. Enumerating truncate candidates from the
+    /// dirty map alone left it behind, and the read path (which
+    /// consults the clean tier) then served pre-truncate bytes
+    /// after the file grew back past the old EOF.
+    #[test]
+    fn truncate_blocks_above_drops_clean() {
+        let mut cache = new_cache();
+        let mut blk = DataBlock::new(9, 4096);
+        blk.set_should_cache();
+        blk.copy(0, &[0xAB; 4096]);
+        cache.insert(9, blk);
+        // Simulate a flush: dirty -> clean tier.
+        cache.clear_dirty();
+        assert_eq!(cache.dirty_count(), 0);
+        assert!(cache.get(&9).is_some(), "block should now be cached clean");
+
+        let removed = cache.truncate_blocks_above(5);
+        assert_eq!(removed, 0, "clean evictions must not be counted as dirty removals");
+        assert!(cache.get(&9).is_none(),
+            "clean cached block above the boundary must be dropped");
+    }
+
+    #[test]
+    fn truncate_blocks_above_keeps_clean_below_boundary() {
+        let mut cache = new_cache();
+        let mut blk = DataBlock::new(2, 4096);
+        blk.set_should_cache();
+        blk.copy(0, &[0xCD; 4096]);
+        cache.insert(2, blk);
+        cache.clear_dirty();
+
+        let _ = cache.truncate_blocks_above(5);
+        let got = cache.get(&2).expect("clean block below boundary must survive");
+        assert_eq!(got.as_slice()[0], 0xCD);
+    }
+
+    #[test]
+    fn truncate_blocks_above_at_boundary_is_inclusive() {
+        let mut cache = new_cache();
+        let mut blk = DataBlock::new(5, 4096);
+        blk.set_should_cache();
+        cache.insert(5, blk);
+        cache.clear_dirty();
+
+        let _ = cache.truncate_blocks_above(5);
+        assert!(cache.get(&5).is_none(), "boundary key itself must be dropped");
     }
 
     // --- contains / get_mut ---
