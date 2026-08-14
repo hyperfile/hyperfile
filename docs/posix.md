@@ -20,25 +20,43 @@ open` / `Hyper::create`.
 
 | Flag | Behaviour | Notes |
 | --- | --- | --- |
-| `O_RDONLY` | Read-only handle. | Every write-side operation (`fs_write`, `fs_write_zero`, `fs_write_batch`, `fs_write_aligned_batch`, `fs_truncate`, and the `fh_*` / tokio equivalents) fails with `EBADF`. See [Write access enforcement](#write-access-enforcement). |
-| `O_WRONLY` | Write-only handle. | Writes behave as with `O_RDWR`. Reads are **not** rejected — hyperfile does not yet return `EBADF` for a read on a write-only handle, which POSIX requires. |
+| `O_RDONLY` | Read-only handle. | Every write-side operation (`fs_write`, `fs_write_zero`, `fs_write_batch`, `fs_write_aligned_batch`, `fs_truncate`, and the `fh_*` / tokio equivalents) fails with `EBADF`. See [Access mode enforcement](#access-mode-enforcement). |
+| `O_WRONLY` | Write-only handle. | `fs_read` (and `fh_read` / the tokio `AsyncRead` impl) fails with `EBADF`. Writes, truncate and `lseek` all work — including operations that read internally, such as a sub-block write or a shrink to a non-aligned size. |
 | `O_RDWR` | Read+write handle. | Recommended for any mutation flow. |
 
-### Write access enforcement
+### Access mode enforcement
 
-A handle opened without write access rejects every write-side
-operation with `EBADF`:
+An operation that the handle's access mode does not permit fails with
+`EBADF`:
+
+| Handle | Rejected | Allowed |
+| --- | --- | --- |
+| `O_RDONLY` | `write`, `write_zero`, `write_batch`, `write_aligned_batch`, `truncate` | `read`, `lseek`, `fsync`/`fdatasync`, `getattr`, `chmod`/`chown` |
+| `O_WRONLY` | `read` | everything else, including writes and `lseek` |
 
 * POSIX `write()` lists `[EBADF] The fildes argument is not a valid
   file descriptor open for writing` as a mandatory ("shall fail")
-  error.
+  error, and `read()` the same for `... open for reading`.
 * POSIX `ftruncate()` permits either `[EBADF]` or `[EINVAL]` for the
-  same condition. Hyperfile uses `EBADF` so that all write-side
-  operations report one errno.
+  same condition. Hyperfile uses `EBADF` so that every access-mode
+  violation reports one errno.
 
 The check keys off the access mode only: `O_APPEND` does not grant
 write access on its own, matching Linux, where
 `open(O_RDONLY | O_APPEND)` followed by a `write` fails with `EBADF`.
+
+`lseek` — including the `SEEK_DATA` / `SEEK_HOLE` extensions behind
+`fs_seek_data` / `fs_seek_hole` — requires no particular access mode
+and is never gated.
+
+Operations that read internally are not affected by the read gate. A
+sub-block write performs a read-modify-write of the target block, and
+a shrink to a non-block-aligned size reads the tail block to zero its
+remainder; both use lower-level block loaders rather than the public
+read path, so they still work on an `O_WRONLY` handle. Symmetrically,
+WAL crash recovery replays previously acknowledged writes while
+opening the file and bypasses the write gate, so a read-only open of a
+file that crashed mid-flush still presents correct contents.
 
 Because `std::io::ErrorKind` has no `EBADF` variant, the error is
 constructed with [`std::io::Error::from_raw_os_error`]. Callers should
@@ -47,10 +65,7 @@ is the unmatchable `Uncategorized` and must not be used. (The
 alternatives were rejected as inaccurate: `PermissionDenied` maps to
 `EACCES`, which POSIX reserves for permission-bit failures at `open`
 time, and `InvalidInput` maps to `EINVAL`, conformant for `ftruncate`
-but not for `write`.)
-
-Not covered yet: a read on an `O_WRONLY` handle should also fail with
-`EBADF` and currently does not.
+but not for `read` / `write`.)
 
 ### File-creation flags
 

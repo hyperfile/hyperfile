@@ -98,6 +98,22 @@ impl HyperFileFlags {
         self.write
     }
 
+    /// True if the handle was opened for reading, i.e. `O_RDONLY` or
+    /// `O_RDWR`.
+    ///
+    /// The mirror of [`Self::is_writable`]: POSIX `read()` lists
+    /// `[EBADF] The fildes argument is not a valid file descriptor
+    /// open for reading` as a mandatory error, so a read on an
+    /// `O_WRONLY` handle must fail with `EBADF`.
+    ///
+    /// Note this governs `read` only. `lseek` — including the
+    /// `SEEK_DATA` / `SEEK_HOLE` extensions behind `seek_data` /
+    /// `seek_hole` — requires no particular access mode and is not
+    /// gated on this.
+    pub fn is_readable(&self) -> bool {
+        self.read
+    }
+
     pub fn is_direct(&self) -> bool {
         self.direct
     }
@@ -538,5 +554,33 @@ mod tests {
     fn hyper_flags_rdonly_append_is_not_writable() {
         let f = HyperFileFlags::from_flags(FileFlags(libc::O_RDONLY | libc::O_APPEND));
         assert!(!f.is_writable(), "O_RDONLY|O_APPEND must not be writable");
+    }
+
+    // --- is_readable (POSIX "open for reading") ---
+
+    #[test]
+    fn hyper_flags_wronly_is_not_readable() {
+        assert!(!HyperFileFlags::from_flags(FileFlags::wronly()).is_readable());
+    }
+
+    #[test]
+    fn hyper_flags_rdonly_and_rdwr_are_readable() {
+        assert!(HyperFileFlags::from_flags(FileFlags::rdonly()).is_readable());
+        assert!(HyperFileFlags::from_flags(FileFlags::rdwr()).is_readable());
+    }
+
+    /// The two predicates are independent and each access mode grants
+    /// exactly the expected pair.
+    #[test]
+    fn hyper_flags_access_mode_matrix() {
+        for (flags, name, readable, writable) in [
+            (FileFlags::rdonly(), "O_RDONLY", true, false),
+            (FileFlags::wronly(), "O_WRONLY", false, true),
+            (FileFlags::rdwr(), "O_RDWR", true, true),
+        ] {
+            let f = HyperFileFlags::from_flags(flags);
+            assert_eq!(f.is_readable(), readable, "{name} is_readable");
+            assert_eq!(f.is_writable(), writable, "{name} is_writable");
+        }
     }
 }

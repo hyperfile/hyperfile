@@ -474,3 +474,70 @@ async fn reactor_handler_rdonly_write_ops_are_ebadf() {
     let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
+
+/// Handler: a read on a write-only handle must fail with EBADF, while
+/// writes — including a partial write that needs an internal
+/// read-modify-write — keep working. The reactor has its own read
+/// path (`spawn_read`), so it needs its own coverage.
+#[tokio::test]
+#[ignore]
+async fn reactor_handler_wronly_read_is_ebadf() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let reactor = make_reactor();
+    const BLOCK: usize = 4096;
+
+    // Seed and flush so the read-modify-write below must fetch from
+    // staging rather than this handle's cache.
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        )
+        .await
+        .expect("fh create");
+        let _ = fh.fh_write(0, &vec![0xAAu8; BLOCK]).await.expect("seed write");
+        let _ = fh.fh_release().await.expect("fh_release");
+    }
+
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::wronly(),
+        )
+        .await
+        .expect("fh open wronly");
+
+        let mut buf = vec![0u8; BLOCK];
+        let err = fh.fh_read(0, &mut buf).await
+            .expect_err("fh_read on a write-only handle must fail");
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF),
+            "fh_read must fail with EBADF, got {:?} (kind {:?})",
+            err.raw_os_error(), err.kind());
+
+        // Handler is still alive; writes still work, including a
+        // partial write needing a read-modify-write.
+        let n = fh.fh_write(50, &vec![0xBBu8; 100]).await
+            .expect("partial fh_write on wronly handle must work");
+        assert_eq!(n, 100);
+        let _ = fh.fh_release().await.expect("fh_release");
+    }
+
+    // Verify content from a read-only handle.
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
+        )
+        .await
+        .expect("fh open rdonly");
+        let mut buf = vec![0u8; BLOCK];
+        let n = fh.fh_read(0, &mut buf).await.expect("fh_read");
+        assert_eq!(n, BLOCK);
+        assert!(buf[..50].iter().all(|&b| b == 0xAA));
+        assert!(buf[50..150].iter().all(|&b| b == 0xBB));
+        assert!(buf[150..].iter().all(|&b| b == 0xAA));
+        let _ = fh.fh_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}

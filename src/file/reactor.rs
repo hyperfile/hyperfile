@@ -96,6 +96,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     // for spawn_read/spawn_write resp is based on mpsc channel
     // so use try_send() instead send()
     pub async fn spawn_read(&mut self, req: FileReqRead<'a>, resp: FileResp) -> Result<usize> {
+        // POSIX: a read on a handle not opened for reading fails with
+        // EBADF. Checked before the flush-state test and the range
+        // lock, for the same reason as spawn_write(): the request must
+        // not acquire state that an error path would have to unwind.
+        if !self.flags.is_readable() {
+            return Err(Self::ebadf_bad_access_mode());
+        }
         let off = req.offset;
         let len = req.buf.len();
 
@@ -584,7 +591,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // a read-only handle is rejected at this same guard, so no
         // sibling writer can exist.
         if !self.flags.is_writable() {
-            return Err(Self::ebadf_not_writable());
+            return Err(Self::ebadf_bad_access_mode());
         }
         let buf = req.buf;
         let len = buf.len();
@@ -648,7 +655,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub async fn spawn_write_zero(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
         // See spawn_write() for why this is checked here.
         if !self.flags.is_writable() {
-            return Err(Self::ebadf_not_writable());
+            return Err(Self::ebadf_bad_access_mode());
         }
         let len = req.len;
         // O_APPEND: same rule as spawn_write(). See the

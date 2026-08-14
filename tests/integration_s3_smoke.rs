@@ -1672,6 +1672,165 @@ async fn smoke_rdonly_handle_write_ops_are_ebadf() {
     let st = hyper.fs_getattr().expect("getattr");
     assert_eq!(st.st_size, 4096, "size must be untouched by the rejected truncates");
 
+    // Operations POSIX does not gate on write access must still work
+    // on a read-only handle: fsync/fdatasync (no-ops here, nothing is
+    // dirty) and chmod/chown (governed by ownership, not by the
+    // handle's access mode).
+    let _ = hyper.fs_flush().await.expect("fs_flush on rdonly handle");
+    let _ = hyper.fs_fdatasync().await.expect("fs_fdatasync on rdonly handle");
+    let st = hyper.fs_chmod(0o600).await.expect("fs_chmod on rdonly handle");
+    assert_eq!(st.st_mode & 0o777, 0o600, "chmod must take effect");
+
+    let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// POSIX: a read on a handle not opened for reading must fail with
+/// EBADF ("[EBADF] The fildes argument is not a valid file descriptor
+/// open for reading", a mandatory error).
+#[tokio::test]
+#[ignore]
+async fn smoke_wronly_handle_read_is_ebadf() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &vec![0xAAu8; 4096]).await.expect("seed write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::wronly())
+        .await.expect("reopen wronly");
+
+    let mut buf = vec![0u8; 4096];
+    let err = hyper.fs_read(0, &mut buf).await
+        .expect_err("read on a write-only handle must fail");
+    assert_eq!(err.raw_os_error(), Some(libc::EBADF),
+        "read must fail with EBADF, got {:?} (kind {:?})", err.raw_os_error(), err.kind());
+
+    // Writes still work on the same handle.
+    let n = hyper.fs_write(0, &vec![0xBBu8; 4096]).await.expect("write on wronly handle");
+    assert_eq!(n, 4096);
+
+    let _ = hyper.fs_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
+
+/// The read guard must not break write-side operations that read
+/// internally. On an `O_WRONLY` handle:
+///
+///   * a partial (sub-block) write needs a read-modify-write of the
+///     existing block,
+///   * a shrink to a non-block-aligned size needs to read the tail
+///     block to zero its remainder.
+///
+/// Both go through the lower-level `load_data_block_*` helpers rather
+/// than `read()`, so both must still work — and produce correct
+/// content, verified from a separate read-only handle.
+#[tokio::test]
+#[ignore]
+async fn smoke_wronly_handle_internal_reads_still_work() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+
+    // Seed two blocks of 0xAA and flush so the data is on S3 (not in
+    // this handle's cache) — the read-modify-write below must fetch
+    // it back from staging.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &vec![0xAAu8; BLOCK * 2]).await.expect("seed write");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Write-only handle: partial write in the middle of block 0.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::wronly())
+            .await.expect("reopen wronly");
+        let n = hyper.fs_write(50, &vec![0xBBu8; 100]).await
+            .expect("partial write on wronly handle must work (read-modify-write)");
+        assert_eq!(n, 100);
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Verify from a read-only handle: the untouched parts of block 0
+    // survived the read-modify-write.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await.expect("reopen rdonly");
+        let mut buf = vec![0u8; BLOCK * 2];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert!(buf[..50].iter().all(|&b| b == 0xAA), "bytes before the patch must be 0xAA");
+        assert!(buf[50..150].iter().all(|&b| b == 0xBB), "patched bytes must be 0xBB");
+        assert!(buf[150..].iter().all(|&b| b == 0xAA), "bytes after the patch must be 0xAA");
+        let _ = hyper.fs_release().await;
+    }
+
+    // Write-only handle: shrink to a non-aligned size. This reads the
+    // tail block to zero its remainder.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::wronly())
+            .await.expect("reopen wronly for truncate");
+        hyper.fs_truncate(BLOCK + 1000).await
+            .expect("truncate on wronly handle must work");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Verify the shrink kept the retained bytes and the size.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+            .await.expect("reopen rdonly after truncate");
+        let st = hyper.fs_getattr().expect("getattr");
+        assert_eq!(st.st_size as usize, BLOCK + 1000);
+        let mut buf = vec![0u8; BLOCK + 1000];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read after truncate");
+        assert!(buf[50..150].iter().all(|&b| b == 0xBB), "patch must survive the truncate");
+        assert!(buf[BLOCK..].iter().all(|&b| b == 0xAA), "retained tail must be 0xAA");
+        let _ = hyper.fs_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// `lseek` requires no particular access mode, and neither do the
+/// `SEEK_DATA` / `SEEK_HOLE` extensions. They must keep working on a
+/// write-only handle even though `read` is rejected.
+#[tokio::test]
+#[ignore]
+async fn smoke_wronly_handle_seek_data_hole_still_work() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = hyper.fs_write(0, &vec![0xAAu8; BLOCK]).await.expect("seed write");
+        hyper.fs_truncate(BLOCK * 3).await.expect("extend with a trailing hole");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::wronly())
+        .await.expect("reopen wronly");
+
+    assert_eq!(hyper.fs_seek_data(0).await.expect("seek_data on wronly"), Some(0));
+    assert_eq!(hyper.fs_seek_hole(0).await.expect("seek_hole on wronly"), Some(BLOCK));
+
+    // ...while read is still rejected on the same handle.
+    let mut buf = vec![0u8; 16];
+    let err = hyper.fs_read(0, &mut buf).await.expect_err("read must still fail");
+    assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+
     let _ = hyper.fs_release().await;
     tf.cleanup(&client).await;
 }
