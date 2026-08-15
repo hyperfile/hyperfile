@@ -1896,3 +1896,66 @@ async fn smoke_unlink_nonexistent_is_enoent() {
 // under the prefix cannot be reclaimed through `fs_unlink` (or the
 // cleaner). See "Known gap: orphaned objects are not reclaimable" in
 // docs/posix.md.
+
+/// Regression: `O_DIRECT` disables the clean-block cache
+/// (`data_cache_blocks` is forced to 0 unless the `wal` feature is
+/// on), and every lookup against a disabled cache used to panic —
+/// the guard `(enabled).then(|| ...).unwrap()` panics precisely when
+/// the cache is *disabled*, since `bool::then` yields `None` for a
+/// false condition. So `O_DIRECT` was unusable without `wal`: the
+/// first read took down the process.
+///
+/// Runs unconditionally: under the `wal` feature `O_DIRECT` keeps the
+/// configured cache size, so this simply exercises the normal path
+/// there.
+#[tokio::test]
+#[ignore]
+async fn smoke_o_direct_read_write_does_not_panic() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLOCK: usize = 4096;
+    let direct = FileFlags::from(libc::O_RDWR | libc::O_DIRECT);
+
+    // Create with O_DIRECT and write two blocks.
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), direct, FileMode::default_file(),
+        ).await.expect("create with O_DIRECT");
+        let n = hyper.fs_write(0, &vec![0xAAu8; BLOCK * 2]).await
+            .expect("write with O_DIRECT");
+        assert_eq!(n, BLOCK * 2);
+        let _ = hyper.fs_flush().await.expect("flush");
+
+        // Read back on the same handle — this is the lookup that used
+        // to panic once the data had been flushed into the (disabled)
+        // clean tier.
+        let mut buf = vec![0u8; BLOCK * 2];
+        let n = hyper.fs_read(0, &mut buf).await.expect("read with O_DIRECT");
+        assert_eq!(n, BLOCK * 2);
+        assert!(buf.iter().all(|&b| b == 0xAA), "content must round-trip");
+
+        // A sub-block write exercises the read-modify-write path, which
+        // also consults the clean tier.
+        let n = hyper.fs_write(50, &vec![0xBBu8; 100]).await
+            .expect("partial write with O_DIRECT");
+        assert_eq!(n, 100);
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Reopen with O_DIRECT and verify content.
+    {
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::from(libc::O_RDONLY | libc::O_DIRECT))
+            .await.expect("reopen with O_DIRECT");
+        let mut buf = vec![0u8; BLOCK * 2];
+        let n = hyper.fs_read(0, &mut buf).await.expect("read after reopen");
+        assert_eq!(n, BLOCK * 2);
+        assert!(buf[..50].iter().all(|&b| b == 0xAA));
+        assert!(buf[50..150].iter().all(|&b| b == 0xBB));
+        assert!(buf[150..].iter().all(|&b| b == 0xAA));
+        let _ = hyper.fs_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}

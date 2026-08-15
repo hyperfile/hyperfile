@@ -67,7 +67,7 @@ impl Cache for MemCache {
             return Some(block);
         }
         // check data cache
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.get(blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.get(blk_idx)).flatten() {
             // cache hit
             debug!("Cache Hit on cache list for block index: {}", blk_idx);
             return Some(block);
@@ -95,7 +95,7 @@ impl Cache for MemCache {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return true;
         }
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).flatten() {
             self.data_blocks_dirty.insert(*blk_idx, block);
             return true;
         }
@@ -106,7 +106,7 @@ impl Cache for MemCache {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return self.data_blocks_dirty.get_mut(blk_idx);
         }
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).flatten() {
             self.data_blocks_dirty.insert(*blk_idx, block);
             return self.data_blocks_dirty.get_mut(blk_idx);
         }
@@ -132,7 +132,7 @@ impl Cache for MemCache {
                 // incomplete block but already in dirty list
                 continue;
             }
-            if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
+            if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).flatten() {
                 // incomplete block found in data blocks cache
                 self.data_blocks_dirty.insert(blk_idx, block);
                 continue;
@@ -174,7 +174,7 @@ impl Cache for MemCache {
             debug!("data block in dirty list, data cleared");
             return true;
         }
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).flatten() {
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
             to_clear.fill(0);
@@ -237,8 +237,15 @@ impl Cache for MemCache {
             if !block.is_should_cache() {
                 continue;
             }
+            if self.data_cache_blocks == 0 {
+                // Cache disabled: nothing to keep the block in, so drop
+                // it. The data is already persisted (clear_dirty runs
+                // after a flush) and the buffer is a plain heap
+                // allocation, so dropping it here is the whole cleanup.
+                continue;
+            }
             // keep block that should cache into cache list
-            if let Some(_) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.put(blk_idx, block)).unwrap() {
+            if let Some(_) = self.data_blocks_cache.put(blk_idx, block) {
                 panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
             }
         }
@@ -260,6 +267,61 @@ mod tests {
 
     fn new_cache() -> MemCache {
         MemCache::new(4, 4096) // 4 cache slots, 4KiB blocks
+    }
+
+    /// `data_cache_blocks == 0` means "clean-block caching disabled".
+    /// It is a representable, reachable configuration, and every path
+    /// that consults the clean tier used to guard it with
+    /// `(enabled).then(|| ...).unwrap()` — which panics precisely when
+    /// the cache is *disabled*, because `bool::then` yields `None` for
+    /// a false condition. Exercise every such path with the cache off.
+    #[test]
+    fn disabled_cache_does_not_panic() {
+        let mut c = MemCache::new(0, 4096);
+        assert_eq!(c.dirty_count(), 0);
+
+        // get / contains / get_mut / truncate_data_block: all consult
+        // the clean tier after missing the dirty map.
+        assert!(c.get(&0).is_none());
+        assert!(!c.contains(&0));
+        assert!(c.get_mut(&0).is_none());
+        assert!(!c.truncate_data_block(&0, 100));
+
+        // remove and insert pop the clean tier unconditionally.
+        assert!(c.remove(&0).is_none());
+        assert!(c.insert(0, DataBlock::new(0, 4096)).is_none());
+        assert_eq!(c.dirty_count(), 1);
+
+        // write_prepare consults the clean tier for partial blocks.
+        let v = c.write_prepare(4096 + 10, 20);
+        assert_eq!(v, vec![1], "block 1 is partial and not cached");
+
+        // clear_dirty has nowhere to put the block; it must drop it
+        // rather than panic, and must not leave it dirty.
+        c.clear_dirty();
+        assert_eq!(c.dirty_count(), 0);
+        assert!(c.get(&0).is_none(), "a disabled cache must not retain the block");
+
+        // truncate_blocks_above sweeps both tiers.
+        assert_eq!(c.truncate_blocks_above(0), 0);
+        c.clear_data_blocks_cache();
+    }
+
+    /// A block marked should_cache still must not be retained when the
+    /// cache is disabled.
+    #[test]
+    fn disabled_cache_clear_dirty_drops_should_cache_block() {
+        let mut c = MemCache::new(0, 4096);
+        let mut blk = DataBlock::new(7, 4096);
+        blk.set_should_cache();
+        blk.copy(0, &[0xAB; 4096]);
+        c.insert(7, blk);
+        assert_eq!(c.dirty_count(), 1);
+
+        c.clear_dirty();
+        assert_eq!(c.dirty_count(), 0);
+        assert!(c.get(&7).is_none(),
+            "with the cache disabled the block must be dropped, not cached");
     }
 
     // --- insert / get ---
@@ -456,7 +518,7 @@ mod tests {
     #[test]
     fn truncate_blocks_above_at_boundary_is_inclusive() {
         let mut cache = new_cache();
-        let mut blk = DataBlock::new(5, 4096);
+        let blk = DataBlock::new(5, 4096);
         blk.set_should_cache();
         cache.insert(5, blk);
         cache.clear_dirty();

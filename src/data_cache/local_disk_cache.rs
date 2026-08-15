@@ -239,7 +239,7 @@ impl Cache for LocalDiskCache {
             return Some(block);
         }
         // check data cache
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.get(blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.get(blk_idx)).flatten() {
             // cache hit
             debug!("Cache Hit on cache list for block index: {}", blk_idx);
             assert!(!block.is_locked());
@@ -273,7 +273,7 @@ impl Cache for LocalDiskCache {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return true;
         }
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).flatten() {
             block.lock();
             self.data_blocks_dirty.insert(*blk_idx, block);
             return true;
@@ -285,7 +285,7 @@ impl Cache for LocalDiskCache {
         if self.data_blocks_dirty.contains_key(blk_idx) {
             return self.data_blocks_dirty.get_mut(blk_idx);
         }
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(blk_idx)).flatten() {
             block.lock();
             block.set_dirty();
             self.data_blocks_dirty.insert(*blk_idx, block);
@@ -310,7 +310,7 @@ impl Cache for LocalDiskCache {
                 // incomplete block but already in dirty list
                 continue;
             }
-            if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
+            if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).flatten() {
                 // incomplete block found in data blocks cache
                 block.lock();
                 block.set_dirty();
@@ -353,7 +353,7 @@ impl Cache for LocalDiskCache {
             debug!("data block in dirty list, data cleared");
             return true;
         }
-        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).unwrap() {
+        if let Some(block) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.pop(&blk_idx)).flatten() {
             block.lock();
             let buf = block.as_mut_slice();
             let (_, to_clear) = buf.split_at_mut(offset_to_discard);
@@ -417,8 +417,19 @@ impl Cache for LocalDiskCache {
         while let Some((blk_idx, block)) = self.data_blocks_dirty.pop_first() {
             block.clear_dirty();
             block.unlock();
+            if self.data_cache_blocks == 0 {
+                // Cache disabled: there is nowhere to keep the block,
+                // and unlike the in-memory cache its bytes live in the
+                // backing cache file rather than on the heap. Punch the
+                // hole so that a later `new_dirty_block` for this index
+                // — which hands out an unzeroed mmap view — cannot
+                // observe the bytes being dropped here. Same reasoning
+                // as the eviction discard below.
+                self.discard(blk_idx);
+                continue;
+            }
             // push into cache list
-            if let Some((old_blk_idx, _)) = (self.data_cache_blocks > 0).then(|| self.data_blocks_cache.push(blk_idx, block)).unwrap() {
+            if let Some((old_blk_idx, _)) = self.data_blocks_cache.push(blk_idx, block) {
                 if old_blk_idx == blk_idx {
                     panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
                 } else {
