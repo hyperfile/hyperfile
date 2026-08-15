@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.4.5] - 2026-08-15
+
+### Fixed
+
+- **Panic on every data-cache lookup when the clean-block cache is
+  disabled.** The guard
+  `(data_cache_blocks > 0).then(|| cache.op()).unwrap()` is inverted:
+  `bool::then` yields `None` for a false condition, so the `.unwrap()`
+  panicked exactly when the cache was *disabled*.
+
+  This was reachable from hyperfile itself, not just from a bad config
+  value: both the create and open paths force `data_cache_blocks` to 0
+  when `O_DIRECT` is set and the `wal` feature is off, so **`O_DIRECT`
+  was unusable without `wal`** — the first read after a flush aborted
+  the process. For a FUSE daemon that means the mount dies and
+  applications see `ENOTCONN`.
+
+  Fixed at all 12 sites across `mem_cache` and `local_disk_cache`. The
+  ten `get` / `pop` sites now use `.flatten()`. The two `clear_dirty`
+  sites are restructured, because there the guard also decides the fate
+  of a block that cannot be cached: the in-memory cache drops it (the
+  data is already persisted and the buffer is a heap allocation), and
+  the local-disk cache drops it **and punches the backing hole** — its
+  blocks are unzeroed mmap views, so leaving the bytes behind would let
+  a later write to the same index observe pre-drop content, the same
+  failure class as the stale-clean-block bug fixed in 0.4.3.
+
 ## [0.4.4] - 2026-08-14
 
 ### Added
