@@ -386,7 +386,7 @@ impl S3Staging {
 
     pub(crate) async fn do_open(client: &Client, bucket: &str, key: &str) -> Result<SegmentSum> {
         // read at least min size of header data
-        let range = format!("bytes={}-{}", 0, SEGMENT_HEADER_FETCH_SIZE);
+        let range = format!("bytes={}-{}", 0, SEGMENT_HEADER_FETCH_SIZE - 1);
         let (bytes, _) = S3Ops::do_get_object_speculative(client, bucket, key, Some(&range), false).await?;
 
         let mut buf = bytes.to_vec();
@@ -401,14 +401,27 @@ impl S3Staging {
         let hdr_buf = &buf[0..hdr_size];
         let hdr = SegmentHeader::from_slice(&hdr_buf);
         let actual_ss_bytes = hdr.s_bytes as usize;
-        let remain_bytes = actual_ss_bytes - SEGMENT_HEADER_FETCH_SIZE;
         if buf.len() < actual_ss_bytes {
-            // readin remain bytes
-            let mut remain_buf = Vec::with_capacity(remain_bytes);
-            remain_buf.resize(remain_bytes, 0);
+            // Read the rest of the summary. This uses the speculative
+            // read on purpose: sizing a buffer from `s_bytes` would let a
+            // corrupted header (u32, so up to ~4 GiB) dictate the
+            // allocation. Letting S3 clamp the range to the end of the
+            // object instead bounds the read by data that actually
+            // exists.
             let range = format!("bytes={}-{}", buf.len(), actual_ss_bytes - 1);
-            let _ = S3Ops::do_get_object(client, bucket, key, &mut remain_buf, Some(&range), false).await?;
-            buf.append(&mut remain_buf);
+            let (rest, _) = S3Ops::do_get_object_speculative(client, bucket, key, Some(&range), false).await?;
+            buf.extend_from_slice(&rest);
+
+            // Still short: `s_bytes` claims more than the object holds, so
+            // the header is corrupt or the object was truncated.
+            if buf.len() < actual_ss_bytes {
+                let err_str = format!(
+                    "segment summary truncated on s3://{}/{}: header claims {} bytes, object has {}",
+                    bucket, key, actual_ss_bytes, buf.len(),
+                );
+                error!("{}", err_str);
+                return Err(Error::new(ErrorKind::InvalidData, err_str));
+            }
         }
 
         Ok(SegmentSum::from_slice(&buf))

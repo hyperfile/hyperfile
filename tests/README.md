@@ -16,6 +16,7 @@ tests/
 ├── integration_s3_rollback.rs               ← rollback (exposure + correctness)
 ├── integration_s3_contract.rs               ← flush contract (invariant) tests
 ├── integration_s3_concurrent.rs             ← multi-instance concurrency
+├── integration_s3_segment_open.rs           ← segment summary read (`open`)
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
 ├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
 ├── integration_reactor_s3_wal.rs            ← reactor + wal
@@ -196,6 +197,29 @@ Multi-instance concurrency:
 See `docs/concurrency.md` for the full behavior model.
 
 Runs in ~27 s.
+
+### `integration_s3_segment_open`
+
+Covers `SegmentReadWrite::open`, which reads a segment's summary. It
+speculatively fetches `SEGMENT_HEADER_FETCH_SIZE` (512 KiB) and tops up
+only if `s_bytes` says the summary is larger, so its behavior depends on
+how the object's real size compares to that constant. The suite writes a
+single flush of 4 KiB, 8 KiB, 512 KiB, 1 MiB and 16 MiB and opens the
+resulting segment in each case.
+
+`open` has no caller inside hyperfile — reads go through the block map
+and the block loaders, which issue exact-length range reads — so no other
+suite exercises it. `hyperfile-cleaner` is the consumer.
+
+**Run this one under debug assertions as well as release.** It previously
+regressed on an integer underflow that wrapped harmlessly in release and
+only panicked with `debug_assertions` on:
+
+```bash
+cargo test --test integration_s3_segment_open -- --ignored --test-threads=1
+```
+
+Runs in ~1 s.
 
 ### `integration_reactor_s3_smoke`
 
