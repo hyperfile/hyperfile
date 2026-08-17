@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.4.6] - 2026-08-17
+
+### Fixed
+
+- **A segment smaller than 512 KiB could not be opened.**
+  `SegmentReadWrite::open` speculatively read `SEGMENT_HEADER_FETCH_SIZE`
+  (512 KiB) into a pre-sized buffer, and the underlying getter rejects a
+  response shorter than the buffer ("feched size 28672 less than input
+  buffer size 524288"). A short read is expected here, since the range
+  deliberately asks for more than the object may hold.
+
+  New `S3Ops::do_get_object_speculative` returns the body as `Bytes`
+  rather than filling a caller-supplied buffer, which removes the
+  length mismatch by construction; the exact-length getter is unchanged
+  for its other callers, which all request an exact byte count. It also
+  maps `NoSuchKey` to `ErrorKind::NotFound`.
+
+  `open` has no caller inside hyperfile — reads go through the block map
+  and the block loaders — so this only affected segment tooling:
+  `hyperfile-cleaner` uses it, which broke `prune` (and hypercli
+  `file prune` / `file du`) on files written with small flushes, i.e. one
+  flush per filesystem commit.
+
+- **Unbounded allocation and an integer underflow in the same path.** The
+  top-up read for a summary larger than the speculative fetch sized its
+  buffer from `s_bytes`, a `u32` off the segment header, so a corrupted
+  value could dictate an allocation of up to ~4 GiB. The size was also
+  computed before the guard that is its only consumer, so it underflowed
+  for any summary below 512 KiB — the normal case, since `s_bytes` covers
+  the summary rather than the segment (240 bytes for an 8 KiB segment,
+  4304 for a 1 MiB one). That panicked under debug assertions and was
+  silently discarded in release.
+
+  The top-up now uses the speculative read as well, so it is bounded by
+  data that actually exists and no length is derived from the header. A
+  summary still short afterwards is reported as `InvalidData` naming both
+  sizes, instead of over-allocating or parsing a truncated summary.
+
+- The speculative range end was off by one: `bytes=0-524288` is
+  inclusive, so it requested 524289 bytes.
+
+### Tests
+
+- New `integration_s3_segment_open` suite covering single-flush segments
+  of 4 KiB, 8 KiB, 512 KiB, 1 MiB and 16 MiB — below, at and above the
+  speculative fetch size. `open` previously had no coverage because it
+  has no in-crate caller. The suite must also be run under debug
+  assertions, since the underflow above was invisible in release; see
+  `tests/README.md`.
+
 ## [0.4.5] - 2026-08-15
 
 ### Fixed
