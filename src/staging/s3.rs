@@ -385,11 +385,11 @@ impl S3Staging {
     }
 
     pub(crate) async fn do_open(client: &Client, bucket: &str, key: &str) -> Result<SegmentSum> {
-        let mut buf = Vec::with_capacity(SEGMENT_HEADER_FETCH_SIZE);
-        buf.resize(SEGMENT_HEADER_FETCH_SIZE, 0);
         // read at least min size of header data
         let range = format!("bytes={}-{}", 0, SEGMENT_HEADER_FETCH_SIZE);
-        let _ = S3Ops::do_get_object(client, bucket, key, &mut buf, Some(&range), false).await?;
+        let (bytes, _) = S3Ops::do_get_object_speculative(client, bucket, key, Some(&range), false).await?;
+
+        let mut buf = bytes.to_vec();
 
         let hdr_size = std::mem::size_of::<SegmentHeader>();
         if buf.len() < hdr_size {

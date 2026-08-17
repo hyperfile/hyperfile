@@ -176,6 +176,53 @@ impl S3Ops {
         Ok(())
     }
 
+    // do get object with speculative
+    pub(crate) async fn do_get_object_speculative(client: &Client, bucket: &str, key: &str,
+            range: Option<&str>, with_ods: bool) -> Result<(bytes::Bytes, Option<OnDiskState>)>
+    {
+        let builder = client
+            .get_object()
+            .bucket(bucket)
+            .key(key);
+        let op = if let Some(r) = range {
+            builder.range(r)
+        } else {
+            builder
+        };
+        match op.send().await {
+            Ok(output) => {
+                let bytes = output.body.collect().await?;
+                if with_ods {
+                    let od_state = OnDiskState {
+                        checksum: output.e_tag.unwrap().replace("\"", ""),
+                        timestamp: output.last_modified.unwrap().secs(),
+                    };
+                    return Ok((bytes.into_bytes(), Some(od_state)));
+                }
+                return Ok((bytes.into_bytes(), None));
+            },
+            Err(sdk_err) => {
+                let mut err_str = if let Some(r) = range {
+                    format!("GetObject s3://{}/{} by range {} error: ", bucket, key, r)
+                } else {
+                    format!("GetObject s3://{}/{} error: ", bucket, key)
+                };
+                if let Some(serv_err) = sdk_err.as_service_error() {
+                    err_str.push_str(&format!("{}", serv_err));
+                } else {
+                    err_str.push_str(&format!("{}", sdk_err));
+                };
+                if sdk_err.as_service_error().map(|e| e.is_no_such_key()) == Some(true) {
+                    warn!("{}", err_str);
+                    return Err(Error::new(ErrorKind::NotFound, err_str));
+                }
+                error!("{}", err_str);
+                return Err(Error::new(s3_error_kind(&sdk_err), err_str));
+            },
+        }
+    }
+
+    // do get object with returned bytes should exact match the input buffer size
     pub(crate) async fn do_get_object(client: &Client, bucket: &str, key: &str,
             buf: &mut [u8], range: Option<&str>, with_ods: bool) -> Result<Option<OnDiskState>>
     {
