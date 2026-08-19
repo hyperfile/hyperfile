@@ -20,6 +20,7 @@ tests/
 ├── integration_s3_block_api.rs              ← block borrow API (`fs_block*`)
 ├── integration_s3_local_disk_cache.rs       ← local-disk data cache tier
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
+├── integration_reactor_s3_block_api.rs      ← reactor block access (`fh_with_block*`)
 ├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
 ├── integration_reactor_s3_wal.rs            ← reactor + wal
 └── integration_reactor_s3_all_features.rs   ← reactor + wal + range-lock
@@ -285,6 +286,22 @@ truncate extend/shrink, flush, getattr, setattr, as well as the
 tokio `AsyncRead`/`AsyncWrite`/`AsyncSeek` surface.
 
 Feature requirement: `reactor` (default).
+
+Runs in ~1 s.
+
+### `integration_reactor_s3_block_api`
+
+Closure-scoped block access on the reactor surface,
+`fh_with_block` / `fh_with_block_mut`. The reactor cannot hand out
+borrow guards — see [docs/block-api.md](../docs/block-api.md#why-the-reactor-surface-takes-a-closure)
+— so the caller's action is sent to the block instead.
+
+Covers values moving in and out of the closure, the closure not
+running for a hole, in-place modification persisting without a
+write-back call, `create`, repeated edits collapsing to one
+checkpoint, access-mode errors surfacing through the channel without
+killing the reactor task, and a byte-for-byte equivalence check
+between the closure form and the direct guard form.
 
 Runs in ~1 s.
 

@@ -51,6 +51,9 @@ Persistent data organized in Log-Structured style, which means, Hyperfile has th
 
 * B+tree data structure based on [btree-ondisk](https://github.com/daiyy/btree-ondisk).
 * Read/write data direct on S3 with file-like API.
+* Block-level API to borrow a cached block for reading or in-place
+  modification, for callers that use hyperfile as block storage rather
+  than as a file — see [Block API](docs/block-api.md).
 * Support S3 and S3 Express One Zone as staging area.
 * Optional: WAL(Write-Ahead-Log) support to perserve durability of unflushed data.
 * Optional: data blocks cache and meta blocks cache on local disk to accelerate read path.

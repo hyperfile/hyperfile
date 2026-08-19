@@ -1,7 +1,9 @@
 use std::io::Result;
 use aws_sdk_s3::Client;
 use hyperfile_reactor::Reactor;
-use crate::file::handler::{ChannelGroup, build_channel_group};
+use tokio::sync::oneshot;
+use crate::BlockIndex;
+use crate::file::handler::{ChannelGroup, build_channel_group, BlockAction};
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use crate::staging::{s3::S3Staging, StagingIntercept};
@@ -210,6 +212,94 @@ impl<'a: 'static> HyperFileHandler<'a> {
         let (ctx, rx) = FileContext::new_trunc(offset);
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// Run `f` against block `idx` for reading, and return what it
+    /// produced. `Ok(None)` when the block is not backed by data, in
+    /// which case `f` is not called.
+    ///
+    /// # Why a closure and not a guard
+    ///
+    /// The direct API hands out a borrow — `Hyper::fs_block` returns a
+    /// `BlockRef` — but the reactor surface cannot. The `Hyper` lives
+    /// inside the reactor task, so a borrow would reach the caller
+    /// only once the response arrives, and from that moment the
+    /// reactor is free to serve the next request from this handle or
+    /// any clone of it. A write, flush, truncate or cache eviction
+    /// would then invalidate a borrow the caller still holds; blocks
+    /// in the local-disk cache additionally have their backing space
+    /// punched when evicted. There is no lifetime that expresses
+    /// "valid until the next message", which is why `fh_read` is
+    /// sound only for as long as its caller is parked awaiting the
+    /// response.
+    ///
+    /// So the action travels to the block. `f` runs inside the reactor
+    /// task while it holds the real borrow, and only owned values
+    /// cross the channel — hence the `Send + 'static` bounds. Move
+    /// what `f` needs into it and return what the caller needs out.
+    ///
+    /// The slice is always `data_block_size` bytes.
+    pub async fn fh_with_block<R, F>(&mut self, idx: BlockIndex, f: F) -> Result<Option<R>>
+    where
+        F: FnOnce(&[u8]) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (rtx, rrx) = oneshot::channel::<R>();
+        let action = BlockAction::Ref(Box::new(move |buf: &[u8]| {
+            let _ = rtx.send(f(buf));
+        }));
+        self.dispatch_with_block(idx, false, action, rrx).await
+    }
+
+    /// Run `f` against block `idx` for modification, and return what
+    /// it produced. `Ok(None)` when the block is not backed by data
+    /// and `create` is false, in which case `f` is not called.
+    ///
+    /// Writes through the slice land in the buffer the next flush will
+    /// write out; no write-back call is needed. `create` materializes
+    /// a zero-filled block for an index with no data. `i_size` is not
+    /// changed. See [`Hyper::fs_block_mut`] for the full semantics and
+    /// [`Self::fh_with_block`] for why this takes a closure rather
+    /// than returning a guard.
+    ///
+    /// [`Hyper::fs_block_mut`]: crate::file::hyper::Hyper::fs_block_mut
+    pub async fn fh_with_block_mut<R, F>(&mut self, idx: BlockIndex, create: bool, f: F) -> Result<Option<R>>
+    where
+        F: FnOnce(&mut [u8]) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (rtx, rrx) = oneshot::channel::<R>();
+        let action = BlockAction::Mut(Box::new(move |buf: &mut [u8]| {
+            let _ = rtx.send(f(buf));
+        }));
+        self.dispatch_with_block(idx, create, action, rrx).await
+    }
+
+    /// Shared tail of the two `fh_with_block*` entry points: send the
+    /// action, learn whether it ran, and if it did collect its result.
+    async fn dispatch_with_block<R>(
+        &mut self,
+        idx: BlockIndex,
+        create: bool,
+        action: BlockAction,
+        rrx: oneshot::Receiver<R>,
+    ) -> Result<Option<R>>
+    {
+        let (ctx, rx) = FileContext::new_with_block(idx, create, action);
+        self.inner.send(ctx)?;
+        let ran = rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))??;
+        if !ran {
+            return Ok(None);
+        }
+        // The action ran to completion before the reactor answered, so
+        // its value is already queued. A closure that panicked would
+        // have taken the reactor task with it, surfacing as the send
+        // error above rather than here.
+        let value = rrx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+                "block action did not report a result"))?;
+        Ok(Some(value))
     }
 
     pub async fn fh_getattr(&self) -> Result<libc::stat>

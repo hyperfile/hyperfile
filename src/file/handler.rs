@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 #[cfg(feature = "wal")]
 use tokio::sync::OwnedMutexGuard;
 use hyperfile_reactor::{Capacity, Channel, Task, TaskBuilder, TaskHandler};
-use crate::SegmentId;
+use crate::{SegmentId, BlockIndex};
 #[cfg(feature = "wal")]
 use crate::inode::OnDiskState;
 use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
@@ -103,6 +103,9 @@ pub type FileRespRead = Result<usize>;
 pub type FileRespWrite = Result<usize>;
 pub type FileRespWriteZero = Result<usize>;
 pub type FileRespTrunc = Result<()>;
+/// Whether the block existed, so whether the action ran. The action's
+/// own return value travels on its own channel.
+pub type FileRespWithBlock = Result<bool>;
 pub type FileRespFlush = Result<SegmentId>;
 pub type FileRespRelease = Result<SegmentId>;
 pub type FileRespLastCno = u64;
@@ -129,6 +132,7 @@ pub enum FileResp {
     WriteAlignedBatch(mpsc::Sender<FileRespWrite>),
     WriteBatch(mpsc::Sender<FileRespWrite>),
     Trunc(oneshot::Sender<FileRespTrunc>),
+    WithBlock(oneshot::Sender<FileRespWithBlock>),
     Flush(oneshot::Sender<FileRespFlush>),
     #[cfg(feature = "wal")]
     WalFlush,
@@ -173,6 +177,13 @@ impl FileResp {
         match self {
             Self::WriteZero(tx) => tx,
             _ => panic!("FileResp::to_write_zero called on wrong variant"),
+        }
+    }
+
+    pub fn to_with_block(self) -> oneshot::Sender<FileRespWithBlock> {
+        match self {
+            Self::WithBlock(tx) => tx,
+            _ => panic!("FileResp::to_with_block called on wrong variant"),
         }
     }
 
@@ -278,6 +289,35 @@ pub struct FileReqTrunc {
     pub offset: usize,
 }
 
+/// A caller-supplied action to run against a borrowed data block.
+///
+/// The reactor owns the `Hyper`, so a block borrow cannot be handed
+/// back across the channel: the caller would receive it only after
+/// the response arrives, by which point the reactor is free to
+/// process the next request — from this handle or any clone of it —
+/// and a write, flush, truncate or eviction could invalidate the
+/// borrow. Views into the local-disk cache also have their backing
+/// space punched on eviction.
+///
+/// So the action travels to the block instead of the block travelling
+/// to the caller, and the borrow never leaves the reactor task. The
+/// closure returns nothing: `fh_with_block*` wraps the caller's
+/// closure in one that sends the result down a dedicated channel,
+/// which keeps this type free of the caller's return type and so
+/// storable in `FileReqBody`.
+pub enum BlockAction {
+    Ref(Box<dyn FnOnce(&[u8]) + Send>),
+    Mut(Box<dyn FnOnce(&mut [u8]) + Send>),
+}
+
+pub struct FileReqWithBlock {
+    pub blk_idx: BlockIndex,
+    /// Materialize a zero-filled block if the index has no data.
+    /// Ignored by [`BlockAction::Ref`], which cannot create.
+    pub create: bool,
+    pub action: BlockAction,
+}
+
 pub struct FileReqGetAttr {}
 
 pub struct FileReqSetAttr {
@@ -325,6 +365,7 @@ pub enum FileReqOp {
     WriteAlignedBatch,
     WriteBatch,
     Trunc,
+    WithBlock,
     Flush,
     FlushData,
     #[cfg(feature = "wal")]
@@ -351,6 +392,7 @@ pub union FileReqBody<'a> {
     write_aligned_batch: ManuallyDrop<FileReqWriteAlignedBatch>,
     write_batch: ManuallyDrop<FileReqWriteBatch>,
     trunc: ManuallyDrop<FileReqTrunc>,
+    with_block: ManuallyDrop<FileReqWithBlock>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
     #[cfg(feature = "wal")]
@@ -512,6 +554,20 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset: offset }), },
         };
         let resp = FileResp::Trunc(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    pub fn new_with_block(blk_idx: BlockIndex, create: bool, action: BlockAction)
+        -> (Self, oneshot::Receiver<FileRespWithBlock>)
+    {
+        let (tx, rx) = oneshot::channel::<FileRespWithBlock>();
+        let req = FileReq {
+            op: FileReqOp::WithBlock,
+            body: FileReqBody {
+                with_block: ManuallyDrop::new(FileReqWithBlock { blk_idx, create, action }),
+            },
+        };
+        let resp = FileResp::WithBlock(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -866,6 +922,31 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let offset = req.offset;
                 let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
+            },
+            FileReqOp::WithBlock => {
+                let md = unsafe { req.body.with_block };
+                let req = ManuallyDrop::into_inner(md);
+                let FileReqWithBlock { blk_idx, create, action } = req;
+                // The borrow stays inside this task for the whole
+                // call; only the action's own result leaves, on the
+                // channel its closure captured.
+                let res = match action {
+                    BlockAction::Ref(f) => {
+                        match self.inner.block(blk_idx).await {
+                            Ok(Some(block)) => { f(block.as_slice()); Ok(true) },
+                            Ok(None) => Ok(false),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    BlockAction::Mut(f) => {
+                        match self.inner.block_mut(blk_idx, create).await {
+                            Ok(Some(mut block)) => { f(block.as_mut_slice()); Ok(true) },
+                            Ok(None) => Ok(false),
+                            Err(e) => Err(e),
+                        }
+                    },
+                };
+                let _ = resp.to_with_block().send(res);
             },
             // single flush interface for extenral
             #[cfg(not(feature = "wal"))]
