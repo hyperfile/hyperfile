@@ -1155,65 +1155,75 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Err(e);
         }
 
-        // Fast path: already cached. `Cache::get_mut` moves a clean
-        // block into the dirty tier, which is what we want, but
-        // probe with the side-effect-free `has` first so `get_mut`
-        // is called exactly once.
-        if self.cache.has(&blk_idx) {
-            let block = self.cache.get_mut(&blk_idx)
-                .expect("cache lost a block between has() and get_mut() under &mut self");
-            // Normalize the dirty flag across cache tiers: the
-            // local-disk `get_mut` sets it, the in-memory one only
-            // moves the block into the dirty map.
-            block.set_dirty();
-            // Retain the block in the read cache once flushed.
-            // A full-block byte write deliberately does not, so that
-            // streaming writes do not evict the read cache, but this
-            // API exists for callers that read-modify-write the same
-            // blocks repeatedly.
-            block.set_should_cache();
-            return Ok(Some(BlockMut::new(block)));
-        }
-
-        // Not cached: decide between loading, creating, or nothing.
-        let state = self.block_state_inner(blk_idx).await?;
-        if state.is_hole() && !create {
-            return Ok(None);
-        }
-
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
-        // `new_block` allocates zeroed, which is what a created
-        // block needs and also the correct starting point for an
-        // explicit zero block being materialized. Deliberately not
-        // the cache's own new-dirty-block path, which on the
-        // local-disk tier hands back an unzeroed view of the cache
-        // file.
-        let block = self.cache.new_block(blk_idx);
-        if state.is_mapped() {
-            let blk_ptr = self.bmap.lookup(&blk_idx).await?;
-            let buf = block.as_mut_slice();
-            if let Err(e) = self.load_data_block_write_path(blk_idx, blk_ptr, 0, buf).await {
-                drop(permit);
-                return Err(e);
+        // Get the block into the dirty tier, loading or creating it
+        // first if it is not cached at all.
+        if !self.cache.has(&blk_idx) {
+            // Probe with the side-effect-free `has`: `get_mut` is what
+            // promotes a clean block into the dirty tier, and it is
+            // called once, below.
+            let state = self.block_state_inner(blk_idx).await?;
+            if state.is_hole() && !create {
+                return Ok(None);
             }
+
+            let permit = self.sema.clone().acquire_owned().await.unwrap();
+            // `new_block` allocates zeroed, which is what a created
+            // block needs and also the correct starting point for an
+            // explicit zero block being materialized. Deliberately not
+            // the cache's own new-dirty-block path, which on the
+            // local-disk tier hands back an unzeroed view of the cache
+            // file.
+            let block = self.cache.new_block(blk_idx);
+            if state.is_mapped() {
+                let blk_ptr = self.bmap.lookup(&blk_idx).await?;
+                let buf = block.as_mut_slice();
+                if let Err(e) = self.load_data_block_write_path(blk_idx, blk_ptr, 0, buf).await {
+                    drop(permit);
+                    return Err(e);
+                }
+            }
+            let None = self.cache.insert(blk_idx, block) else {
+                panic!("BlockIndex {} already on the dirty list", blk_idx);
+            };
+            drop(permit);
         }
 
-        // Install as dirty and give the bmap a placeholder so flush
-        // knows to assign a real pointer for this index.
-        let None = self.cache.insert(blk_idx, block) else {
-            panic!("BlockIndex {} already on the dirty list", blk_idx);
-        };
+        // Give the bmap a placeholder for this index, on *every* path
+        // including the already-cached one.
+        //
+        // This is not only about telling flush to assign a real
+        // pointer. `flush_process_build_segment` collects the dirty
+        // meta nodes *before* it assigns pointers to data blocks, so a
+        // node that is not already dirty when the flush starts is
+        // never written — the flush would store the block's data and
+        // update the map in memory, then persist neither the node
+        // holding the new pointer nor any record of it. A cold reader
+        // would follow the old pointer to the previous version, with
+        // no error reported anywhere.
+        //
+        // While the whole map still fits in the inode's inline root
+        // that is invisible, because the root travels with the inode
+        // and every flush writes the inode. It only surfaces once the
+        // map has spilled to a node, which is why skipping this on the
+        // already-cached path looked harmless. The byte write path has
+        // always inserted for every block it dirties.
         let prev = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
         if prev.is_none() {
             let data_block_size = self.config.meta.data_block_size;
             self.inode.update_blocks(data_block_size as isize);
         }
         self.inode.update_mtime();
-        drop(permit);
 
         let block = self.cache.get_mut(&blk_idx)
-            .expect("block just inserted into the dirty tier is missing");
+            .expect("block is not in the cache after being loaded or created");
+        // Normalize the dirty flag across cache tiers: the local-disk
+        // `get_mut` sets it, the in-memory one only moves the block
+        // into the dirty map.
         block.set_dirty();
+        // Retain the block in the read cache once flushed. A full-block
+        // byte write deliberately does not, so that streaming writes do
+        // not evict the read cache, but this API exists for callers
+        // that read-modify-write the same blocks repeatedly.
         block.set_should_cache();
         Ok(Some(BlockMut::new(block)))
     }

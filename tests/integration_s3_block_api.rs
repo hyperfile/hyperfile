@@ -523,3 +523,189 @@ async fn block_api_with_data_cache_disabled() {
     // this covers the owned fallback.
     round_trip_with_cache(HyperFileDataCacheConfig::new_mem(), 0, 20, "disabled cache").await;
 }
+
+/// An in-place edit in a *later* flush window must reach a cold
+/// reader, including once the block map has spilled out of the
+/// inode's inline root.
+///
+/// Regression: `block_mut`'s already-cached fast path returned as soon
+/// as it had promoted the block into the dirty tier, without touching
+/// the bmap. The byte write path inserts a placeholder for every block
+/// it dirties, and that insert is what puts the block's containing
+/// bmap node into the set of dirty meta nodes the flush collects
+/// (`flush_process_build_segment` collects them *before* assigning
+/// pointers to data blocks). Without it the flush wrote the block's
+/// data and updated the map in memory, but never persisted the node
+/// holding the new pointer — so a cold reader followed the old
+/// pointer and saw the previous version. No error anywhere.
+///
+/// While the whole map still fitted in the inode's inline root the
+/// update rode along with the inode, which every flush writes, so this
+/// only appeared past the spill threshold — 7 blocks from index 0.
+#[tokio::test]
+#[ignore]
+async fn block_mut_edit_survives_after_the_bmap_spills() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+
+    // Well past the spill threshold, and again at a large index, where
+    // fewer keys fit inline.
+    for (first, count) in [(0u64, 8u64), (0, 30), (33554432, 8)] {
+        let tf = TestFile::new(&client).await;
+
+        // First version: `count` blocks of 0xAA, created through the
+        // block API only. No byte write anywhere.
+        {
+            let mut h = open_rdwr(&client, tf.uri()).await;
+            for i in first..first + count {
+                let mut blk = h.fs_block_mut(i, true).await
+                    .unwrap_or_else(|e| panic!("create block {i}: {e}"))
+                    .expect("create=true yields a block");
+                blk.as_mut_slice().fill(0xAA);
+            }
+            let _ = h.fs_flush().await.expect("flush 1");
+
+            // Second version: every block becomes 0xBB, edited in
+            // place in a later flush window.
+            for i in first..first + count {
+                let mut blk = h.fs_block_mut(i, false).await
+                    .unwrap_or_else(|e| panic!("edit block {i}: {e}"))
+                    .unwrap_or_else(|| panic!("block {i} should be mapped"));
+                blk.as_mut_slice().fill(0xBB);
+            }
+
+            // Warm reads see the edit even when it is not persisted,
+            // so they prove nothing on their own; assert them anyway
+            // to localize a failure.
+            for i in first..first + count {
+                let blk = h.fs_block(i).await.expect("warm").expect("mapped");
+                assert_eq!(blk.as_slice()[0], 0xBB,
+                    "first={first} count={count}: block {i} wrong even warm");
+            }
+
+            let _ = h.fs_flush().await.expect("flush 2");
+            let _ = h.fs_release().await.expect("release");
+        }
+
+        // Cold: a fresh open must follow the map to the new segment.
+        {
+            let mut h = open_rdwr(&client, tf.uri()).await;
+            let mut lost = Vec::new();
+            for i in first..first + count {
+                let blk = h.fs_block(i).await
+                    .unwrap_or_else(|e| panic!("cold read block {i}: {e}"))
+                    .unwrap_or_else(|| panic!("block {i} should be mapped"));
+                if blk.as_slice()[0] != 0xBB {
+                    lost.push((i, blk.as_slice()[0]));
+                }
+            }
+            assert!(lost.is_empty(),
+                "first={first} count={count}: {} of {count} in-place edits lost; \
+                 a cold reader still sees the previous version for {:?}",
+                lost.len(), lost.iter().take(5).collect::<Vec<_>>());
+            let _ = h.fs_release().await.expect("release");
+        }
+
+        tf.cleanup(&client).await;
+    }
+}
+
+/// The same loss, reached through the byte API rather than the block
+/// API, must also not happen: a block whose first version came from
+/// `fs_write` and is then edited in place, and the reverse.
+#[tokio::test]
+#[ignore]
+async fn block_mut_and_byte_writes_interoperate_after_a_spill() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const N: u64 = 12;
+
+    // Created by fs_write, edited by fs_block_mut.
+    {
+        let tf = TestFile::new(&client).await;
+        {
+            let mut h = open_rdwr(&client, tf.uri()).await;
+            let _ = h.fs_write(0, &vec![0xAAu8; N as usize * BLK]).await.expect("write");
+            let _ = h.fs_flush().await.expect("flush 1");
+            for i in 0..N {
+                let mut blk = h.fs_block_mut(i, false).await.expect("edit").expect("mapped");
+                blk.as_mut_slice().fill(0xBB);
+            }
+            let _ = h.fs_flush().await.expect("flush 2");
+            let _ = h.fs_release().await.expect("release");
+        }
+        let mut h = open_rdwr(&client, tf.uri()).await;
+        for i in 0..N {
+            let mut buf = vec![0u8; BLK];
+            let _ = h.fs_read(i as usize * BLK, &mut buf).await.expect("read");
+            assert!(buf.iter().all(|b| *b == 0xBB),
+                "write-then-block_mut: block {i} lost the edit");
+        }
+        let _ = h.fs_release().await.expect("release");
+        tf.cleanup(&client).await;
+    }
+
+    // Created by fs_block_mut, edited by fs_write.
+    {
+        let tf = TestFile::new(&client).await;
+        {
+            let mut h = open_rdwr(&client, tf.uri()).await;
+            for i in 0..N {
+                let mut blk = h.fs_block_mut(i, true).await.expect("create").expect("created");
+                blk.as_mut_slice().fill(0xAA);
+            }
+            // Move EOF so the byte writes below are inside the file.
+            let _ = h.fs_truncate(N as usize * BLK).await.expect("truncate");
+            let _ = h.fs_flush().await.expect("flush 1");
+            for i in 0..N {
+                let _ = h.fs_write(i as usize * BLK, &vec![0xBBu8; BLK]).await.expect("write");
+            }
+            let _ = h.fs_flush().await.expect("flush 2");
+            let _ = h.fs_release().await.expect("release");
+        }
+        let mut h = open_rdwr(&client, tf.uri()).await;
+        for i in 0..N {
+            let blk = h.fs_block(i).await.expect("cold").expect("mapped");
+            assert_eq!(blk.as_slice()[0], 0xBB,
+                "block_mut-then-write: block {i} lost the edit");
+        }
+        let _ = h.fs_release().await.expect("release");
+        tf.cleanup(&client).await;
+    }
+}
+
+/// `fs_block_mut` must update `mtime`, like any other write. The
+/// already-cached fast path used to return without touching the inode.
+#[tokio::test]
+#[ignore]
+async fn block_mut_updates_mtime() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let mut h = open_rdwr(&client, tf.uri()).await;
+    {
+        let mut blk = h.fs_block_mut(0, true).await.expect("create").expect("created");
+        blk.as_mut_slice().fill(0x01);
+    }
+    let _ = h.fs_flush().await.expect("flush");
+    let before = h.fs_getattr().expect("getattr");
+
+    // mtime has 1-second granularity in `stat`, so wait it out rather
+    // than comparing nanoseconds.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // The block is cached now, so this takes the fast path.
+    {
+        let mut blk = h.fs_block_mut(0, false).await.expect("edit").expect("mapped");
+        blk.as_mut_slice().fill(0x02);
+    }
+    let after = h.fs_getattr().expect("getattr");
+
+    assert!(after.st_mtime > before.st_mtime,
+        "an in-place edit must move mtime: {} -> {}", before.st_mtime, after.st_mtime);
+
+    let _ = h.fs_flush().await.expect("flush");
+    let _ = h.fs_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
