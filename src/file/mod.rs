@@ -320,6 +320,22 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let _start = Instant::now();
 
         // 1. collect all dirty meta data
+        //
+        // Note the ordering constraint this imposes on everything that
+        // dirties a data block: this set is fixed *here*, before the
+        // loop below assigns pointers to data blocks. A bmap node that
+        // is not already dirty at this point is never written, so the
+        // pointer `bmap_assign_data_node` stores into it exists only in
+        // memory, and a cold reader keeps following the old one.
+        //
+        // So every path that puts a block into the dirty tier must also
+        // insert into the bmap for that index in the same flush window,
+        // which is what marks the containing node dirty. The write
+        // paths do it for every block they touch; see `block_mut` and
+        // `truncate_last_data_block` for two places where omitting it
+        // caused silent loss, visible only once the map had spilled out
+        // of the inode's inline root — below that the root travels with
+        // the inode, which every flush writes.
         let dirty_meta_vec = self.bmap_lookup_dirty();
         debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
             dirty_meta_vec.len(), dirty_data_blocks.len());
@@ -681,6 +697,22 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let _start = Instant::now();
 
         // 1. collect all dirty meta data
+        //
+        // Note the ordering constraint this imposes on everything that
+        // dirties a data block: this set is fixed *here*, before the
+        // loop below assigns pointers to data blocks. A bmap node that
+        // is not already dirty at this point is never written, so the
+        // pointer `bmap_assign_data_node` stores into it exists only in
+        // memory, and a cold reader keeps following the old one.
+        //
+        // So every path that puts a block into the dirty tier must also
+        // insert into the bmap for that index in the same flush window,
+        // which is what marks the containing node dirty. The write
+        // paths do it for every block they touch; see `block_mut` and
+        // `truncate_last_data_block` for two places where omitting it
+        // caused silent loss, visible only once the map had spilled out
+        // of the inode's inline root — below that the root travels with
+        // the inode, which every flush writes.
         let dirty_meta_vec = self.bmap_lookup_dirty();
         debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
             dirty_meta_vec.len(), dirty_data_blocks.len());

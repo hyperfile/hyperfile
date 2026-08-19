@@ -1532,6 +1532,18 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     async fn truncate_last_data_block(&mut self, blk_idx: &BlockIndex, offset_to_discard: usize) -> Result<bool> {
         debug!("truncate_last_data_block - block index {}, offset_to_discard {}", blk_idx, offset_to_discard);
         if self.cache.truncate_data_block(blk_idx, offset_to_discard) {
+            // The block is dirty now — `truncate_data_block` zeroed its
+            // tail and promoted it out of the clean tier if that is
+            // where it was — so the flush will give it a new pointer,
+            // and the bmap node holding that pointer has to be dirty
+            // *before* the flush starts collecting dirty meta nodes.
+            // Without this the zeroing is written to the new segment
+            // but the map still names the old one, and a cold reader
+            // sees the pre-truncate tail. Invisible while the map fits
+            // in the inode's inline root, which every flush writes.
+            // Same reason as the load path below, and as every write
+            // path.
+            let _ = self.bmap.insert(*blk_idx, BlockPtrFormat::dummy_value()).await?;
             return Ok(true);
         }
 

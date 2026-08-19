@@ -1618,6 +1618,81 @@ async fn smoke_truncate_shrink_drops_clean_cached_blocks() {
     tf.cleanup(&client).await;
 }
 
+/// A shrink *within* the current last block must persist its tail
+/// zeroing, including once the block map has spilled out of the
+/// inode's inline root.
+///
+/// This is a different code path from
+/// `smoke_truncate_shrink_drops_clean_cached_blocks` above, which
+/// crosses a block boundary and so goes through the bmap sweep.
+/// A same-block shrink (`tgt_blk_idx == cur_blk_idx`) instead zeroes
+/// the tail of one cached block in place, and used to return without
+/// marking the bmap. The flush then wrote the zeroed block to a new
+/// segment and updated the map in memory, but the node holding the new
+/// pointer was not in the set of dirty meta nodes the flush collects
+/// up front, so it was never persisted — a cold reader followed the
+/// old pointer and got the pre-truncate tail back.
+///
+/// Two things had to line up for it to be visible, which is why the
+/// existing truncate coverage missed it: the map must have spilled
+/// (below that the inline root rides along with the inode, which every
+/// flush writes), and the block must be *clean*, i.e. flushed, so that
+/// nothing else had already dirtied it.
+///
+/// Uses only the byte API.
+#[tokio::test]
+#[ignore]
+async fn smoke_truncate_same_block_tail_persists_after_bmap_spill() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const BLK: usize = 4096;
+    // Enough blocks that the map cannot be inline.
+    const FULL: usize = 30;
+    const TAIL: usize = 500;
+    const KEEP: usize = 100;
+
+    {
+        let mut hyper = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+
+        let size = FULL * BLK + TAIL;
+        let n = hyper.fs_write(0, &vec![0xABu8; size]).await.expect("write");
+        assert_eq!(n, size);
+        // Required: moves the last block into the clean tier.
+        let _ = hyper.fs_flush().await.expect("flush");
+
+        // Shrink inside block FULL, then flush that.
+        hyper.fs_truncate(FULL * BLK + KEEP).await.expect("shrink within the last block");
+        let _ = hyper.fs_flush().await.expect("flush after shrink");
+
+        // Grow back over the discarded region; it must be a hole now.
+        hyper.fs_truncate(FULL * BLK + TAIL).await.expect("grow back");
+        let _ = hyper.fs_flush().await.expect("flush after grow");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Cold reader: this is where the loss showed up. A warm read on the
+    // original handle sees the zeros regardless, because the block is
+    // still cached.
+    let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly())
+        .await.expect("reopen ro");
+    let mut buf = vec![0xFFu8; TAIL];
+    let n = hyper.fs_read(FULL * BLK, &mut buf).await.expect("read the last block");
+    assert_eq!(n, TAIL);
+    assert!(buf[0..KEEP].iter().all(|&b| b == 0xAB),
+        "the retained head of the block must survive the shrink");
+    let stale = buf[KEEP..].iter().filter(|&&b| b != 0).count();
+    assert_eq!(stale, 0,
+        "the region discarded by the shrink must read as zeros, found {} stale bytes (first={:#04x})",
+        stale, buf[KEEP..].iter().find(|&&b| b != 0).copied().unwrap_or(0));
+    let _ = hyper.fs_release().await;
+
+    tf.cleanup(&client).await;
+}
+
 /// POSIX: every write-side operation on a handle that was not
 /// opened for writing must fail with EBADF.
 ///
