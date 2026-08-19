@@ -183,8 +183,8 @@ impl LocalDiskCache {
     /// by hand left the `File` holding a descriptor that had already
     /// been handed back to the OS, which Rust's I/O safety checks
     /// abort on ("owned file descriptor already closed"). Combined
-    /// with `shutdown` and `Drop` both tearing down, releasing a file
-    /// that used this cache aborted the process.
+    /// with `shutdown` and `Drop` both tearing down, releasing a
+    /// file that used this cache aborted the process.
     fn teardown(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
         if self.closed.swap(true, Ordering::AcqRel) {
@@ -207,6 +207,18 @@ impl LocalDiskCache {
 }
 
 impl Cache for LocalDiskCache {
+    /// Grow the mapping to cover `bytes`, never shrink. See the
+    /// trait docs.
+    ///
+    /// Blocks in this tier are views at `addr + blk_idx *
+    /// data_block_size`, so a block index whose end offset is past
+    /// the mapping would be written outside it.
+    fn ensure_capacity(&self, bytes: usize) {
+        if bytes > self.size {
+            self.set_size(bytes);
+        }
+    }
+
     fn set_size(&self, new_size: usize) {
         let fd = self.file.as_raw_fd();
         let addr = self.addr as *mut libc::c_void;
@@ -271,6 +283,57 @@ impl Cache for LocalDiskCache {
         let mut dirty_block = self.new_dirty_block(blk_idx);
         dirty_block.copy(0, block.as_slice());
         self.data_blocks_dirty.insert(blk_idx, dirty_block)
+    }
+
+    /// Install a clean, freshly-loaded block in the LRU. See the
+    /// trait docs.
+    ///
+    /// The incoming block is a heap allocation, but this tier's
+    /// clean entries must be views into the backing file so that
+    /// eviction can reclaim their space with a hole punch. So the
+    /// bytes are copied into a file-backed view for the block's
+    /// index and the heap block is dropped.
+    ///
+    /// When the cache is disabled nothing is written to the file at
+    /// all, so unlike `clear_dirty` there is no hole to punch on the
+    /// way out.
+    /// Side-effect-free probe; see the trait docs. Notably this does
+    /// *not* mlock the block the way `get` does, which is the whole
+    /// reason it exists.
+    fn has(&self, blk_idx: &BlockIndex) -> bool {
+        if self.data_blocks_dirty.contains_key(blk_idx) {
+            return true;
+        }
+        self.data_cache_blocks > 0 && self.data_blocks_cache.contains(blk_idx)
+    }
+
+    /// Install a clean, freshly-loaded block in the LRU. See the
+    /// trait docs.
+    fn insert_clean(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock> {
+        if self.data_cache_blocks == 0 {
+            return Some(block);
+        }
+        debug_assert!(!block.is_dirty(), "insert_clean given a dirty block");
+        debug_assert!(!self.data_blocks_dirty.contains_key(&blk_idx));
+
+        // `new_dirty_block` is the only way to mint a view into the
+        // backing file; it hands back a dirty, locked block, so undo
+        // both once the bytes are in place. Order matters: `unlock`
+        // refuses to act on a block still marked dirty.
+        let mut cached = self.new_dirty_block(blk_idx);
+        cached.copy(0, block.as_slice());
+        cached.set_should_cache();
+        cached.clear_dirty();
+        cached.unlock();
+
+        if let Some((old_blk_idx, _)) = self.data_blocks_cache.push(blk_idx, cached) {
+            if old_blk_idx == blk_idx {
+                panic!("block already exists, failed to insert clean block index {} into data blocks cache", blk_idx);
+            } else {
+                self.discard(old_blk_idx);
+            }
+        }
+        None
     }
 
     fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {

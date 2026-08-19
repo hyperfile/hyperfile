@@ -4,6 +4,8 @@ use aws_sdk_s3::Client;
 use crate::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
 use crate::config::{HyperFileConfig, HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
+use crate::BlockIndex;
+use super::block::{BlockRef, BlockMut, BlockState};
 use super::hyper::Hyper;
 use super::flags::{HyperFileFlags, FileFlags};
 use super::mode::{HyperFileMode, FileMode};
@@ -213,6 +215,43 @@ impl<'a: 'static> Hyper<'a> {
     {
         debug!("fs_write_aligned_batch - batch count: {}", blocks.len());
         self.inner.write_aligned_batch(blocks).await
+    }
+
+    /// Borrow block `idx` for reading. See [`HyperFile::block`].
+    ///
+    /// `Ok(None)` means the block is not backed by data — no bmap
+    /// entry, or an explicit zero block. Use [`Self::fs_block_state`]
+    /// to tell those apart.
+    ///
+    /// [`HyperFile::block`]: crate::file::file::HyperFile::block
+    pub async fn fs_block(&mut self, idx: BlockIndex) -> Result<Option<BlockRef<'_>>>
+    {
+        debug!("fs_block - block index: {}", idx);
+        self.inner.block(idx).await
+    }
+
+    /// Borrow block `idx` for in-place modification. See
+    /// [`HyperFile::block_mut`].
+    ///
+    /// The block is dirty from acquisition; the next
+    /// [`Self::fs_flush`] persists it. `create` decides whether a
+    /// block with no data is materialized as zeros (`true`) or
+    /// reported as `Ok(None)` (`false`). `i_size` is not changed.
+    ///
+    /// [`HyperFile::block_mut`]: crate::file::file::HyperFile::block_mut
+    pub async fn fs_block_mut(&mut self, idx: BlockIndex, create: bool) -> Result<Option<BlockMut<'_>>>
+    {
+        debug!("fs_block_mut - block index: {}, create: {}", idx, create);
+        self.inner.block_mut(idx, create).await
+    }
+
+    /// How block `idx` is mapped. See [`BlockState`].
+    ///
+    /// One bmap lookup, no data transfer.
+    pub async fn fs_block_state(&mut self, idx: BlockIndex) -> Result<BlockState>
+    {
+        debug!("fs_block_state - block index: {}", idx);
+        self.inner.block_state(idx).await
     }
 
     pub async fn fs_write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize>

@@ -11,6 +11,7 @@ pub mod fs;
 pub mod fh;
 #[cfg(feature = "reactor")]
 pub mod tokio_wrapper;
+pub mod block;
 #[cfg(feature = "range-lock")]
 pub mod lock;
 mod state;

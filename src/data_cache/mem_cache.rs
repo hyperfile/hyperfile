@@ -45,6 +45,12 @@ impl Cache for MemCache {
         /* do nothing */
     }
 
+    /// No-op: blocks are keyed in a map, so there is no extent to
+    /// extend. See the trait docs.
+    fn ensure_capacity(&self, _: usize) {
+        /* do nothing */
+    }
+
     fn set_unlimited(&mut self) {
         self.data_blocks_cache.resize(NonZeroUsize::new(usize::MAX).unwrap());
     }
@@ -80,6 +86,33 @@ impl Cache for MemCache {
         // be sure block is not in cache list
         let _ = self.data_blocks_cache.pop(&blk_idx);
         self.data_blocks_dirty.insert(blk_idx, block)
+    }
+
+    /// Side-effect-free probe; see the trait docs. `LruCache::contains`
+    /// does not disturb recency, which is what "side-effect-free"
+    /// requires here.
+    fn has(&self, blk_idx: &BlockIndex) -> bool {
+        if self.data_blocks_dirty.contains_key(blk_idx) {
+            return true;
+        }
+        self.data_cache_blocks > 0 && self.data_blocks_cache.contains(blk_idx)
+    }
+
+    /// Install a clean, freshly-loaded block in the LRU. See the
+    /// trait docs.
+    fn insert_clean(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock> {
+        if self.data_cache_blocks == 0 {
+            // Nothing to keep it in. Hand it back so the caller can
+            // still use the bytes it just paid to load.
+            return Some(block);
+        }
+        debug_assert!(!block.is_dirty(), "insert_clean given a dirty block");
+        // A block being installed clean must not already be dirty
+        // under the same index; the caller probed the cache first.
+        debug_assert!(!self.data_blocks_dirty.contains_key(&blk_idx));
+        block.set_should_cache();
+        let _ = self.data_blocks_cache.put(blk_idx, block);
+        None
     }
 
     // remove a block
@@ -612,5 +645,103 @@ mod tests {
 
         cache.restore_limit();
         // after restore, capacity is back to 2 — next operations may evict
+    }
+
+    // --- has / insert_clean / ensure_capacity ---
+    //
+    // These back the block borrow API. `has` exists because neither
+    // `get` nor `contains` can be used to probe: on the local-disk
+    // tier `get` mlocks the block it returns and asserts it was not
+    // already locked, and `contains` promotes a clean block into the
+    // dirty tier.
+
+    #[test]
+    fn has_is_side_effect_free() {
+        let mut cache = new_cache();
+        assert!(!cache.has(&7), "empty cache must not claim to have a block");
+
+        // A dirty block is visible to `has`.
+        let blk = DataBlock::new(7, 4096);
+        blk.set_should_cache();
+        cache.insert(7, blk);
+        assert!(cache.has(&7));
+        assert_eq!(cache.dirty_count(), 1);
+
+        // Move it to the clean tier.
+        cache.clear_dirty();
+        assert_eq!(cache.dirty_count(), 0);
+
+        // Still visible, and *repeated* probes must not promote it
+        // back into the dirty tier the way `contains` would.
+        for _ in 0..3 {
+            assert!(cache.has(&7), "clean block must be visible to has()");
+        }
+        assert_eq!(cache.dirty_count(), 0,
+            "has() must not promote a clean block into the dirty tier");
+
+        // Contrast: `contains` does promote.
+        assert!(cache.contains(&7));
+        assert_eq!(cache.dirty_count(), 1, "contains() is expected to promote");
+    }
+
+    #[test]
+    fn insert_clean_populates_the_clean_tier() {
+        let mut cache = new_cache();
+        let mut block = cache.new_block(3);
+        block.copy(0, &[0xC1u8; 4096]);
+
+        assert!(cache.insert_clean(3, block).is_none(),
+            "an enabled cache must take the block");
+        assert!(cache.has(&3));
+        assert_eq!(cache.dirty_count(), 0,
+            "insert_clean must not make the block dirty");
+
+        // Readable, and still clean afterwards.
+        assert_eq!(cache.get(&3).expect("clean hit").as_slice()[0], 0xC1);
+        assert_eq!(cache.dirty_count(), 0);
+
+        // A later write borrow promotes it.
+        assert!(cache.get_mut(&3).is_some());
+        assert_eq!(cache.dirty_count(), 1);
+    }
+
+    #[test]
+    fn insert_clean_hands_the_block_back_when_disabled() {
+        // data_cache_blocks == 0 is what O_DIRECT without wal forces.
+        // There is nowhere to keep a clean block, so the caller must
+        // get it back rather than silently lose the bytes it loaded.
+        let mut cache = MemCache::new(0, 4096);
+        let mut block = cache.new_block(1);
+        block.copy(0, &[0xD2u8; 4096]);
+
+        let returned = cache.insert_clean(1, block);
+        let returned = returned.expect("a disabled cache must return the block");
+        assert_eq!(returned.index(), 1);
+        assert_eq!(returned.as_slice()[0], 0xD2, "returned block must keep its contents");
+        assert!(!cache.has(&1), "nothing should have been cached");
+    }
+
+    #[test]
+    fn insert_clean_marks_should_cache() {
+        // Without should_cache, clear_dirty drops the block instead of
+        // keeping it, so a block that arrived via insert_clean and was
+        // later dirtied would not survive a flush.
+        let mut cache = new_cache();
+        let block = cache.new_block(5);
+        assert!(cache.insert_clean(5, block).is_none());
+        assert!(cache.get(&5).expect("clean hit").is_should_cache());
+
+        let _ = cache.get_mut(&5).expect("promote");
+        cache.clear_dirty();
+        assert!(cache.has(&5), "block should survive clear_dirty");
+    }
+
+    #[test]
+    fn ensure_capacity_is_a_noop_for_mem_cache() {
+        // The in-memory tier keys blocks in a map and has no extent,
+        // so an arbitrarily high block index is fine.
+        let cache = new_cache();
+        cache.ensure_capacity(usize::MAX);
+        cache.ensure_capacity(0);
     }
 }

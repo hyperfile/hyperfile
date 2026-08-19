@@ -12,11 +12,56 @@ use self::{mem_cache::MemCache, local_disk_cache::LocalDiskCache};
 
 pub(crate) trait Cache {
     fn set_size(&self, size: usize);
+    /// Make sure the cache can hold a block whose end offset is
+    /// `bytes`, growing but never shrinking.
+    ///
+    /// `set_size` is absolute and is driven by `i_size`, which is
+    /// fine for the byte write paths because they only ever cache
+    /// blocks inside the file. The block borrow API can cache a
+    /// block above EOF — it deliberately does not move `i_size` —
+    /// so it needs a way to extend the cache's addressable range on
+    /// its own. Growth only: calling `set_size` with a smaller value
+    /// would unmap storage still referenced by cached blocks.
+    ///
+    /// A no-op for the in-memory cache, which addresses blocks by
+    /// map key and has no extent.
+    fn ensure_capacity(&self, bytes: usize);
     fn set_unlimited(&mut self);
     fn restore_limit(&mut self);
     fn new_block(&self, blk_idx: BlockIndex) -> DataBlock;
     fn get(&mut self, blk_idx: &BlockIndex) -> Option<&DataBlock>;
+    /// Side-effect-free membership test across both tiers.
+    ///
+    /// Unlike `contains`, which promotes a clean block into the
+    /// dirty tier, and unlike `get`, which on the local-disk tier
+    /// mlocks the block it returns, this only answers the question.
+    /// Needed by the read-borrow path, which must decide whether to
+    /// load *before* taking the borrow it intends to hand out,
+    /// because `get` cannot be called twice on the same clean block
+    /// without tripping the lock assertion.
+    fn has(&self, blk_idx: &BlockIndex) -> bool;
     fn insert(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock>;
+    /// Install a freshly-loaded, **clean** block in the read cache.
+    ///
+    /// `insert` places a block in the dirty tier, so it is the wrong
+    /// entry point for a block that was just read from staging and
+    /// must not be written back. Until the block borrow API
+    /// (`HyperFile::block`) there was no such caller: the byte read
+    /// path loads straight into the caller's buffer and never
+    /// caches, so the clean tier was populated only by `clear_dirty`
+    /// handing over blocks that had just been flushed.
+    ///
+    /// Each tier stores the block in its own representation — the
+    /// local-disk tier copies the bytes into its backing file so
+    /// that eviction can reclaim them with a hole punch — so
+    /// ownership is taken.
+    ///
+    /// Returns the block back as `Some` when it could **not** be
+    /// cached, which happens when the data cache is disabled
+    /// (`data_cache_blocks == 0`, as `O_DIRECT` without `wal`
+    /// forces). Callers that need the bytes regardless must use the
+    /// returned block; there is nothing in the cache to borrow.
+    fn insert_clean(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock>;
     fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock>;
     fn contains(&mut self, blk_idx: &BlockIndex) -> bool;
     fn get_mut(&mut self, blk_idx: &BlockIndex) -> Option<&mut DataBlock>;

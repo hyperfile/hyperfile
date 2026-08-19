@@ -17,6 +17,7 @@ tests/
 ├── integration_s3_contract.rs               ← flush contract (invariant) tests
 ├── integration_s3_concurrent.rs             ← multi-instance concurrency
 ├── integration_s3_segment_open.rs           ← segment summary read (`open`)
+├── integration_s3_block_api.rs              ← block borrow API (`fs_block*`)
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
 ├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
 ├── integration_reactor_s3_wal.rs            ← reactor + wal
@@ -220,6 +221,43 @@ cargo test --test integration_s3_segment_open -- --ignored --test-threads=1
 ```
 
 Runs in ~1 s.
+
+### `integration_s3_block_api`
+
+Covers `fs_block` / `fs_block_mut` / `fs_block_state`, which let a
+caller borrow a cached data block instead of copying it through
+`fs_read` / `fs_write`. Asserts the semantics a block-storage
+consumer relies on: the borrow is the cache's own buffer, a hole is
+distinguishable from a block of zeros (which `fs_read` cannot do),
+an in-place modification is persisted by the next flush with no
+write-back call, repeated borrows inside one flush window produce a
+single checkpoint, `i_size` is untouched, and access mode is
+enforced in both directions.
+
+Runs the same round trip under all three data cache configurations,
+because the borrow API does materially different work in each:
+
+- default in-memory cache;
+- local-disk cache, where clean blocks are views into a backing file,
+  `Cache::get` mlocks the block it hands out, and eviction punches a
+  hole;
+- data cache disabled (`data_cache_blocks = 0`, which `O_DIRECT`
+  without `wal` forces), where there is nothing to borrow and
+  `fs_block` falls back to owning the block it loaded.
+
+**Run this one under debug assertions as well as release.** Both
+cache tiers carry `debug_assert!`s about block dirty state, and the
+local-disk tier asserts outright that a clean block handed out by
+`get` was not already locked — which is what makes the borrow
+guards' `Drop` load-bearing.
+
+Note the local-disk case creates a block in a hole *inside* `i_size`.
+That tier addresses cached blocks as offsets into a mapping sized
+from `i_size` and cannot grow the mapping in place, so a block above
+EOF is not representable there; that case runs on the in-memory
+cache instead.
+
+Runs in ~2 s.
 
 ### `integration_reactor_s3_smoke`
 

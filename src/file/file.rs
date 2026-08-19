@@ -34,6 +34,7 @@ use crate::wal::{WalReadWrite, WalChunkDesc};
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::inode::OnDiskState;
 use crate::data_cache::Cache;
+use super::block::{BlockRef, BlockMut, BlockState};
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks, FlushTiming};
@@ -1012,6 +1013,220 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Err(e);
         }
         Ok(bytes_write)
+    }
+
+    /// End offset of block `blk_idx`, i.e. the number of bytes the
+    /// data cache must be able to address to hold it.
+    ///
+    /// The block borrow API can cache a block above `i_size`, which
+    /// the byte paths never do, and the local-disk cache addresses
+    /// blocks as an offset into a mapping sized from `i_size`. So the
+    /// cache has to be told about the block's extent explicitly; see
+    /// `Cache::ensure_capacity`.
+    fn block_end_offset(&self, blk_idx: BlockIndex) -> usize {
+        (blk_idx as usize + 1) * self.config.meta.data_block_size
+    }
+
+    /// How block `blk_idx` is mapped. See [`BlockState`].
+    ///
+    /// Cheap: one bmap lookup, no data transfer. A block that is
+    /// dirty in cache reports [`BlockState::Mapped`], because the
+    /// write paths install a bmap entry when they dirty a block.
+    pub async fn block_state(&mut self, blk_idx: BlockIndex) -> Result<BlockState> {
+        if !self.flags.is_readable() {
+            return Err(Self::ebadf_bad_access_mode());
+        }
+        self.block_state_inner(blk_idx).await
+    }
+
+    /// `block_state` without the access-mode check, for in-crate
+    /// callers that have already established their own.
+    async fn block_state_inner(&mut self, blk_idx: BlockIndex) -> Result<BlockState> {
+        match self.bmap.lookup(&blk_idx).await {
+            Ok(blk_ptr) => {
+                if BlockPtrFormat::is_zero_block(&blk_ptr) {
+                    Ok(BlockState::Zero)
+                } else {
+                    Ok(BlockState::Mapped)
+                }
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(BlockState::Unmapped),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Borrow block `blk_idx` for reading, loading it from staging
+    /// if it is not already cached.
+    ///
+    /// Returns `Ok(None)` when the block is not backed by data —
+    /// either no bmap entry at all or an explicit zero block. That
+    /// is deliberately *not* the same as "reads as zeros", which is
+    /// all the byte API can tell you; use [`Self::block_state`] to
+    /// tell the two hole flavors apart.
+    ///
+    /// The returned slice is the cache's buffer, not a copy, and is
+    /// exactly `data_block_size` bytes. The guard borrows `self`,
+    /// so no flush, eviction or other file operation can run while
+    /// it is alive.
+    ///
+    /// Unlike `read`, this does not stop at `i_size`: a block above
+    /// EOF that holds data (which only this API can produce, see
+    /// [`Self::block_mut`]) is returned. Also unlike `read`, this
+    /// does not update `atime`.
+    pub async fn block(&mut self, blk_idx: BlockIndex) -> Result<Option<BlockRef<'_>>> {
+        if !self.flags.is_readable() {
+            return Err(Self::ebadf_bad_access_mode());
+        }
+
+        // Probe before borrowing. `Cache::has` is the only
+        // side-effect-free test: on the local-disk tier `get` mlocks
+        // the block it returns and asserts it was not already
+        // locked, so it cannot be called twice for one clean block,
+        // and `contains` would promote the block into the dirty
+        // tier. Checked ahead of the bmap so that a dirty block
+        // whose bmap entry is still a placeholder is served from
+        // cache.
+        if self.cache.has(&blk_idx) {
+            let block = self.cache.get(&blk_idx)
+                .expect("cache lost a block between has() and get() under &mut self");
+            return Ok(Some(BlockRef::cached(block)));
+        }
+
+        // Not cached: consult the bmap.
+        let blk_ptr = match self.bmap.lookup(&blk_idx).await {
+            Ok(p) => p,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if BlockPtrFormat::is_zero_block(&blk_ptr) {
+            return Ok(None);
+        }
+
+        // Backed by real data in staging. Load a whole block into a
+        // fresh buffer, the same shape the byte read path uses for a
+        // cache miss.
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        let block = self.cache.new_block(blk_idx);
+        let buf = block.as_mut_slice();
+        let res = self.load_data_block_read_path(blk_idx, blk_ptr, 0, buf).await;
+        drop(permit);
+        res?;
+
+        // Keep it for the next reader if the cache will take it.
+        // With the data cache disabled it comes straight back and the
+        // guard owns it.
+        self.cache.ensure_capacity(self.block_end_offset(blk_idx));
+        match self.cache.insert_clean(blk_idx, block) {
+            None => {
+                let block = self.cache.get(&blk_idx)
+                    .expect("block just installed in the clean tier is missing");
+                Ok(Some(BlockRef::cached(block)))
+            },
+            Some(block) => Ok(Some(BlockRef::owned(block))),
+        }
+    }
+
+    /// Borrow block `blk_idx` for modification, loading it from
+    /// staging if it is not already cached.
+    ///
+    /// The block is marked dirty at acquisition, so writes through
+    /// the guard need no write-back call and cannot be lost by an
+    /// early return between acquire and drop. The next `flush`
+    /// persists it. Borrowing the same block any number of times
+    /// within one flush window produces exactly one new version,
+    /// matching `write`.
+    ///
+    /// `create` decides what happens for a block that is not backed
+    /// by data: `false` returns `Ok(None)`, `true` materializes a
+    /// zero-filled block and returns a guard for it. A created
+    /// block is guaranteed zeroed on both cache tiers.
+    ///
+    /// `i_size` is left alone — see the [module docs](super::block)
+    /// for why, and for the consequence that a block above EOF is
+    /// durable but unreachable through `read`. `i_blocks` is
+    /// updated when a new bmap entry appears.
+    ///
+    /// A flush may be triggered on entry if the dirty set is
+    /// already over threshold. It cannot be triggered on drop,
+    /// since `Drop` cannot await, so a caller that dirties blocks
+    /// only through this API and never calls `flush` will grow the
+    /// dirty set without bound.
+    pub async fn block_mut(&mut self, blk_idx: BlockIndex, create: bool) -> Result<Option<BlockMut<'_>>> {
+        if !self.flags.is_writable() {
+            return Err(Self::ebadf_bad_access_mode());
+        }
+
+        // Flush here if we are already over threshold: `Drop` is
+        // not async, so this is the only point at which the guard
+        // API can honor the auto-flush contract the byte writes
+        // have.
+        if let Err(e) = self.try_flush().await {
+            let _ = self.rollback_from_persisted().await;
+            return Err(e);
+        }
+
+        // Fast path: already cached. `Cache::get_mut` moves a clean
+        // block into the dirty tier, which is what we want, but
+        // probe with the side-effect-free `has` first so `get_mut`
+        // is called exactly once.
+        if self.cache.has(&blk_idx) {
+            let block = self.cache.get_mut(&blk_idx)
+                .expect("cache lost a block between has() and get_mut() under &mut self");
+            // Normalize the dirty flag across cache tiers: the
+            // local-disk `get_mut` sets it, the in-memory one only
+            // moves the block into the dirty map.
+            block.set_dirty();
+            // Retain the block in the read cache once flushed.
+            // A full-block byte write deliberately does not, so that
+            // streaming writes do not evict the read cache, but this
+            // API exists for callers that read-modify-write the same
+            // blocks repeatedly.
+            block.set_should_cache();
+            return Ok(Some(BlockMut::new(block)));
+        }
+
+        // Not cached: decide between loading, creating, or nothing.
+        let state = self.block_state_inner(blk_idx).await?;
+        if state.is_hole() && !create {
+            return Ok(None);
+        }
+
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        // `new_block` allocates zeroed, which is what a created
+        // block needs and also the correct starting point for an
+        // explicit zero block being materialized. Deliberately not
+        // the cache's own new-dirty-block path, which on the
+        // local-disk tier hands back an unzeroed view of the cache
+        // file.
+        let block = self.cache.new_block(blk_idx);
+        if state.is_mapped() {
+            let blk_ptr = self.bmap.lookup(&blk_idx).await?;
+            let buf = block.as_mut_slice();
+            if let Err(e) = self.load_data_block_write_path(blk_idx, blk_ptr, 0, buf).await {
+                drop(permit);
+                return Err(e);
+            }
+        }
+
+        // Install as dirty and give the bmap a placeholder so flush
+        // knows to assign a real pointer for this index.
+        self.cache.ensure_capacity(self.block_end_offset(blk_idx));
+        let None = self.cache.insert(blk_idx, block) else {
+            panic!("BlockIndex {} already on the dirty list", blk_idx);
+        };
+        let prev = self.bmap.insert(blk_idx, BlockPtrFormat::dummy_value()).await?;
+        if prev.is_none() {
+            let data_block_size = self.config.meta.data_block_size;
+            self.inode.update_blocks(data_block_size as isize);
+        }
+        self.inode.update_mtime();
+        drop(permit);
+
+        let block = self.cache.get_mut(&blk_idx)
+            .expect("block just inserted into the dirty tier is missing");
+        block.set_dirty();
+        block.set_should_cache();
+        Ok(Some(BlockMut::new(block)))
     }
 
     pub(crate) fn need_flush(&self) -> bool {
