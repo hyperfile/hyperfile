@@ -15,6 +15,13 @@ pub(crate) struct LocalDiskCache {
     addr: u64, // acturallly *mut libc::c_void
     size: usize,
     file: std::fs::File,
+    /// Whether the mapping has already been torn down.
+    ///
+    /// `Cache::shutdown` and `Drop` both tear the cache down, and
+    /// `shutdown` is the normal path on release, so `Drop` almost
+    /// always runs second. Without this the second teardown would
+    /// `msync`/`munmap` an address that is no longer mapped.
+    closed: std::sync::atomic::AtomicBool,
     pub(crate) data_blocks_cache: LruCache<BlockIndex, DataBlock>,
     pub(crate) data_blocks_dirty: BTreeMap<BlockIndex, DataBlock>, // index by block uid
     pub(crate) data_cache_blocks: usize,
@@ -30,8 +37,12 @@ impl fmt::Display for LocalDiskCache {
 
 impl Drop for LocalDiskCache {
     fn drop(&mut self) {
-        self.sync().expect("local disk cache - failed to sync data");
-        self.close().expect("local disk cache - failed to close cache");
+        // Best-effort: a failure here cannot be reported, and
+        // panicking in `Drop` would abort if we are already
+        // unwinding. `shutdown` is the path that surfaces errors.
+        if let Err(e) = self.teardown() {
+            warn!("local disk cache - teardown during drop failed: {}", e);
+        }
     }
 }
 
@@ -78,6 +89,7 @@ impl LocalDiskCache {
             addr: addr as u64,
             size,
             file,
+            closed: std::sync::atomic::AtomicBool::new(false),
             data_blocks_cache,
             data_blocks_dirty,
             data_cache_blocks,
@@ -121,6 +133,7 @@ impl LocalDiskCache {
             addr: addr as u64,
             size,
             file,
+            closed: std::sync::atomic::AtomicBool::new(false),
             data_blocks_cache,
             data_blocks_dirty,
             data_cache_blocks,
@@ -163,26 +176,28 @@ impl LocalDiskCache {
         }
     }
 
-    pub(crate) fn sync(&self) -> Result<()> {
+    /// Sync and unmap, exactly once.
+    ///
+    /// The file descriptor is deliberately *not* closed here. It is
+    /// owned by `self.file`, whose own `Drop` closes it; closing it
+    /// by hand left the `File` holding a descriptor that had already
+    /// been handed back to the OS, which Rust's I/O safety checks
+    /// abort on ("owned file descriptor already closed"). Combined
+    /// with `shutdown` and `Drop` both tearing down, releasing a file
+    /// that used this cache aborted the process.
+    fn teardown(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         let ret = unsafe {
             libc::msync(self.addr as *mut libc::c_void, self.size, libc::MS_SYNC | libc::MS_INVALIDATE)
         };
         if ret != 0 {
             return Err(Error::last_os_error());
         }
-        Ok(())
-    }
-
-    pub(crate) fn close(&self) -> Result<()> {
         let ret = unsafe {
             libc::munmap(self.addr as *mut libc::c_void, self.size)
-        };
-        if ret != 0 {
-            return Err(Error::last_os_error());
-        }
-        let fd = self.file.as_raw_fd();
-        let ret = unsafe {
-            libc::close(fd)
         };
         if ret != 0 {
             return Err(Error::last_os_error());
@@ -446,7 +461,6 @@ impl Cache for LocalDiskCache {
     }
 
     fn shutdown(&self) {
-        self.sync().expect("local disk cache - failed to sync data");
-        self.close().expect("local disk cache - failed to close cache");
+        self.teardown().expect("local disk cache - failed to tear down cache");
     }
 }
