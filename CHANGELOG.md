@@ -9,6 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.5.1] - 2026-08-19
+
+> **If you used `fs_block_mut` or `fh_with_block_mut` on 0.5.0, some of
+> those edits may never have been persisted.** See the first entry
+> below. Data written through the byte API is unaffected. There is no
+> way to recover a lost edit after the fact — the segment holding it was
+> written, but nothing points at it — so re-apply anything you cannot
+> verify.
+
+### Fixed
+
+- **`fs_block_mut` silently lost an in-place edit of an already-cached
+  block, for any reader that had not made the edit.** The flush returned
+  `Ok` and wrote a segment, a read on the same handle returned the new
+  bytes, and a fresh open returned the *previous* version. No error was
+  reported anywhere.
+
+  `block_mut` had a fast path for a block already in the cache: promote
+  it into the dirty tier, mark it dirty, return — without touching the
+  block map. `flush_process_build_segment` collects the set of dirty
+  meta nodes *before* it assigns pointers to data blocks, so a map node
+  that is not already dirty when the flush starts is never written: the
+  pointer the flush stored existed only in memory, and the persisted map
+  still named the old segment. The byte write paths avoid this by
+  inserting a placeholder for every block they dirty, which is what
+  marks the containing node dirty; the fast path skipped exactly that.
+
+  Two things hid it. While the whole map still fitted in the inode's
+  inline root the update rode along with the inode, which every flush
+  writes, so it only appeared past the spill threshold — 7 blocks from
+  index 0, 4 from a large index. And any byte write in the same flush
+  window masked it, because that write marked the node for every
+  block-API edit sitting beside it. A caller that happens to write one
+  structure of its own through the byte API on every commit would never
+  have seen it.
+
+  Reported against 0.5.0 with a reproduction; the block API was
+  introduced in 0.5.0, so no earlier release is affected.
+
+- **A shrinking `truncate` within the current last block lost its tail
+  zeroing** the same way, and for the same reason:
+  `truncate_last_data_block` returned early when the block was already
+  cached, leaving it dirty but the map node clean. The discarded region
+  read back as the pre-truncate bytes after a reopen.
+
+  This one predates the block API and is reachable through the byte API
+  alone. It produces the same symptom as the truncate bug fixed in
+  0.4.3, by a different route: 0.4.3 was a cross-block shrink going
+  through the bmap sweep, this is a shrink that stays inside one block.
+  Existing truncate coverage missed it because every case wrote few
+  enough blocks to keep the map inline.
+
+- `fs_block_mut` did not update `mtime` when the block was already
+  cached.
+
+### Changed
+
+- The ordering constraint behind both defects is now recorded at both
+  `bmap_lookup_dirty` call sites in the flush path: any path that puts a
+  block into the dirty tier must insert into the bmap for that index in
+  the same flush window. Neither of the two places that violated it
+  looked wrong on its own, and one of them carried a comment asserting
+  the opposite.
+
+### Tests
+
+- `block_mut_edit_survives_after_the_bmap_spills`: 8 and 30 blocks from
+  index 0, and 8 from index 33554432; every block edited, every block
+  checked after a reopen.
+- `block_mut_and_byte_writes_interoperate_after_a_spill`: a block first
+  written by `fs_write` then edited in place, and the reverse.
+- `block_mut_updates_mtime`.
+- `smoke_truncate_same_block_tail_persists_after_bmap_spill`: byte API
+  only.
+- Each was verified to fail with its fix reverted.
+
 ## [0.5.0] - 2026-08-19
 
 ### Added
