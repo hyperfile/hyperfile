@@ -18,6 +18,7 @@ tests/
 ├── integration_s3_concurrent.rs             ← multi-instance concurrency
 ├── integration_s3_segment_open.rs           ← segment summary read (`open`)
 ├── integration_s3_block_api.rs              ← block borrow API (`fs_block*`)
+├── integration_s3_local_disk_cache.rs       ← local-disk data cache tier
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
 ├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
 ├── integration_reactor_s3_wal.rs            ← reactor + wal
@@ -256,6 +257,22 @@ That tier addresses cached blocks as offsets into a mapping sized
 from `i_size` and cannot grow the mapping in place, so a block above
 EOF is not representable there; that case runs on the in-memory
 cache instead.
+
+Runs in ~2 s.
+
+### `integration_s3_local_disk_cache`
+
+The only suite that selects `HyperFileDataCacheConfig::LocalDisk` for
+the **data** cache. That tier keeps blocks in a memory-mapped file;
+because nothing exercised it, four separate defects lived there
+undetected, including memory corruption on an extending write and a
+process abort on release. See the suite's module docs.
+
+Covers: creating an empty file on that tier, releasing it repeatedly
+without aborting, writing far past EOF, a 4 TiB sparse address space,
+slot recycling under constant eviction, truncate releasing slots
+without leaving stale bytes, and exhausting the slot pool so blocks
+fall back to heap allocations.
 
 Runs in ~2 s.
 

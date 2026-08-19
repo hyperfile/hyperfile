@@ -395,16 +395,11 @@ use hyperfile::staging::config::StagingConfig;
 /// The file is created and populated with the default cache first,
 /// then reopened with the configuration under test. That makes the
 /// borrowed blocks come from staging rather than from the dirty tier,
-/// which is the interesting path, and it avoids an unrelated defect:
-/// the local-disk cache mmaps the file's size at open, and
-/// `mmap(len=0)` is `EINVAL`, so that tier cannot create an empty
-/// file.
+/// which is the interesting path.
 ///
-/// `create_idx` is the index used for the create-in-a-hole case. It
-/// must be inside `i_size` for the local-disk tier, which addresses
-/// cached blocks as offsets into a mapping sized from `i_size` and
-/// cannot grow that mapping in place. Blocks above EOF are covered
-/// by `block_mut_leaves_i_size_alone` on the default cache.
+/// `create_idx` is the index used for the create-in-a-hole case, and
+/// is deliberately different per tier so that both a hole inside
+/// `i_size` and one above EOF are covered.
 async fn round_trip_with_cache(
     cache: HyperFileDataCacheConfig,
     data_cache_blocks: usize,
@@ -511,9 +506,9 @@ async fn block_api_on_local_disk_cache() {
     round_trip_with_cache(
         HyperFileDataCacheConfig::new_local_disk(Some(&dir), None),
         64,
-        // Inside i_size: this tier cannot address a block past the
-        // end of its mapping, and cannot grow the mapping in place.
-        6,
+        // Above EOF, to prove the tier no longer ties its mapping to
+        // the file's size.
+        40,
         "local-disk cache",
     ).await;
     let _ = std::fs::remove_dir_all(&dir);

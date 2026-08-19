@@ -45,11 +45,6 @@ impl Cache for MemCache {
         /* do nothing */
     }
 
-    /// No-op: blocks are keyed in a map, so there is no extent to
-    /// extend. See the trait docs.
-    fn ensure_capacity(&self, _: usize) {
-        /* do nothing */
-    }
 
     fn set_unlimited(&mut self) {
         self.data_blocks_cache.resize(NonZeroUsize::new(usize::MAX).unwrap());
@@ -116,10 +111,11 @@ impl Cache for MemCache {
     }
 
     // remove a block
-    fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {
+    fn remove(&mut self, blk_idx: &BlockIndex) -> bool {
         // be sure block is not in cache list
-        let _ = self.data_blocks_cache.pop(&blk_idx);
-        self.data_blocks_dirty.remove(blk_idx)
+        let in_clean = self.data_blocks_cache.pop(&blk_idx).is_some();
+        let in_dirty = self.data_blocks_dirty.remove(blk_idx).is_some();
+        in_clean || in_dirty
     }
 
     // test if block of index need to be retrieve
@@ -321,7 +317,7 @@ mod tests {
         assert!(!c.truncate_data_block(&0, 100));
 
         // remove and insert pop the clean tier unconditionally.
-        assert!(c.remove(&0).is_none());
+        assert!(!c.remove(&0), "nothing cached, so nothing to remove");
         assert!(c.insert(0, DataBlock::new(0, 4096)).is_none());
         assert_eq!(c.dirty_count(), 1);
 
@@ -596,8 +592,7 @@ mod tests {
     fn remove_from_dirty() {
         let mut cache = new_cache();
         cache.insert(0, DataBlock::new(0, 4096));
-        let removed = cache.remove(&0);
-        assert!(removed.is_some());
+        assert!(cache.remove(&0), "remove should report the block was there");
         assert_eq!(cache.dirty_count(), 0);
     }
 
@@ -734,14 +729,5 @@ mod tests {
         let _ = cache.get_mut(&5).expect("promote");
         cache.clear_dirty();
         assert!(cache.has(&5), "block should survive clear_dirty");
-    }
-
-    #[test]
-    fn ensure_capacity_is_a_noop_for_mem_cache() {
-        // The in-memory tier keys blocks in a map and has no extent,
-        // so an arbitrarily high block index is fine.
-        let cache = new_cache();
-        cache.ensure_capacity(usize::MAX);
-        cache.ensure_capacity(0);
     }
 }

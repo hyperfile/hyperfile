@@ -200,7 +200,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             bmap_ud: bmap_ud,
             cache: crate::data_cache::cache_from_config(
                 &config.data_cache,
-                0,
+                max_dirty_blocks,
                 data_cache_blocks,
                 config.meta.data_block_size,
             )?,
@@ -309,7 +309,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             bmap_ud: bmap_ud,
             cache: crate::data_cache::cache_from_config(
                 &config.data_cache,
-                inode.size(),
+                max_dirty_blocks,
                 data_cache_blocks,
                 config.meta.data_block_size,
             )?,
@@ -637,11 +637,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let block_remaining = data_block_size - block_off;
             let dst_len = block_remaining.min(buf_len - consumed);
 
-            // Cache check first — `cache.get` does NOT promote
-            // clean→dirty (only `contains` does), so this is a
-            // safe peek with a side-effect of bumping LRU on
-            // clean hits, which mirrors the pre-coalescing read.
-            let cache_hit = self.cache.get(&blk_idx).is_some();
+            // Cache check first. This must be a side-effect-free
+            // probe: `get` would hand out the block, which on the
+            // local-disk tier mlocks it and asserts on the next `get`
+            // that it was not already locked — so planning with `get`
+            // and then executing with `get` panicked on any clean-tier
+            // hit. `contains` is also unusable here, since it promotes
+            // a clean block into the dirty tier.
+            let cache_hit = self.cache.has(&blk_idx);
             if cache_hit {
                 flush_range(&mut ops, &mut current_range);
                 ops.push(ReadOp::Cache {
@@ -1015,18 +1018,6 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(bytes_write)
     }
 
-    /// End offset of block `blk_idx`, i.e. the number of bytes the
-    /// data cache must be able to address to hold it.
-    ///
-    /// The block borrow API can cache a block above `i_size`, which
-    /// the byte paths never do, and the local-disk cache addresses
-    /// blocks as an offset into a mapping sized from `i_size`. So the
-    /// cache has to be told about the block's extent explicitly; see
-    /// `Cache::ensure_capacity`.
-    fn block_end_offset(&self, blk_idx: BlockIndex) -> usize {
-        (blk_idx as usize + 1) * self.config.meta.data_block_size
-    }
-
     /// How block `blk_idx` is mapped. See [`BlockState`].
     ///
     /// Cheap: one bmap lookup, no data transfer. A block that is
@@ -1115,7 +1106,6 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // Keep it for the next reader if the cache will take it.
         // With the data cache disabled it comes straight back and the
         // guard owns it.
-        self.cache.ensure_capacity(self.block_end_offset(blk_idx));
         match self.cache.insert_clean(blk_idx, block) {
             None => {
                 let block = self.cache.get(&blk_idx)
@@ -1210,7 +1200,6 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         // Install as dirty and give the bmap a placeholder so flush
         // knows to assign a real pointer for this index.
-        self.cache.ensure_capacity(self.block_end_offset(blk_idx));
         let None = self.cache.insert(blk_idx, block) else {
             panic!("BlockIndex {} already on the dirty list", blk_idx);
         };

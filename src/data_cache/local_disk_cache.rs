@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::path::Path;
 use std::os::fd::AsRawFd;
 use std::num::NonZeroUsize;
@@ -11,9 +11,43 @@ use crate::buffer::DataBlock;
 use crate::file::DirtyDataBlocks;
 use super::Cache;
 
+/// Block cache backed by a memory-mapped file on local disk.
+///
+/// # Addressing
+///
+/// The mapping is a fixed pool of block-sized **slots**, and a block
+/// occupies whichever slot was free when it entered the cache. It is
+/// deliberately *not* a 1:1 map of the file's address space.
+///
+/// Addressing cached blocks as `addr + blk_idx * data_block_size`,
+/// as this tier used to, ties the mapping's size to the file's size
+/// and breaks in four ways: a new file has size zero and `mmap`
+/// rejects a zero length; a write past the current EOF mints a view
+/// outside the mapping, because the cache is told the new size only
+/// after the blocks are created; growing the mapping in place is not
+/// something `mremap` can promise, and letting it move would dangle
+/// every view already handed out; and a sparse file with a large
+/// address space cannot be mapped at all, since the mapping would
+/// have to span the whole space rather than the resident blocks.
+///
+/// With a slot pool the mapping's size depends only on how many
+/// blocks the cache may hold, so none of those apply, and a block
+/// index is never used as an offset.
+///
+/// When the pool is exhausted — the dirty set can transiently exceed
+/// its threshold, since one large write dirties every block it
+/// touches before the flush check runs — blocks fall back to heap
+/// allocations. That costs memory rather than correctness; such
+/// blocks simply have no slot to release.
 pub(crate) struct LocalDiskCache {
     addr: u64, // acturallly *mut libc::c_void
+    /// Length of the mapping, i.e. `nslots * data_block_size`. Fixed
+    /// at construction.
     size: usize,
+    /// Number of block-sized slots in the mapping.
+    nslots: usize,
+    /// Free slot indices, used as a stack.
+    free_slots: Vec<u32>,
     file: std::fs::File,
     /// Whether the mapping has already been torn down.
     ///
@@ -30,8 +64,9 @@ pub(crate) struct LocalDiskCache {
 
 impl fmt::Display for LocalDiskCache {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "  data cache blocks limit: {}, data lru cache size: {}, data dirty size: {}",
-            self.data_cache_blocks, self.data_blocks_cache.len(), self.data_blocks_dirty.len())
+        write!(f, "  data cache blocks limit: {}, data lru cache size: {}, data dirty size: {}, free slots: {}/{}",
+            self.data_cache_blocks, self.data_blocks_cache.len(), self.data_blocks_dirty.len(),
+            self.free_slots.len(), self.nslots)
     }
 }
 
@@ -47,15 +82,41 @@ impl Drop for LocalDiskCache {
 }
 
 impl LocalDiskCache {
-    pub(crate) fn new(file_path: impl AsRef<Path>, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Self> {
+    /// Number of slots to provide beyond the clean-tier capacity.
+    ///
+    /// Dirty blocks live in the same mapping as clean ones, and the
+    /// dirty set is bounded by the flush threshold rather than by
+    /// `data_cache_blocks`, so the pool needs room for both. Anything
+    /// past this falls back to heap blocks.
+    const DIRTY_SLOT_HEADROOM: usize = 1024;
+
+    fn pool_slots(data_cache_blocks: usize, max_dirty_blocks: usize) -> usize {
+        // At least one slot: `mmap` rejects a zero length, which is
+        // what a freshly created (empty) file used to produce.
+        (data_cache_blocks + max_dirty_blocks + Self::DIRTY_SLOT_HEADROOM).max(1)
+    }
+
+    pub(crate) fn open_or_create(
+        file_path: impl AsRef<Path>,
+        max_dirty_blocks: usize,
+        data_cache_blocks: usize,
+        data_block_size: usize,
+    ) -> Result<Self> {
+        let nslots = Self::pool_slots(data_cache_blocks, max_dirty_blocks);
+        let size = nslots * data_block_size;
+
+        // The cache is not persistent: nothing repopulates the LRU at
+        // open, so a pre-existing file's contents are unreachable
+        // either way. Reuse the path if it is there, size it to the
+        // pool, and treat the contents as scratch.
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(file_path)?;
         let fd = file.as_raw_fd();
 
-        // init backend file ondisk
         unsafe {
             let ret = libc::ftruncate(fd, size as libc::off_t);
             if ret != 0 {
@@ -63,7 +124,6 @@ impl LocalDiskCache {
             }
         }
 
-        // create memory map
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut::<libc::c_void>(),
@@ -83,89 +143,87 @@ impl LocalDiskCache {
             NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
         );
 
-        let data_blocks_dirty = BTreeMap::new();
+        debug!("local disk cache - {} slots of {} bytes, {} bytes mapped",
+            nslots, data_block_size, size);
 
         Ok(Self {
             addr: addr as u64,
             size,
+            nslots,
+            // Hand out low slots first; reverse so popping ascends.
+            free_slots: (0..nslots as u32).rev().collect(),
             file,
             closed: std::sync::atomic::AtomicBool::new(false),
             data_blocks_cache,
-            data_blocks_dirty,
+            data_blocks_dirty: BTreeMap::new(),
             data_cache_blocks,
             data_block_size,
         })
     }
 
-    pub(crate) fn open(file_path: impl AsRef<Path>, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(file_path)?;
-        let metadata = file.metadata()?;
-        let cache_file_size = metadata.len() as usize;
-        let fd = file.as_raw_fd();
-        assert!(cache_file_size == size);
+    /// Byte offset of a slot within the mapping.
+    #[inline]
+    fn slot_offset(&self, slot: u32) -> usize {
+        slot as usize * self.data_block_size
+    }
 
-        // create memory map
-        let addr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut::<libc::c_void>(),
-                size as libc::size_t,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-
-        if addr == libc::MAP_FAILED {
-            return Err(Error::last_os_error());
+    /// Which slot a block occupies, or `None` if it is a heap block
+    /// handed out because the pool was exhausted.
+    ///
+    /// Derived from the block's address rather than tracked in a
+    /// side table, so it cannot fall out of sync with reality.
+    fn slot_of(&self, block: &DataBlock) -> Option<u32> {
+        let p = block.as_slice().as_ptr() as usize;
+        let base = self.addr as usize;
+        if p < base || p >= base + self.size {
+            return None;
         }
-
-        let data_blocks_cache = lru::LruCache::new(
-            NonZeroUsize::new(data_cache_blocks).or(NonZeroUsize::new(1)).unwrap()
-        );
-
-        let data_blocks_dirty = BTreeMap::new();
-
-        Ok(Self {
-            addr: addr as u64,
-            size,
-            file,
-            closed: std::sync::atomic::AtomicBool::new(false),
-            data_blocks_cache,
-            data_blocks_dirty,
-            data_cache_blocks,
-            data_block_size,
-        })
+        Some(((p - base) / self.data_block_size) as u32)
     }
 
-    pub(crate) fn open_or_create(file_path: impl AsRef<Path>, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Self> {
-        Self::open(&file_path, size, data_cache_blocks, data_block_size)
-            .or_else(|e| {
-                if e.kind() == ErrorKind::NotFound {
-                    Self::new(file_path, size, data_cache_blocks, data_block_size)
-                } else {
-                    Err(e)
-                }
-            })
-    }
-
-    fn new_dirty_block(&self, blk_idx: BlockIndex) -> DataBlock {
-        let addr = self.addr as *mut u8;
+    /// Take a slot-backed, zeroed, dirty, locked block, falling back
+    /// to a heap block when the pool is empty.
+    fn new_dirty_block(&mut self, blk_idx: BlockIndex) -> DataBlock {
+        let Some(slot) = self.free_slots.pop() else {
+            warn!("local disk cache - slot pool of {} exhausted, falling back to a heap block for index {}",
+                self.nslots, blk_idx);
+            let block = DataBlock::new_alloc(blk_idx, self.data_block_size);
+            block.set_dirty();
+            block.lock();
+            return block;
+        };
         let ptr = unsafe {
-            addr.add(blk_idx as usize * self.data_block_size)
+            (self.addr as *mut u8).add(self.slot_offset(slot))
         };
         let block = DataBlock::new_mmap(blk_idx, ptr, self.data_block_size);
+        // Zero explicitly. Releasing a slot punches its hole, so a
+        // recycled slot normally reads as zeros already, but relying
+        // on that makes every future release path load-bearing for
+        // correctness rather than only for space. Callers that only
+        // partially fill a new block have been a repeated source of
+        // stale-data bugs.
+        block.as_mut_slice().fill(0);
         block.set_dirty();
         block.lock();
         block
     }
 
-    fn discard(&self, blk_idx: BlockIndex) {
+    /// Return a block's slot to the pool and reclaim its disk space.
+    ///
+    /// Punching the hole is what frees the space; the slot reads as
+    /// zeros afterwards, though `new_dirty_block` does not depend on
+    /// that.
+    fn release(&mut self, block: &DataBlock) {
+        let Some(slot) = self.slot_of(block) else {
+            return; // heap fallback block, nothing to reclaim
+        };
+        self.punch(slot);
+        self.free_slots.push(slot);
+    }
+
+    fn punch(&self, slot: u32) {
         let fd = self.file.as_raw_fd();
-        let offset = (blk_idx as usize * self.data_block_size) as libc::off_t;
+        let offset = self.slot_offset(slot) as libc::off_t;
         let len = self.data_block_size as libc::off_t;
         let ret = unsafe {
             libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset, len)
@@ -207,40 +265,10 @@ impl LocalDiskCache {
 }
 
 impl Cache for LocalDiskCache {
-    /// Grow the mapping to cover `bytes`, never shrink. See the
-    /// trait docs.
-    ///
-    /// Blocks in this tier are views at `addr + blk_idx *
-    /// data_block_size`, so a block index whose end offset is past
-    /// the mapping would be written outside it.
-    fn ensure_capacity(&self, bytes: usize) {
-        if bytes > self.size {
-            self.set_size(bytes);
-        }
-    }
-
-    fn set_size(&self, new_size: usize) {
-        let fd = self.file.as_raw_fd();
-        let addr = self.addr as *mut libc::c_void;
-        let ret = unsafe {
-            libc::ftruncate(fd, new_size as libc::off_t)
-        };
-        if ret == -1 {
-            panic!("ftruncate failed to change cache file size from {} to {}, error: {}",
-                self.size, new_size, Error::last_os_error());
-        }
-        let ret = unsafe {
-            libc::mremap(addr, self.size, new_size, 0)
-        };
-        if ret == libc::MAP_FAILED {
-            panic!("mremap failed to change cache space size from {} to {}, error: {}",
-                self.size, new_size, Error::last_os_error());
-        }
-        assert!(ret == addr);
-        unsafe {
-            let ptr = std::ptr::addr_of!(self.size) as *mut usize;
-            std::ptr::write_volatile(ptr, new_size);
-        }
+    /// No-op. The mapping is a fixed slot pool, so it does not track
+    /// the file's size; see the type-level docs.
+    fn set_size(&self, _: usize) {
+        /* do nothing */
     }
 
     fn set_unlimited(&mut self) {
@@ -282,7 +310,11 @@ impl Cache for LocalDiskCache {
         assert!(!block.is_dirty());
         let mut dirty_block = self.new_dirty_block(blk_idx);
         dirty_block.copy(0, block.as_slice());
-        self.data_blocks_dirty.insert(blk_idx, dirty_block)
+        let displaced = self.data_blocks_dirty.insert(blk_idx, dirty_block);
+        if let Some(old) = &displaced {
+            self.release(old);
+        }
+        displaced
     }
 
     /// Install a clean, freshly-loaded block in the LRU. See the
@@ -326,25 +358,28 @@ impl Cache for LocalDiskCache {
         cached.clear_dirty();
         cached.unlock();
 
-        if let Some((old_blk_idx, _)) = self.data_blocks_cache.push(blk_idx, cached) {
+        if let Some((old_blk_idx, old)) = self.data_blocks_cache.push(blk_idx, cached) {
             if old_blk_idx == blk_idx {
                 panic!("block already exists, failed to insert clean block index {} into data blocks cache", blk_idx);
-            } else {
-                self.discard(old_blk_idx);
             }
+            self.release(&old);
         }
         None
     }
 
-    fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock> {
-        // be sure block is not in cache list
-        let _ = self.data_blocks_cache.pop(&blk_idx);
-        self.data_blocks_dirty.remove(blk_idx)
-            .and_then(|block| {
-                block.clear_dirty();
-                block.unlock();
-                Some(block)
-            })
+    fn remove(&mut self, blk_idx: &BlockIndex) -> bool {
+        let mut removed = false;
+        if let Some(block) = self.data_blocks_cache.pop(&blk_idx) {
+            self.release(&block);
+            removed = true;
+        }
+        if let Some(block) = self.data_blocks_dirty.remove(blk_idx) {
+            block.clear_dirty();
+            block.unlock();
+            self.release(&block);
+            removed = true;
+        }
+        removed
     }
 
     fn contains(&mut self, blk_idx: &BlockIndex) -> bool {
@@ -456,14 +491,10 @@ impl Cache for LocalDiskCache {
             .map(|(k, _)| *k)
             .collect();
         for k in dirty {
-            if self.data_blocks_dirty.remove(&k).is_some() {
+            if let Some(block) = self.data_blocks_dirty.remove(&k) {
                 removed += 1;
+                self.release(&block);
             }
-            // Punch the backing hole: `new_dirty_block` hands out a
-            // raw mmap view without zeroing it, so a later write to
-            // this index would otherwise observe the pre-truncate
-            // bytes still sitting in the cache file.
-            self.discard(k);
         }
         // Sweep the clean tier independently. A block that was
         // already flushed lives only here; enumerating candidates
@@ -477,8 +508,9 @@ impl Cache for LocalDiskCache {
                 .filter(|k| *k >= boundary)
                 .collect();
             for k in clean {
-                let _ = self.data_blocks_cache.pop(&k);
-                self.discard(k);
+                if let Some(block) = self.data_blocks_cache.pop(&k) {
+                    self.release(&block);
+                }
             }
         }
         removed
@@ -498,28 +530,26 @@ impl Cache for LocalDiskCache {
             if self.data_cache_blocks == 0 {
                 // Cache disabled: there is nowhere to keep the block,
                 // and unlike the in-memory cache its bytes live in the
-                // backing cache file rather than on the heap. Punch the
-                // hole so that a later `new_dirty_block` for this index
-                // — which hands out an unzeroed mmap view — cannot
-                // observe the bytes being dropped here. Same reasoning
-                // as the eviction discard below.
-                self.discard(blk_idx);
+                // backing file rather than on the heap, so its slot
+                // has to go back to the pool.
+                self.release(&block);
                 continue;
             }
             // push into cache list
-            if let Some((old_blk_idx, _)) = self.data_blocks_cache.push(blk_idx, block) {
+            if let Some((old_blk_idx, old)) = self.data_blocks_cache.push(blk_idx, block) {
                 if old_blk_idx == blk_idx {
                     panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
-                } else {
-                    self.discard(old_blk_idx);
                 }
+                self.release(&old);
             }
         }
     }
 
     fn clear_data_blocks_cache(&mut self) {
         if self.data_cache_blocks > 0 {
-            self.data_blocks_cache.clear();
+            while let Some((_, block)) = self.data_blocks_cache.pop_lru() {
+                self.release(&block);
+            }
         }
     }
 

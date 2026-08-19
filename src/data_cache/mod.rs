@@ -12,20 +12,6 @@ use self::{mem_cache::MemCache, local_disk_cache::LocalDiskCache};
 
 pub(crate) trait Cache {
     fn set_size(&self, size: usize);
-    /// Make sure the cache can hold a block whose end offset is
-    /// `bytes`, growing but never shrinking.
-    ///
-    /// `set_size` is absolute and is driven by `i_size`, which is
-    /// fine for the byte write paths because they only ever cache
-    /// blocks inside the file. The block borrow API can cache a
-    /// block above EOF — it deliberately does not move `i_size` —
-    /// so it needs a way to extend the cache's addressable range on
-    /// its own. Growth only: calling `set_size` with a smaller value
-    /// would unmap storage still referenced by cached blocks.
-    ///
-    /// A no-op for the in-memory cache, which addresses blocks by
-    /// map key and has no extent.
-    fn ensure_capacity(&self, bytes: usize);
     fn set_unlimited(&mut self);
     fn restore_limit(&mut self);
     fn new_block(&self, blk_idx: BlockIndex) -> DataBlock;
@@ -62,7 +48,13 @@ pub(crate) trait Cache {
     /// forces). Callers that need the bytes regardless must use the
     /// returned block; there is nothing in the cache to borrow.
     fn insert_clean(&mut self, blk_idx: BlockIndex, block: DataBlock) -> Option<DataBlock>;
-    fn remove(&mut self, blk_idx: &BlockIndex) -> Option<DataBlock>;
+    /// Drop a block from both tiers.
+    ///
+    /// Returns whether anything was removed. Deliberately does not
+    /// hand the block back: the local-disk tier's blocks are views
+    /// into its backing file, so an owned block escaping the cache
+    /// would leak the slot it occupies. No caller wanted the value.
+    fn remove(&mut self, blk_idx: &BlockIndex) -> bool;
     fn contains(&mut self, blk_idx: &BlockIndex) -> bool;
     fn get_mut(&mut self, blk_idx: &BlockIndex) -> Option<&mut DataBlock>;
     fn write_prepare(&mut self, off: usize, len: usize) -> Vec<BlockIndex>;
@@ -102,13 +94,19 @@ impl fmt::Display for Box<dyn Cache + Send> {
     }
 }
 
-pub(crate) fn cache_from_config(config: &HyperFileDataCacheConfig, size: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Box<dyn Cache + Send>> {
+/// Build the configured data cache.
+///
+/// `max_dirty_blocks` is the flush threshold, used by the local-disk
+/// tier to size its slot pool: dirty blocks share the mapping with
+/// clean ones, so the pool must cover both. The in-memory tier
+/// ignores it.
+pub(crate) fn cache_from_config(config: &HyperFileDataCacheConfig, max_dirty_blocks: usize, data_cache_blocks: usize, data_block_size: usize) -> Result<Box<dyn Cache + Send>> {
     match config {
         HyperFileDataCacheConfig::Memory(_) => {
             Ok(Box::new(MemCache::new(data_cache_blocks, data_block_size)))
         },
         HyperFileDataCacheConfig::LocalDisk(local) => {
-            let cache = LocalDiskCache::open_or_create(local.full_file_path()?, size, data_cache_blocks, data_block_size)?;
+            let cache = LocalDiskCache::open_or_create(local.full_file_path()?, max_dirty_blocks, data_cache_blocks, data_block_size)?;
             Ok(Box::new(cache))
         },
     }
