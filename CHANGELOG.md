@@ -9,6 +9,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.5.0] - 2026-08-19
+
+### Added
+
+- **Block API.** A caller that uses hyperfile as block storage rather
+  than as a file can now borrow the cached block instead of copying
+  through it. On `Hyper`:
+
+  ```rust
+  fs_block(idx)              -> Option<BlockRef>   // read borrow
+  fs_block_mut(idx, create)  -> Option<BlockMut>   // in-place write borrow
+  fs_block_state(idx)        -> BlockState         // how idx is mapped
+  ```
+
+  `BlockMut` needs no write-back call: the block is dirty from
+  acquisition, so an early return between acquire and drop cannot lose
+  the modification, and repeated borrows inside one flush window
+  collapse to a single version, matching `write`. The point is to remove
+  the reason such callers keep a shadow copy of every block they intend
+  to modify, which is a recurring source of
+  copy-diverges-from-original bugs.
+
+  `BlockState` separates `Unmapped` / `Zero` / `Mapped`. Through the
+  byte API all three read back as zeros, so a caller holding its own
+  index could not tell "never written" from "real data that happens to
+  be zeros" — the difference between a consistent index and a lost
+  block.
+
+  Neither borrow moves `i_size`; these callers manage their own address
+  space. A block dirtied above EOF is still durable, but `read` stops at
+  `i_size`, so it is reachable only through this API. `i_blocks` is
+  updated either way.
+
+- **Closure-scoped block access on the reactor surface**:
+  `fh_with_block(idx, f)` and `fh_with_block_mut(idx, create, f)`.
+
+  The reactor cannot hand out borrow guards. The `Hyper` lives inside
+  the reactor task, so a guard would reach the caller only once the
+  response arrives, after which the reactor is free to serve the next
+  request and invalidate it. So the action travels to the block: `f`
+  runs inside the reactor task while it holds the real borrow, and only
+  owned values cross the channel.
+
+- `docs/block-api.md`, covering both surfaces, the three hole states,
+  why `i_size` is left alone, and why the reactor surface takes a
+  closure.
+
+### Fixed
+
+- **The local-disk *data* cache aborted the process on release.**
+  `close` called `libc::close` on a descriptor owned by a
+  `std::fs::File`, and both `Cache::shutdown` — the normal path from
+  `release` — and `Drop` called it:
+
+      fatal runtime error: IO Safety violation: owned file descriptor
+      already closed, aborting
+
+- **The same tier corrupted memory on an extending write.** It mapped
+  the file's own address space and located a block at
+  `addr + blk_idx * data_block_size`, but the cache is told the new size
+  only *after* the blocks are created, so a write past EOF minted a view
+  outside the mapping and wrote through it. Observed as `SIGSEGV` and as
+  dynamic-loader assertion failures. Three related consequences of the
+  same addressing scheme: a newly created file has size zero and `mmap`
+  rejects a zero length, so the tier could not create a file at all; the
+  mapping could not grow, since `mremap` was called without
+  `MREMAP_MAYMOVE` and its result asserted unmoved, which it must be
+  because views already handed out point into it; and a sparse file
+  could not be mapped, because the mapping had to span the address space
+  rather than the resident blocks.
+
+  The mapping is now a fixed pool of block-sized slots, sized from the
+  cache capacity and the flush threshold, and a block takes whichever
+  slot is free. A block index is never used as an offset. A block's slot
+  is derived from its address rather than tracked separately, so the two
+  cannot disagree. When the pool is exhausted — one large write dirties
+  every block it touches before the flush check runs — blocks fall back
+  to heap allocations, costing memory rather than correctness.
+
+- **`write`, `flush`, `read` within one open panicked on the same tier**
+  with `assertion failed: !block.is_locked()`. `plan_read` probed the
+  cache with `Cache::get`, which mlocks the block it hands out of the
+  clean tier and asserts on the next `get` that it was not already
+  locked; the read executor then called `get` for real. Reopening the
+  file masked it, since the clean tier starts empty and reads miss.
+
+  None of these three were reachable through the default (in-memory)
+  data cache, and no test selected the local-disk tier, which is why
+  they went unnoticed.
+
+### Changed
+
+- Blocks newly created in the local-disk cache are zeroed explicitly.
+  Releasing a slot punches its hole, so a recycled slot did read as
+  zeros, but depending on that made every release path load-bearing for
+  correctness rather than only for reclaiming space. Partially-filled
+  new blocks have caused two stale-data bugs already (0.4.3, 0.4.5).
+- The local-disk cache file's size now follows the cache's capacity
+  instead of the file's size. It is scratch space with no persistent
+  contents — nothing repopulates the cache at open — so this is not an
+  on-disk format change, but the file on disk will be a different size
+  than before.
+
+### Tests
+
+- `integration_s3_block_api`: 9 cases, run under all three data cache
+  configurations (in-memory, local-disk, disabled), covering the borrow
+  contents, hole/zero/data discrimination, in-place persistence,
+  `create`, one-version-per-flush-window, `i_size` being untouched, and
+  access-mode enforcement.
+- `integration_s3_local_disk_cache`: 7 cases, the first suite to select
+  that tier. Creating an empty file, releasing repeatedly without
+  aborting, writing far past EOF, a 4 TiB sparse address space, slot
+  recycling under constant eviction, truncate releasing slots without
+  leaving stale bytes, and pool exhaustion.
+- `integration_reactor_s3_block_api`: 6 cases, including a check that
+  the same edits applied through `fs_block_mut` and through
+  `fh_with_block_mut` produce byte-identical files.
+- All three should be run under debug assertions as well as release:
+  much of what they cover only fails with `debug_assertions` on. See
+  `tests/README.md`.
+
 ## [0.4.6] - 2026-08-17
 
 ### Fixed
