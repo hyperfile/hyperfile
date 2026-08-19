@@ -1,2 +1,7 @@
 /target
 Cargo.lock
+
+# editor swap / backup files
+*.swp
+*.swo
+*~
