@@ -9,6 +9,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.0] - 2026-08-20
+
+> **`fh_read` and `fh_write` must not be cancelled.** This has always
+> been true and was never written down; see *Documentation* below. If
+> you wrap either in a `timeout` or a `select!` branch, switch to the
+> new owned variants.
+
+### Added
+
+- **A reactor block closure may now borrow the caller's locals.**
+  `fh_with_block` and `fh_with_block_mut` required `F: ... + 'static`,
+  so the closure could capture only owned values:
+
+  ```rust
+  // before: two copies — block into a Vec, Vec into the caller's buffer
+  let v = fh.fh_with_block(idx, |blk| blk.to_vec()).await?;
+  out.copy_from_slice(&v);
+
+  // now: one copy, straight into a buffer the caller already owns
+  fh.fh_with_block(idx, |blk| out.copy_from_slice(blk)).await?;
+  ```
+
+  `Send` is still required — the closure runs on the reactor's thread —
+  and `R` is no longer `'static` either. One copy per block per
+  direction goes away, on the path whose purpose is to avoid copies.
+
+  The closure must not run once the caller is gone, so the request
+  carries a gate: the dispatcher checks it before calling the closure
+  and skips it if the caller has left, and the caller's guard sets it on
+  drop, however it leaves. The gate is taken after the block is in hand,
+  so the critical section is one closure body with nothing awaiting
+  inside it.
+
+- **Cancel-safe byte read and write on the reactor surface**:
+
+  ```rust
+  fh_read_owned(off, len)        -> Bytes
+  fh_write_owned(off, buf: Bytes)
+  ```
+
+  Nothing of the caller's is borrowed: the read allocates in the reactor
+  and hands the buffer back, and the write moves a reference-counted
+  `Bytes` into the request. Dropping either future is harmless.
+
+  These do not replace `fh_read` / `fh_write`, which keep their
+  signatures and remain the zero-copy path. Use the owned variants where
+  the operation may be cancelled.
+
+### Documentation
+
+- **`fh_read` and `fh_write` cannot be cancelled**, and now say so.
+  Both hand the reactor a bare pointer to the caller's buffer, which is
+  valid only while the caller stays parked on the response — dropping
+  the future can leave the reactor reading from or writing into freed
+  memory. With `wal`, a write's buffer is read straight into an
+  object-store PUT, so the window is a full round trip.
+
+  Long-standing behavior, not a change. It is called out here because
+  wrapping a read in a `timeout` is a natural thing to write, and
+  because both are safe functions, so nothing stops it.
+
+  Neither could be fixed the way the block closure was. The reactor
+  touches the buffer from inside the object-store request rather than in
+  one step afterwards, so there is no moment at which the work can
+  simply be skipped, and waiting for it would mean waiting across I/O —
+  which deadlocks, because the reactor's I/O can be driven by the
+  caller's runtime. Hence the owned variants above rather than a fix in
+  place.
+
+- `docs/block-api.md` gains a table of which reactor entry point is
+  cancel-safe and who owns the buffer in each.
+
+### Changed
+
+- `FileReqWrite` gains an `owned: Option<Bytes>` field, which
+  `fh_write_owned` uses to keep the write's bytes alive for as long as
+  the request travels — through the absorb and requeue stages, and past
+  a caller that has gone away. `handler.rs` is public, so this is a
+  visible struct change; the write pipeline itself is unchanged.
+
+### Tests
+
+- Six cases added to `integration_reactor_s3_block_api`, run under
+  default, `wal` and `range-lock`: a closure mutably borrowing a
+  caller-owned buffer and filling it from the block, plus the write
+  direction; a hole leaving the borrowed local untouched; 32 rounds of
+  cancelling a borrowing closure mid-flight; the owned read agreeing
+  with `fh_read` byte for byte across aligned and unaligned windows and
+  being empty at EOF; the owned write round-tripping a full block and an
+  unaligned partial write over it; and 24 owned reads plus 24 owned
+  writes all actually cancelled mid-flight, after which every block is
+  uniformly one value or the other, so no cancelled write was partially
+  applied.
+
 ## [0.5.2] - 2026-08-20
 
 ### Added
