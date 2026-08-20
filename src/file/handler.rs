@@ -1,6 +1,7 @@
 //! impl request handler style IO process
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use bytes::Bytes;
 use std::io::{Error, Result, ErrorKind};
 #[cfg(feature = "wal")]
 use log::{warn, info, debug};
@@ -108,6 +109,8 @@ pub type FileRespTrunc = Result<()>;
 /// own return value travels on its own channel.
 pub type FileRespWithBlock = Result<bool>;
 pub type FileRespTiming = Result<TimingValue>;
+/// The bytes read, truncated to what was actually available.
+pub type FileRespReadOwned = Result<Bytes>;
 pub type FileRespFlush = Result<SegmentId>;
 pub type FileRespRelease = Result<SegmentId>;
 pub type FileRespLastCno = u64;
@@ -136,6 +139,7 @@ pub enum FileResp {
     Trunc(oneshot::Sender<FileRespTrunc>),
     WithBlock(oneshot::Sender<FileRespWithBlock>),
     Timing(oneshot::Sender<FileRespTiming>),
+    ReadOwned(oneshot::Sender<FileRespReadOwned>),
     Flush(oneshot::Sender<FileRespFlush>),
     #[cfg(feature = "wal")]
     WalFlush,
@@ -180,6 +184,13 @@ impl FileResp {
         match self {
             Self::WriteZero(tx) => tx,
             _ => panic!("FileResp::to_write_zero called on wrong variant"),
+        }
+    }
+
+    pub fn to_read_owned(self) -> oneshot::Sender<FileRespReadOwned> {
+        match self {
+            Self::ReadOwned(tx) => tx,
+            _ => panic!("FileResp::to_read_owned called on wrong variant"),
         }
     }
 
@@ -277,6 +288,16 @@ pub struct FileReqWrite<'a> {
     pub fetched: Vec<DataBlock>,
     pub spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
     pub fh: ChannelGroup<FileContext<'a>>,
+    /// Keeps `buf`'s referent alive when the caller does not.
+    ///
+    /// `fh_write` points `buf` at the caller's memory, which is only
+    /// valid while the caller stays parked on the response.
+    /// `fh_write_owned` instead puts the bytes here and points `buf`
+    /// into them, so the referent belongs to the request and travels
+    /// with it — through the absorb and requeue stages, and safely past
+    /// a caller that has gone away. `Bytes` does not move its
+    /// allocation when the handle moves, so `buf` stays valid.
+    pub owned: Option<Bytes>,
 }
 
 pub struct FileReqWriteZero<'a> {
@@ -319,7 +340,7 @@ pub struct FileReqTrunc {
 /// The boxes are `'static` in the type but not in fact: the closure
 /// may borrow the caller's locals, and `fh_with_block*` erases that
 /// lifetime to get it here. What keeps that sound is
-/// [`BlockActionDone`], not the type.
+/// [`BlockActionGate`], not the type.
 pub enum BlockAction {
     Ref(Box<dyn FnOnce(&[u8]) + Send>),
     Mut(Box<dyn FnOnce(&mut [u8]) + Send>),
@@ -352,6 +373,16 @@ pub enum TimingOp {
     ReadReset,
     Flush,
     FlushReset,
+}
+
+/// A read whose buffer the reactor allocates and hands back.
+///
+/// Unlike [`FileReqRead`], nothing here points at the caller. That is
+/// the whole point: the caller has nothing borrowed, so dropping the
+/// future cannot leave the reactor writing into freed memory.
+pub struct FileReqReadOwned {
+    pub offset: usize,
+    pub len: usize,
 }
 
 pub struct FileReqTiming {
@@ -429,6 +460,7 @@ pub enum FileReqOp {
     Trunc,
     WithBlock,
     Timing,
+    ReadOwned,
     Flush,
     FlushData,
     #[cfg(feature = "wal")]
@@ -457,6 +489,7 @@ pub union FileReqBody<'a> {
     trunc: ManuallyDrop<FileReqTrunc>,
     with_block: ManuallyDrop<FileReqWithBlock>,
     timing: ManuallyDrop<FileReqTiming>,
+    read_owned: ManuallyDrop<FileReqReadOwned>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
     #[cfg(feature = "wal")]
@@ -522,7 +555,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let req = FileReq {
             op: FileReqOp::Write,
-            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, spawn_write_permit: None, fh: fh, fetched: Vec::new(), }), },
+            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, spawn_write_permit: None, fh: fh, fetched: Vec::new(), owned: None, }), },
         };
         let resp = FileResp::Write(tx.clone());
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
@@ -618,6 +651,41 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset: offset }), },
         };
         let resp = FileResp::Trunc(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    /// A write whose bytes the request owns. See
+    /// [`FileReqWrite::owned`].
+    pub fn new_write_owned(buf: Bytes, offset: usize, fh: ChannelGroup<FileContext<'a>>)
+        -> (Self, mpsc::Sender<FileRespWrite>, mpsc::Receiver<FileRespWrite>)
+    {
+        let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
+        // SAFETY: points into the `Bytes` stored alongside it. `Bytes`
+        // keeps its allocation put when the handle moves, and the
+        // handle travels with the request, so the referent outlives
+        // every stage that reads it — including after the caller is
+        // gone.
+        let slice: &'a [u8] = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr(), buf.len())
+        };
+        let req = FileReq {
+            op: FileReqOp::Write,
+            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite {
+                buf: slice, offset, spawn_write_permit: None, fh,
+                fetched: Vec::new(), owned: Some(buf),
+            }), },
+        };
+        let resp = FileResp::Write(tx.clone());
+        (Self { req: Some(req), resp: Some(resp), }, tx, rx)
+    }
+
+    pub fn new_read_owned(offset: usize, len: usize) -> (Self, oneshot::Receiver<FileRespReadOwned>) {
+        let (tx, rx) = oneshot::channel::<FileRespReadOwned>();
+        let req = FileReq {
+            op: FileReqOp::ReadOwned,
+            body: FileReqBody { read_owned: ManuallyDrop::new(FileReqReadOwned { offset, len }), },
+        };
+        let resp = FileResp::ReadOwned(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -997,6 +1065,26 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
             },
+            FileReqOp::ReadOwned => {
+                let md = unsafe { req.body.read_owned };
+                let r = ManuallyDrop::into_inner(md);
+                // The buffer is local to this arm and the read runs to
+                // completion before the arm returns, so nothing here
+                // outlives its owner. This deliberately uses the
+                // serial read path rather than the spawning one, whose
+                // response is sent from a detached task after the arm
+                // has already returned — that would put the buffer's
+                // lifetime back in question.
+                let mut owned = vec![0u8; r.len];
+                let out = match self.inner.read(r.offset, &mut owned).await {
+                    Ok(n) => {
+                        owned.truncate(n);
+                        Ok(Bytes::from(owned))
+                    },
+                    Err(e) => Err(e),
+                };
+                let _ = resp.to_read_owned().send(out);
+            },
             FileReqOp::Timing => {
                 let md = unsafe { req.body.timing };
                 let req = ManuallyDrop::into_inner(md);
@@ -1237,6 +1325,7 @@ mod tests {
     use super::*;
     use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use bytes::Bytes;
     use tokio::task::LocalSet;
     use hyperfile_reactor::Reactor;
 

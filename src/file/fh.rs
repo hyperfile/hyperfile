@@ -175,6 +175,29 @@ impl<'a: 'static> HyperFileHandler<'a> {
     ///
     /// `docs/block-api.md` has the full table of which entry points
     /// populate the cache.
+    ///
+    /// # Do not cancel this future
+    ///
+    /// `buf` is handed to the reactor as a bare pointer, because the
+    /// reactor's request type is `'static` and cannot name the
+    /// caller's lifetime. That is sound only while the caller stays
+    /// parked on the response, which is what keeps `buf` alive and
+    /// unaliased.
+    ///
+    /// Dropping this future before it completes — a `select!` branch
+    /// losing, a `timeout` firing — breaks that: the reactor may still
+    /// write into `buf` after the caller has freed or reused it.
+    ///
+    /// Unlike [`Self::fh_with_block`], this cannot be made safe by
+    /// skipping the work, because the reactor writes into `buf` from
+    /// inside the object-store read rather than in one step
+    /// afterwards; waiting for that to finish would mean waiting
+    /// across I/O, which can deadlock, since the reactor's I/O may be
+    /// driven by the caller's runtime.
+    ///
+    /// If you need a cancellable read, read into a buffer you own and
+    /// copy afterwards, or drive this from a task you can let run to
+    /// completion.
     pub async fn fh_read(&mut self, off: usize, buf: &mut [u8]) -> Result<usize>
     {
         let b = unsafe {
@@ -188,6 +211,18 @@ impl<'a: 'static> HyperFileHandler<'a> {
         res
     }
 
+    /// Write `buf` at `off`, returning the number of bytes written.
+    ///
+    /// # Do not cancel this future
+    ///
+    /// As with [`Self::fh_read`], `buf` reaches the reactor as a bare
+    /// pointer and stays borrowed for as long as the caller is parked
+    /// on the response. Dropping this future before it completes may
+    /// leave the reactor reading from freed memory.
+    ///
+    /// With the `wal` feature this window includes an object-store
+    /// PUT issued straight from `buf`, so it can be as long as a
+    /// round trip.
     pub async fn fh_write(&mut self, off: usize, buf: &[u8]) -> Result<usize>
     {
         let b = unsafe {
@@ -244,6 +279,59 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_truncate(&mut self, offset: usize) -> Result<()>
     {
         let (ctx, rx) = FileContext::new_trunc(offset);
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// Write `buf` at `off`, returning the number of bytes written.
+    ///
+    /// The cancel-safe counterpart of [`Self::fh_write`]. The request
+    /// takes ownership of `buf`, so nothing of the caller's stays
+    /// borrowed and dropping this future is harmless — the bytes live
+    /// as long as the write needs them, including across the
+    /// object-store PUT the `wal` feature issues from them.
+    ///
+    /// `Bytes` is reference-counted, so a caller that wants to keep its
+    /// copy can clone first at no cost. Otherwise this is the same
+    /// write as [`Self::fh_write`]: same pipeline, same absorb and
+    /// range-lock behavior, same flush semantics.
+    pub async fn fh_write_owned(&mut self, off: usize, buf: bytes::Bytes) -> Result<usize>
+    {
+        let (ctx, tx, mut rx) = FileContext::new_write_owned(buf, off, self.inner.clone());
+        self.inner.send(ctx)?;
+        let res = rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
+        drop(tx);
+        res
+    }
+
+    /// Read up to `len` bytes from `off` into a buffer the reactor
+    /// allocates, and return it.
+    ///
+    /// The cancel-safe counterpart of [`Self::fh_read`]. Nothing of the
+    /// caller's is borrowed, so dropping this future is harmless: the
+    /// buffer belongs to the reactor and goes away with the request.
+    /// Use this wherever the read might be cancelled — a `select!`
+    /// branch, a `timeout`, a task that may be aborted.
+    ///
+    /// The returned `Bytes` is truncated to what was actually read, so
+    /// its length is the count; it is empty at or past `i_size`. Being
+    /// reference-counted, handing it on costs nothing.
+    ///
+    /// Two differences from [`Self::fh_read`] beyond the buffer:
+    ///
+    /// * the reactor allocates, so a caller that already has a buffer
+    ///   to fill pays one copy out of the returned `Bytes` — whereas
+    ///   `fh_read` fills that buffer directly;
+    /// * the read runs serially inside the reactor rather than
+    ///   splitting a coalesced plan across `read_max_concurrency`
+    ///   tasks. For a request that covers one contiguous range — which
+    ///   is what a single object request means — that is the same
+    ///   work.
+    ///
+    /// **Does not populate the data cache**, like every byte read.
+    pub async fn fh_read_owned(&self, off: usize, len: usize) -> Result<bytes::Bytes>
+    {
+        let (ctx, rx) = FileContext::new_read_owned(off, len);
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }

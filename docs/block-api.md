@@ -163,6 +163,23 @@ waits for `f` to finish. The wait is one closure body — the block is
 already in hand by then and nothing awaits — so it is bounded and
 cannot deadlock against the reactor's I/O.
 
+The byte entry points on this surface need more care, because the
+reactor touches the caller's buffer from inside the object-store
+request rather than in one step afterwards:
+
+| | cancel-safe | buffer |
+|---|---|---|
+| `fh_read` | **no** | caller's, borrowed for the whole request |
+| `fh_write` | **no** | caller's; with `wal`, borrowed across a PUT |
+| `fh_read_owned` | yes | allocated by the reactor, returned as `Bytes` |
+| `fh_write_owned` | yes | owned by the request, a `Bytes` the caller hands over |
+
+`fh_read` and `fh_write` are the zero-copy path and stay that way; use
+them when the read or write will be allowed to finish. Use the owned
+variants behind a `select!`, a `timeout`, or in a task that may be
+aborted. `Bytes` is reference-counted, so handing one over or getting
+one back costs nothing.
+
 ## Access mode
 
 Both borrows honor the open access mode, like the byte API:

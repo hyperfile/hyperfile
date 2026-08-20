@@ -662,3 +662,161 @@ async fn cancelling_a_borrowing_closure_is_safe() {
     let _ = fh.fh_release().await.expect("release");
     tf.cleanup(&client).await;
 }
+
+// --- cancel-safe owned buffers ---
+//
+// `fh_read` and `fh_write` point the reactor at the caller's memory,
+// which is only valid while the caller stays parked on the response, so
+// they must not be cancelled. `fh_read_owned` and `fh_write_owned`
+// borrow nothing of the caller's: the buffer belongs to the reactor for
+// a read, and to the request for a write.
+
+/// `fh_read_owned` returns what was read, truncated to the count, and
+/// agrees with `fh_read` byte for byte.
+#[tokio::test]
+#[ignore]
+async fn read_owned_matches_the_borrowing_read() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+
+    let mut payload = vec![0u8; 3 * BLK];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let _ = fh.fh_write(0, &payload).await.expect("write");
+    let _ = fh.fh_flush().await.expect("flush");
+
+    // Whole file, and an unaligned window, both ways.
+    for (off, len) in [(0usize, 3 * BLK), (100, BLK), (BLK + 7, 2 * BLK - 9)] {
+        let owned = fh.fh_read_owned(off, len).await.expect("read_owned");
+        let mut borrowed = vec![0u8; len];
+        let n = fh.fh_read(off, &mut borrowed).await.expect("read");
+        assert_eq!(owned.len(), n, "off={off} len={len}: owned length should be the count");
+        assert_eq!(&owned[..], &borrowed[..n], "off={off} len={len}: contents differ");
+        assert_eq!(&owned[..], &payload[off..off + n]);
+    }
+
+    // At and past EOF the result is empty rather than an error.
+    let past = fh.fh_read_owned(3 * BLK, BLK).await.expect("read_owned past eof");
+    assert!(past.is_empty(), "reading at EOF should yield no bytes, got {}", past.len());
+    let past = fh.fh_read_owned(10 * BLK, BLK).await.expect("read_owned past eof");
+    assert!(past.is_empty());
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
+
+/// `fh_write_owned` goes through the same pipeline and persists the
+/// same bytes.
+#[tokio::test]
+#[ignore]
+async fn write_owned_matches_the_borrowing_write() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+
+    // A full block, then an unaligned partial write over it, so the
+    // read-modify-write path is exercised too.
+    let a = bytes::Bytes::from(vec![0xA1u8; 2 * BLK]);
+    let n = fh.fh_write_owned(0, a.clone()).await.expect("write_owned");
+    assert_eq!(n, 2 * BLK);
+
+    let b = bytes::Bytes::from((0..64u8).collect::<Vec<u8>>());
+    let n = fh.fh_write_owned(BLK + 11, b.clone()).await.expect("write_owned partial");
+    assert_eq!(n, 64);
+
+    let _ = fh.fh_flush().await.expect("flush");
+    let _ = fh.fh_release().await.expect("release");
+
+    // Verify from a fresh open.
+    let mut fh = HyperFileHandler::fh_open(
+        &reactor, &client, tf.uri(), FileFlags::rdonly(),
+    ).await.expect("fh open");
+    let got = fh.fh_read_owned(0, 2 * BLK).await.expect("read_owned");
+    assert_eq!(got.len(), 2 * BLK);
+    assert!(got[0..BLK].iter().all(|x| *x == 0xA1), "first block damaged");
+    assert_eq!(&got[BLK + 11..BLK + 11 + 64], &b[..], "partial write not persisted");
+    assert!(got[BLK..BLK + 11].iter().all(|x| *x == 0xA1), "gap before the partial write damaged");
+
+    // The caller's handle to the bytes is still usable — `Bytes` is
+    // shared, not consumed.
+    assert_eq!(a.len(), 2 * BLK);
+    assert_eq!(b.len(), 64);
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
+
+/// Cancelling the owned variants is safe by construction: the caller
+/// has nothing borrowed. Cancel both repeatedly and confirm the handle
+/// and the data survive.
+#[tokio::test]
+#[ignore]
+async fn cancelling_the_owned_variants_is_safe() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("fh create");
+        let _ = fh.fh_write(0, &vec![0x77u8; 8 * BLK]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    // Cold handle so the reads take real I/O and the timeout fires.
+    let mut fh = HyperFileHandler::fh_open(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(),
+    ).await.expect("fh open");
+
+    let mut cancelled_reads = 0;
+    for i in 0..24usize {
+        let fut = fh.fh_read_owned(i % 8 * BLK, BLK);
+        match tokio::time::timeout(std::time::Duration::from_micros(1), fut).await {
+            Ok(Ok(b)) => assert!(b.iter().all(|x| *x == 0x77), "round {i}: wrong bytes"),
+            Ok(Err(e)) => panic!("round {i}: read_owned failed: {e}"),
+            Err(_) => cancelled_reads += 1,
+        }
+    }
+
+    let mut cancelled_writes = 0;
+    for i in 0..24usize {
+        let payload = bytes::Bytes::from(vec![0x88u8; BLK]);
+        let fut = fh.fh_write_owned(i % 8 * BLK, payload);
+        match tokio::time::timeout(std::time::Duration::from_micros(1), fut).await {
+            Ok(Ok(n)) => assert_eq!(n, BLK),
+            Ok(Err(e)) => panic!("round {i}: write_owned failed: {e}"),
+            Err(_) => cancelled_writes += 1,
+        }
+    }
+    eprintln!("cancelled {cancelled_reads} reads and {cancelled_writes} writes");
+
+    // The handle still works, and the file is readable and consistent:
+    // every block is entirely one value or the other, never a mix.
+    let _ = fh.fh_flush().await.expect("flush");
+    for i in 0..8usize {
+        let b = fh.fh_read_owned(i * BLK, BLK).await.expect("read after cancellations");
+        assert_eq!(b.len(), BLK);
+        let first = b[0];
+        assert!(first == 0x77 || first == 0x88, "block {i} has unexpected content {first:#04x}");
+        assert!(b.iter().all(|x| *x == first),
+            "block {i} is a mix, so a cancelled write was partially applied");
+    }
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
