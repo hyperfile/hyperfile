@@ -356,3 +356,161 @@ async fn closure_form_matches_the_direct_guard_form() {
     tf_direct.cleanup(&client).await;
     tf_reactor.cleanup(&client).await;
 }
+
+// --- counters on the reactor surface ---
+//
+// `fh_read_timing` / `fh_flush_timing` mirror the direct API's
+// accessors, returning owned snapshots because a reference to the live
+// counters cannot leave the reactor task. Having them makes the
+// reactor surface's cache behaviour testable, which it was not before.
+
+/// The cache rule documented for the byte and block APIs holds on the
+/// reactor surface too: `fh_read` does not populate the data cache, so
+/// reading the same block twice fetches twice; `fh_with_block` does, so
+/// borrowing twice fetches once and a later `fh_read` is a hit.
+#[tokio::test]
+#[ignore]
+async fn reactor_cache_population_matches_the_direct_api() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("fh create");
+        let _ = fh.fh_write(0, &vec![0x5Au8; 8 * BLK]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    // Byte reads: two reads of the same block, two fetches.
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
+        ).await.expect("fh open");
+        fh.fh_read_timing_reset().await.expect("reset");
+
+        let mut buf = vec![0u8; BLK];
+        let _ = fh.fh_read(3 * BLK, &mut buf).await.expect("first read");
+        let first = fh.fh_read_timing().await.expect("timing");
+        assert_eq!(first.data_gets, 1);
+        assert_eq!(first.cache_hits, 0);
+
+        let _ = fh.fh_read(3 * BLK, &mut buf).await.expect("second read");
+        let second = fh.fh_read_timing().await.expect("timing");
+        assert_eq!(second.data_gets, 2,
+            "fh_read does not populate the cache, so the second read must fetch again");
+        assert_eq!(second.cache_hits, 0);
+
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    // Block access: two borrows of the same block, one fetch.
+    {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
+        ).await.expect("fh open");
+        fh.fh_read_timing_reset().await.expect("reset");
+
+        let b = fh.fh_with_block(3, |buf| buf[0]).await.expect("borrow").expect("mapped");
+        assert_eq!(b, 0x5A);
+        let first = fh.fh_read_timing().await.expect("timing");
+        assert_eq!(first.data_gets, 1);
+
+        let _ = fh.fh_with_block(3, |buf| buf[0]).await.expect("borrow again").expect("mapped");
+        let second = fh.fh_read_timing().await.expect("timing");
+        assert_eq!(second.data_gets, 1,
+            "fh_with_block populates the cache, so a second borrow must not fetch");
+        assert_eq!(second.cache_hits, 1);
+
+        // And the byte path sees it.
+        let mut buf = vec![0u8; BLK];
+        let _ = fh.fh_read(3 * BLK, &mut buf).await.expect("read");
+        let third = fh.fh_read_timing().await.expect("timing");
+        assert_eq!(third.data_gets, 1, "a byte read of a cached block must not fetch");
+        assert_eq!(third.cache_hits, 2);
+
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// A read spanning contiguous blocks in one segment costs one request
+/// on the reactor surface as well.
+#[tokio::test]
+#[ignore]
+async fn reactor_contiguous_read_costs_one_request() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const N: usize = 64;
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("fh create");
+        let _ = fh.fh_write(0, &vec![0x11u8; N * BLK]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    let mut fh = HyperFileHandler::fh_open(
+        &reactor, &client, tf.uri(), FileFlags::rdonly(),
+    ).await.expect("fh open");
+    fh.fh_read_timing_reset().await.expect("reset");
+
+    let mut buf = vec![0u8; N * BLK];
+    let n = fh.fh_read(0, &mut buf).await.expect("read");
+    assert_eq!(n, N * BLK);
+    assert!(buf.iter().all(|b| *b == 0x11));
+
+    let t = fh.fh_read_timing().await.expect("timing");
+    assert_eq!(t.data_gets, 1,
+        "{N} contiguous blocks should coalesce into 1 request, got {}", t.data_gets);
+    assert_eq!(t.data_bytes, (N * BLK) as u64);
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
+
+/// Flush timings are reachable too, and both resets work.
+#[tokio::test]
+#[ignore]
+async fn reactor_flush_timing_and_resets() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+
+    let _ = fh.fh_write(0, &vec![0x22u8; BLK]).await.expect("write");
+    let _ = fh.fh_flush().await.expect("flush");
+
+    let f = fh.fh_flush_timing().await.expect("flush timing");
+    assert!(f.flush_count >= 1, "a flush should have been counted, got {}", f.flush_count);
+    assert!(f.build_segment_ns > 0, "segment build time should be recorded");
+
+    let mut buf = vec![0u8; BLK];
+    let _ = fh.fh_read(0, &mut buf).await.expect("read");
+    let r = fh.fh_read_timing().await.expect("read timing");
+    assert!(r.cache_hits >= 1 || r.data_gets >= 1, "the read should have been counted");
+
+    fh.fh_flush_timing_reset().await.expect("flush reset");
+    fh.fh_read_timing_reset().await.expect("read reset");
+    let f = fh.fh_flush_timing().await.expect("flush timing");
+    let r = fh.fh_read_timing().await.expect("read timing");
+    assert_eq!(f.flush_count, 0);
+    assert_eq!(f.build_segment_ns, 0);
+    assert_eq!(r.total_gets(), 0);
+    assert_eq!(r.cache_hits, 0);
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}

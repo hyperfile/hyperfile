@@ -181,7 +181,9 @@ a block borrow of the same data is served from memory; a block borrow
 after a byte read is not.
 
 `read_timing` reports this directly: `data_gets` counts fetches and
-`cache_hits` counts reads served from the cache.
+`cache_hits` counts reads served from the cache. On the reactor surface
+use `fh_read_timing`, which returns an owned snapshot because a
+reference to the live counters cannot leave the reactor task.
 
 Two configurations behave differently:
 

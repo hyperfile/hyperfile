@@ -207,8 +207,9 @@ staging twice. Borrowing the same block twice fetches it once. A byte
 read after a block borrow of the same data is served from memory; a
 block borrow after a byte read is not.
 
-`read_timing` reports this: `data_gets` counts fetches, `cache_hits`
-counts reads served from the cache. See
+`read_timing` (or `fh_read_timing` on the reactor surface) reports
+this: `data_gets` counts fetches, `cache_hits` counts reads served from
+the cache. See
 [Block API](block-api.md#interaction-with-the-data-cache).
 
 ## Sparse holes (write past EOF without O_APPEND)

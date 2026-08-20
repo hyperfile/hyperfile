@@ -106,6 +106,7 @@ pub type FileRespTrunc = Result<()>;
 /// Whether the block existed, so whether the action ran. The action's
 /// own return value travels on its own channel.
 pub type FileRespWithBlock = Result<bool>;
+pub type FileRespTiming = Result<TimingValue>;
 pub type FileRespFlush = Result<SegmentId>;
 pub type FileRespRelease = Result<SegmentId>;
 pub type FileRespLastCno = u64;
@@ -133,6 +134,7 @@ pub enum FileResp {
     WriteBatch(mpsc::Sender<FileRespWrite>),
     Trunc(oneshot::Sender<FileRespTrunc>),
     WithBlock(oneshot::Sender<FileRespWithBlock>),
+    Timing(oneshot::Sender<FileRespTiming>),
     Flush(oneshot::Sender<FileRespFlush>),
     #[cfg(feature = "wal")]
     WalFlush,
@@ -177,6 +179,13 @@ impl FileResp {
         match self {
             Self::WriteZero(tx) => tx,
             _ => panic!("FileResp::to_write_zero called on wrong variant"),
+        }
+    }
+
+    pub fn to_timing(self) -> oneshot::Sender<FileRespTiming> {
+        match self {
+            Self::Timing(tx) => tx,
+            _ => panic!("FileResp::to_timing called on wrong variant"),
         }
     }
 
@@ -310,6 +319,30 @@ pub enum BlockAction {
     Mut(Box<dyn FnOnce(&mut [u8]) + Send>),
 }
 
+/// Which counters a timing request is about.
+#[derive(Clone, Copy, Debug)]
+pub enum TimingOp {
+    Read,
+    ReadReset,
+    Flush,
+    FlushReset,
+}
+
+pub struct FileReqTiming {
+    pub op: TimingOp,
+}
+
+/// A counter snapshot, or an acknowledgement for a reset.
+///
+/// Snapshots are owned values rather than references to the live
+/// counters, which cannot leave the reactor task.
+#[derive(Clone, Copy, Debug)]
+pub enum TimingValue {
+    Read(super::ReadTimingSnapshot),
+    Flush(super::FlushTimingSnapshot),
+    Reset,
+}
+
 pub struct FileReqWithBlock {
     pub blk_idx: BlockIndex,
     /// Materialize a zero-filled block if the index has no data.
@@ -366,6 +399,7 @@ pub enum FileReqOp {
     WriteBatch,
     Trunc,
     WithBlock,
+    Timing,
     Flush,
     FlushData,
     #[cfg(feature = "wal")]
@@ -393,6 +427,7 @@ pub union FileReqBody<'a> {
     write_batch: ManuallyDrop<FileReqWriteBatch>,
     trunc: ManuallyDrop<FileReqTrunc>,
     with_block: ManuallyDrop<FileReqWithBlock>,
+    timing: ManuallyDrop<FileReqTiming>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
     #[cfg(feature = "wal")]
@@ -554,6 +589,16 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset: offset }), },
         };
         let resp = FileResp::Trunc(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    pub fn new_timing(op: TimingOp) -> (Self, oneshot::Receiver<FileRespTiming>) {
+        let (tx, rx) = oneshot::channel::<FileRespTiming>();
+        let req = FileReq {
+            op: FileReqOp::Timing,
+            body: FileReqBody { timing: ManuallyDrop::new(FileReqTiming { op }), },
+        };
+        let resp = FileResp::Timing(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -922,6 +967,23 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let offset = req.offset;
                 let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
+            },
+            FileReqOp::Timing => {
+                let md = unsafe { req.body.timing };
+                let req = ManuallyDrop::into_inner(md);
+                let v = match req.op {
+                    TimingOp::Read => TimingValue::Read(self.inner.read_timing().snapshot()),
+                    TimingOp::ReadReset => {
+                        self.inner.read_timing_reset();
+                        TimingValue::Reset
+                    },
+                    TimingOp::Flush => TimingValue::Flush(self.inner.flush_timing().snapshot()),
+                    TimingOp::FlushReset => {
+                        self.inner.flush_timing_reset();
+                        TimingValue::Reset
+                    },
+                };
+                let _ = resp.to_timing().send(Ok(v));
             },
             FileReqOp::WithBlock => {
                 let md = unsafe { req.body.with_block };

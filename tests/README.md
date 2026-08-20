@@ -322,6 +322,11 @@ checkpoint, access-mode errors surfacing through the channel without
 killing the reactor task, and a byte-for-byte equivalence check
 between the closure form and the direct guard form.
 
+Also covers the reactor counter accessors (`fh_read_timing`,
+`fh_flush_timing` and their resets), including that the cache rule
+documented for the byte and block APIs holds on this surface too —
+which was untestable before those accessors existed.
+
 Runs in ~1 s.
 
 ### `integration_reactor_s3_range_lock`

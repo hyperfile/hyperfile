@@ -3,7 +3,7 @@ use aws_sdk_s3::Client;
 use hyperfile_reactor::Reactor;
 use tokio::sync::oneshot;
 use crate::BlockIndex;
-use crate::file::handler::{ChannelGroup, build_channel_group, BlockAction};
+use crate::file::handler::{ChannelGroup, build_channel_group, BlockAction, TimingOp, TimingValue};
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use crate::staging::{s3::S3Staging, StagingIntercept};
@@ -220,6 +220,57 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_truncate(&mut self, offset: usize) -> Result<()>
     {
         let (ctx, rx) = FileContext::new_trunc(offset);
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// Read-side counters for this file. See
+    /// [`ReadTiming`](crate::file::ReadTiming).
+    ///
+    /// Returns an owned snapshot rather than a reference to the live
+    /// counters, which cannot leave the reactor task. Otherwise this
+    /// matches `Hyper::read_timing`.
+    pub async fn fh_read_timing(&self) -> Result<crate::file::ReadTimingSnapshot>
+    {
+        match self.timing(TimingOp::Read).await? {
+            TimingValue::Read(s) => Ok(s),
+            other => panic!("read timing request answered with {other:?}"),
+        }
+    }
+
+    /// Zero the read counters, to bracket a measurement.
+    pub async fn fh_read_timing_reset(&self) -> Result<()>
+    {
+        let _ = self.timing(TimingOp::ReadReset).await?;
+        Ok(())
+    }
+
+    /// Flush-side timings for this file. See
+    /// [`FlushTiming`](crate::file::FlushTiming).
+    ///
+    /// Returns an owned snapshot, for the same reason as
+    /// [`Self::fh_read_timing`]. Hidden to match
+    /// `Hyper::flush_timing`, which is benchmark-only.
+    #[doc(hidden)]
+    pub async fn fh_flush_timing(&self) -> Result<crate::file::FlushTimingSnapshot>
+    {
+        match self.timing(TimingOp::Flush).await? {
+            TimingValue::Flush(s) => Ok(s),
+            other => panic!("flush timing request answered with {other:?}"),
+        }
+    }
+
+    /// Benchmark-only: zero the flush timings.
+    #[doc(hidden)]
+    pub async fn fh_flush_timing_reset(&self) -> Result<()>
+    {
+        let _ = self.timing(TimingOp::FlushReset).await?;
+        Ok(())
+    }
+
+    async fn timing(&self, op: TimingOp) -> Result<TimingValue>
+    {
+        let (ctx, rx) = FileContext::new_timing(op);
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
