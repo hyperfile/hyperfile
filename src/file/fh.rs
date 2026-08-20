@@ -141,6 +141,16 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
+    /// Read `buf.len()` bytes from `off`, returning the number of
+    /// bytes read. Reads stop at `i_size`.
+    ///
+    /// **Does not populate the data cache**, matching
+    /// `Hyper::fs_read`. Reading the same bytes twice fetches them
+    /// twice. A read does consult the cache, so it is served from
+    /// there when the blocks happen to be resident.
+    ///
+    /// `docs/block-api.md` has the full table of which entry points
+    /// populate the cache.
     pub async fn fh_read(&mut self, off: usize, buf: &mut [u8]) -> Result<usize>
     {
         let b = unsafe {
@@ -218,6 +228,11 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// produced. `Ok(None)` when the block is not backed by data, in
     /// which case `f` is not called.
     ///
+    /// **Populates the data cache**, matching `Hyper::fs_block`. A
+    /// block fetched here is retained, so a later block access or byte
+    /// read of it is served from memory. [`Self::fh_read`] does not do
+    /// this.
+    ///
     /// # Why a closure and not a guard
     ///
     /// The direct API hands out a borrow — `Hyper::fs_block` returns a
@@ -258,7 +273,10 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// Writes through the slice land in the buffer the next flush will
     /// write out; no write-back call is needed. `create` materializes
     /// a zero-filled block for an index with no data. `i_size` is not
-    /// changed. See [`Hyper::fs_block_mut`] for the full semantics and
+    /// changed.
+    ///
+    /// **Populates the data cache**, and the block stays cached after
+    /// the flush that persists it. See [`Hyper::fs_block_mut`] for the full semantics and
     /// [`Self::fh_with_block`] for why this takes a closure rather
     /// than returning a guard.
     ///

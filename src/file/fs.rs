@@ -177,6 +177,17 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.release().await
     }
 
+    /// Read `buf.len()` bytes from `off`, returning the number of
+    /// bytes read. Reads stop at `i_size`.
+    ///
+    /// **Does not populate the data cache.** Reading the same bytes
+    /// twice fetches them twice. A read does consult the cache, so it
+    /// is served from there when the blocks happen to be resident —
+    /// for instance after [`Self::fs_block`], or after a write that
+    /// has since been flushed.
+    ///
+    /// `docs/block-api.md` has the full table of which entry points
+    /// populate the cache.
     pub async fn fs_read(&mut self, off: usize, buf: &mut [u8]) -> Result<usize>
     {
         debug!("fs_read - offset: {}, size: {}", off, buf.len());
@@ -223,6 +234,10 @@ impl<'a: 'static> Hyper<'a> {
     /// entry, or an explicit zero block. Use [`Self::fs_block_state`]
     /// to tell those apart.
     ///
+    /// **Populates the data cache.** A block fetched here is retained,
+    /// so a later borrow or byte read of it is served from memory.
+    /// [`Self::fs_read`] does not do this.
+    ///
     /// [`HyperFile::block`]: crate::file::file::HyperFile::block
     pub async fn fs_block(&mut self, idx: BlockIndex) -> Result<Option<BlockRef<'_>>>
     {
@@ -237,6 +252,9 @@ impl<'a: 'static> Hyper<'a> {
     /// [`Self::fs_flush`] persists it. `create` decides whether a
     /// block with no data is materialized as zeros (`true`) or
     /// reported as `Ok(None)` (`false`). `i_size` is not changed.
+    ///
+    /// **Populates the data cache**, and the block stays cached after
+    /// the flush that persists it.
     ///
     /// [`HyperFile::block_mut`]: crate::file::file::HyperFile::block_mut
     pub async fn fs_block_mut(&mut self, idx: BlockIndex, create: bool) -> Result<Option<BlockMut<'_>>>

@@ -191,6 +191,26 @@ A `fs_read` issued on a file whose `i_size` is 0 returns `Ok(0)`
 immediately, before consulting the bmap or staging. The same
 applies for an offset at or past `i_size`.
 
+## Reads and the data cache
+
+Byte reads do not populate the data cache; block access does. Both
+read from it.
+
+| entry point | populates the data cache |
+|---|---|
+| `fs_read` / `fh_read` | **no** |
+| `fs_block` / `fh_with_block` | **yes** |
+| `fs_block_mut` / `fh_with_block_mut` | **yes** |
+
+Reading the same bytes twice through `fs_read` fetches them from
+staging twice. Borrowing the same block twice fetches it once. A byte
+read after a block borrow of the same data is served from memory; a
+block borrow after a byte read is not.
+
+`read_timing` reports this: `data_gets` counts fetches, `cache_hits`
+counts reads served from the cache. See
+[Block API](block-api.md#interaction-with-the-data-cache).
+
 ## Sparse holes (write past EOF without O_APPEND)
 
 `fs_write(off, buf)` where `off > i_size` (and the handle was not

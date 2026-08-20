@@ -165,17 +165,33 @@ Both borrows honor the open access mode, like the byte API:
 
 ## Interaction with the data cache
 
-The borrow comes from whichever cache tier holds the block, and a block
-read through `fs_block` is kept for the next reader. Two configurations
-behave slightly differently:
+The block API populates the data cache; the byte API does not. Both
+read from it.
+
+| entry point | reads the cache | populates the cache |
+|---|---|---|
+| `fs_read` / `fh_read` | yes | **no** |
+| `fs_block` / `fh_with_block` | yes | **yes** |
+| `fs_block_mut` / `fh_with_block_mut` | yes | **yes** |
+| `fs_write` / `fh_write` | yes | while dirty, and kept after the flush only for a partially-written block |
+
+So reading the same bytes twice through `fs_read` fetches them twice,
+while borrowing the same block twice fetches it once. A byte read after
+a block borrow of the same data is served from memory; a block borrow
+after a byte read is not.
+
+`read_timing` reports this directly: `data_gets` counts fetches and
+`cache_hits` counts reads served from the cache.
+
+Two configurations behave differently:
 
 * **Data cache disabled** (`data_cache_blocks = 0`, which `O_DIRECT`
-  without the `wal` feature forces): there is no cached buffer to
-  borrow, so `fs_block` owns the block it loaded for the life of the
-  guard. This is invisible through the API except that the bytes are
-  not retained for a subsequent call.
+  without the `wal` feature forces): nothing is retained by anything.
+  There is no cached buffer to borrow, so `fs_block` owns the block it
+  loaded for the life of the guard, and the bytes are not kept for a
+  subsequent call.
 * **Local-disk data cache**: blocks are views into a memory-mapped
-  file. Nothing about the block API differs, but note this tier keeps a
+  file. Nothing about the block API differs, but this tier keeps a
   fixed pool of block slots, so a working set larger than the pool
   falls back to heap allocations.
 
