@@ -98,6 +98,123 @@ impl FlushTiming {
     }
 }
 
+/// Read-side counters, the counterpart of [`FlushTiming`].
+///
+/// The read path's cost is dominated by object-store round trips, and
+/// there was previously no way to count them: a caller can time a read
+/// but cannot tell one request for a coalesced range from many, or a
+/// cache hit from a fetch. That matters most for callers that assert on
+/// round-trip counts rather than on wall time, since wall time varies
+/// with the network.
+///
+/// Requests are split by what they fetch, because the three answer
+/// different questions:
+///
+/// * data — how well block reads coalesce into ranged requests;
+/// * meta — how many index nodes a lookup had to descend through;
+/// * inode — one per cold open, so mostly a constant.
+///
+/// Counters are shared by every clone of a file's staging handle, so
+/// they cover one file. They are never reset implicitly; call
+/// [`Self::reset`] to bracket a measurement.
+#[derive(Default, Debug)]
+pub struct ReadTiming {
+    /// Object requests issued to fetch data blocks. One coalesced
+    /// range counts once, which is the point.
+    pub data_gets: AtomicU64,
+    /// Bytes returned by those requests, including any read past what
+    /// the caller asked for as a result of coalescing.
+    pub data_bytes: AtomicU64,
+    /// Object requests issued to fetch meta (index) blocks.
+    pub meta_gets: AtomicU64,
+    /// Bytes returned by those requests.
+    pub meta_bytes: AtomicU64,
+    /// Object requests issued to fetch the inode.
+    pub inode_gets: AtomicU64,
+    /// Block reads served from the data cache, without reaching
+    /// staging. Together with `data_gets` this separates "the cache
+    /// worked" from "the read coalesced well".
+    pub cache_hits: AtomicU64,
+    /// Nanoseconds spent awaiting staging reads, so that a share of
+    /// wall time can be attributed to the object store rather than
+    /// inferred.
+    pub staging_ns: AtomicU64,
+}
+
+/// Snapshot of [`ReadTiming`] values at a single point in time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadTimingSnapshot {
+    pub data_gets: u64,
+    pub data_bytes: u64,
+    pub meta_gets: u64,
+    pub meta_bytes: u64,
+    pub inode_gets: u64,
+    pub cache_hits: u64,
+    pub staging_ns: u64,
+}
+
+impl ReadTimingSnapshot {
+    /// Every object request, whatever it fetched.
+    pub fn total_gets(&self) -> u64 {
+        self.data_gets + self.meta_gets + self.inode_gets
+    }
+
+    /// Every byte fetched. Excludes the inode, whose size is not
+    /// tracked separately.
+    pub fn total_bytes(&self) -> u64 {
+        self.data_bytes + self.meta_bytes
+    }
+}
+
+impl ReadTiming {
+    pub fn snapshot(&self) -> ReadTimingSnapshot {
+        ReadTimingSnapshot {
+            data_gets: self.data_gets.load(Ordering::Relaxed),
+            data_bytes: self.data_bytes.load(Ordering::Relaxed),
+            meta_gets: self.meta_gets.load(Ordering::Relaxed),
+            meta_bytes: self.meta_bytes.load(Ordering::Relaxed),
+            inode_gets: self.inode_gets.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            staging_ns: self.staging_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.data_gets.store(0, Ordering::Relaxed);
+        self.data_bytes.store(0, Ordering::Relaxed);
+        self.meta_gets.store(0, Ordering::Relaxed);
+        self.meta_bytes.store(0, Ordering::Relaxed);
+        self.inode_gets.store(0, Ordering::Relaxed);
+        self.cache_hits.store(0, Ordering::Relaxed);
+        self.staging_ns.store(0, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_data_get(&self, bytes: usize, elapsed_ns: u64) {
+        self.data_gets.fetch_add(1, Ordering::Relaxed);
+        self.data_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.staging_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_meta_get(&self, bytes: usize, elapsed_ns: u64) {
+        self.meta_gets.fetch_add(1, Ordering::Relaxed);
+        self.meta_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.staging_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_inode_get(&self, elapsed_ns: u64) {
+        self.inode_gets.fetch_add(1, Ordering::Relaxed);
+        self.staging_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub struct DirtyDataBlocks<'a> {
     pub inner: Option<BTreeMap<BlockIndex, &'a DataBlock>>,
     // if we need to owned (clone) the data

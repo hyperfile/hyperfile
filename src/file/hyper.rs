@@ -64,7 +64,7 @@ impl<'a: 'static> Hyper<'a> {
     pub async fn open(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
-        let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
+        let loader = staging.to_block_loader();
         let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
         let mut file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::open(staging, loader, node_cache, file_config, flags.clone()).await?;
         // POSIX O_TRUNC: when opening an existing regular file with
@@ -86,7 +86,7 @@ impl<'a: 'static> Hyper<'a> {
     pub async fn create(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
     {
         let staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
-        let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
+        let loader = staging.to_block_loader();
         let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
         let file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::new(staging, loader, node_cache, file_config, flags, mode).await?;
         Ok(Self {
@@ -98,7 +98,7 @@ impl<'a: 'static> Hyper<'a> {
     {
         let mut staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         staging.interceptor(interceptor);
-        let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
+        let loader = staging.to_block_loader();
         let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
         let file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::new(staging, loader, node_cache, file_config, flags, mode).await?;
         Ok(Self {
@@ -160,6 +160,21 @@ impl<'a: 'static> Hyper<'a> {
     }
 
     /// Benchmark-only: cumulative per-phase flush timings.
+    /// Read-side counters for this file. See
+    /// [`ReadTiming`](crate::file::ReadTiming).
+    ///
+    /// The read path's cost is dominated by object-store round trips,
+    /// and timing a read cannot tell one coalesced request from many,
+    /// or a cache hit from a fetch.
+    pub fn read_timing(&self) -> &crate::file::ReadTiming {
+        self.inner.read_timing()
+    }
+
+    /// Zero the read counters, to bracket a measurement.
+    pub fn read_timing_reset(&self) {
+        self.inner.read_timing_reset()
+    }
+
     #[doc(hidden)]
     pub fn flush_timing(&self) -> &crate::file::FlushTiming {
         self.inner.flush_timing()

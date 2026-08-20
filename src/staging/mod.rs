@@ -29,6 +29,10 @@ pub trait StagingIntercept<Staging>: Send + Sync {
 }
 
 pub trait Staging<L> {
+    /// Read-side counters for this file. Shared by every clone of the
+    /// handle.
+    fn read_timing(&self) -> &crate::file::ReadTiming;
+
     fn load_inode(&self, buf: &mut [u8]) -> impl Future<Output = Result<Option<OnDiskState>>>;
     fn load_inode_from_segment(&self, buf: &mut [u8], segid: u64) -> impl Future<Output = Result<Option<OnDiskState>>>;
     fn load_segment_timestamp(&self, segid: u64) -> impl Future<Output = Result<(i64, i64)>>;

@@ -19,6 +19,7 @@ tests/
 ├── integration_s3_segment_open.rs           ← segment summary read (`open`)
 ├── integration_s3_block_api.rs              ← block borrow API (`fs_block*`)
 ├── integration_s3_local_disk_cache.rs       ← local-disk data cache tier
+├── integration_s3_read_timing.rs            ← read-side counters (`read_timing`)
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
 ├── integration_reactor_s3_block_api.rs      ← reactor block access (`fh_with_block*`)
 ├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
@@ -274,6 +275,24 @@ without aborting, writing far past EOF, a 4 TiB sparse address space,
 slot recycling under constant eviction, truncate releasing slots
 without leaving stale bytes, and exhausting the slot pool so blocks
 fall back to heap allocations.
+
+Runs in ~2 s.
+
+### `integration_s3_read_timing`
+
+Checks that the read-side counters count what they claim to. The read
+path's cost is dominated by object-store round trips, and wall-clock
+timing cannot tell one request for a coalesced range from many, nor a
+cache hit from a fetch — so these are the assertions that keep the
+counters trustworthy.
+
+Covers: a read spanning 64 contiguous blocks in one segment costing a
+single request; a byte read not populating the data cache, so a second
+read of the same block fetches again; a block borrow populating it, so
+a second borrow is a hit and a later byte read is too; index requests
+counted separately from data requests, including that the batched
+index fetch reports both of the requests it makes; holes and unflushed
+writes costing nothing; and `read_timing_reset` zeroing every counter.
 
 Runs in ~2 s.
 

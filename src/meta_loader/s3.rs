@@ -1,4 +1,5 @@
 use std::io::Result;
+use std::sync::Arc;
 use log::debug;
 use aws_sdk_s3::Client;
 use btree_ondisk::BlockLoader;
@@ -6,12 +7,16 @@ use crate::{BlockPtr, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
 use crate::segment::Segment;
 use crate::s3uri::S3Uri;
+use crate::file::ReadTiming;
 use crate::s3commons::S3Ops;
 
 pub struct S3BlockLoader {
     pub client: Client,
     pub bucket: String,
     pub root_path: String,
+    /// Shared with the file's staging handle so meta-block requests
+    /// land in the same counters as data requests.
+    read_timing: Arc<ReadTiming>,
 }
 
 impl Clone for S3BlockLoader {
@@ -20,16 +25,18 @@ impl Clone for S3BlockLoader {
             client: self.client.to_owned(),
             bucket: self.bucket.clone(),
             root_path: self.root_path.clone(),
+            read_timing: self.read_timing.clone(),
         }
     }
 }
 
 impl S3BlockLoader {
-    pub fn new(client: &Client, bucket: &str, root_path: &str) -> Self {
+    pub fn new(client: &Client, bucket: &str, root_path: &str, read_timing: Arc<ReadTiming>) -> Self {
         Self {
             client: client.to_owned(),
             bucket: bucket.to_string(),
             root_path: root_path.to_string(),
+            read_timing,
         }
     }
 }
@@ -43,7 +50,10 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
         let end = offset + meta_block_size - 1;
         let range = format!("bytes={}-{}", offset, end);
         debug!("read s3://{}/{} from s3 at offset {} for range {}", self.bucket, &key, offset, range);
-        let _ = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await?;
+        let start = std::time::Instant::now();
+        let res = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await;
+        self.read_timing.add_meta_get(meta_block_size, start.elapsed().as_nanos() as u64);
+        let _ = res?;
         // TODO return more
         Ok(Vec::new())
     }

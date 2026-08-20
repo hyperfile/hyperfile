@@ -4,6 +4,7 @@ use log::{trace, debug, warn, error};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::Object;
 use crate::staging::{Staging, FlushInodeFlag};
+use crate::file::ReadTiming;
 use crate::staging::config::StagingConfig;
 use crate::{BlockIndex, BlockPtr, SegmentId};
 use crate::segment;
@@ -29,15 +30,26 @@ pub struct S3Staging {
     pub config: StagingConfig,
     pub runtime_config: HyperFileRuntimeConfig,
     pub interceptor: Option<Arc<dyn StagingIntercept<Self>>>,
+    /// Shared with every clone of this handle and with the block
+    /// loader, so the counts cover the whole file rather than one
+    /// handle.
+    pub read_timing: Arc<ReadTiming>,
 }
 
 impl Staging<S3BlockLoader> for S3Staging {
     fn to_block_loader(&self) -> S3BlockLoader {
-        S3BlockLoader::new(&self.client, &self.bucket, &self.root_path)
+        S3BlockLoader::new(&self.client, &self.bucket, &self.root_path, self.read_timing.clone())
+    }
+
+    fn read_timing(&self) -> &ReadTiming {
+        &self.read_timing
     }
 
     async fn load_inode(&self, buf: &mut [u8]) -> Result<Option<OnDiskState>> {
-        S3Ops::do_get_object(&self.client, &self.bucket, &self.inode_file, buf, None, true).await
+        let start = std::time::Instant::now();
+        let res = S3Ops::do_get_object(&self.client, &self.bucket, &self.inode_file, buf, None, true).await;
+        self.read_timing.add_inode_get(start.elapsed().as_nanos() as u64);
+        res
     }
 
     async fn load_inode_from_segment(&self, buf: &mut [u8], segid: SegmentId) -> Result<Option<OnDiskState>> {
@@ -50,7 +62,10 @@ impl Staging<S3BlockLoader> for S3Staging {
         let inode_off = std::mem::offset_of!(SegmentHeader, s_inode);
         let inode_bytes = std::mem::size_of::<InodeRaw>();
         let range = format!("bytes={}-{}", inode_off, inode_off + inode_bytes - 1);
-        S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await
+        let start = std::time::Instant::now();
+        let res = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await;
+        self.read_timing.add_inode_get(start.elapsed().as_nanos() as u64);
+        res
     }
 
     async fn load_segment_timestamp(&self, segid: SegmentId) -> Result<(i64, i64)> {
@@ -153,7 +168,10 @@ impl Staging<S3BlockLoader> for S3Staging {
         let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
         let range = format!("bytes={}-{}", start_off, end);
         debug!("load_data_block from s3 staging s3://{}/{} at offset: {} range: {} block size: {}", &self.bucket, &key, start_off, &range, block_size);
-        let _ = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await?;
+        let start = std::time::Instant::now();
+        let res = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await;
+        self.read_timing.add_data_get(block_size, start.elapsed().as_nanos() as u64);
+        let _ = res?;
         Ok(())
     }
 
@@ -171,7 +189,10 @@ impl Staging<S3BlockLoader> for S3Staging {
             "load_range from s3 staging s3://{}/{} at offset: {} range: {} len: {}",
             &self.bucket, &key, s3_off, &range, len,
         );
-        let _ = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await?;
+        let start = std::time::Instant::now();
+        let res = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await;
+        self.read_timing.add_data_get(len, start.elapsed().as_nanos() as u64);
+        let _ = res?;
         Ok(())
     }
 
@@ -236,6 +257,7 @@ impl S3Staging {
             config: config,
             runtime_config: runtime_config,
             interceptor: None,
+            read_timing: Arc::new(ReadTiming::default()),
         }
     }
 
@@ -261,6 +283,7 @@ impl S3Staging {
             config: config,
             runtime_config: runtime_config,
             interceptor: None,
+            read_timing: Arc::new(ReadTiming::default()),
         })
     }
 
@@ -286,6 +309,7 @@ impl S3Staging {
             config: config,
             runtime_config: runtime_config,
             interceptor: None,
+            read_timing: Arc::new(ReadTiming::default()),
         })
     }
 
@@ -455,12 +479,23 @@ impl S3Staging {
 
     // fetch meta blocks area from segment
     // return: (meta_block_area_offset, meta_block_size, meta_block count, data chunk)
-    pub(crate) async fn do_fetch_meta_blocks_chunk(client: &Client, bucket: &str, key: &str) -> Result<(usize, usize, usize, Vec<u8>)> {
+    /// Fetch a segment's meta-block chunk.
+    ///
+    /// Issues up to two requests — the header, then the blocks — so it
+    /// takes the counter rather than letting the caller record one
+    /// request for what may be two.
+    pub(crate) async fn do_fetch_meta_blocks_chunk(client: &Client, bucket: &str, key: &str,
+        read_timing: Option<&ReadTiming>) -> Result<(usize, usize, usize, Vec<u8>)> {
         let mut buf = Vec::with_capacity(SegmentHeader::size());
         buf.resize(SegmentHeader::size(), 0);
         // read in header
         let range = format!("bytes={}-{}", 0, SegmentHeader::size() - 1);
-        let _ = S3Ops::do_get_object(client, bucket, key, &mut buf, Some(&range), false).await?;
+        let start = std::time::Instant::now();
+        let res = S3Ops::do_get_object(client, bucket, key, &mut buf, Some(&range), false).await;
+        if let Some(t) = read_timing {
+            t.add_meta_get(SegmentHeader::size(), start.elapsed().as_nanos() as u64);
+        }
+        let _ = res?;
 
         let hdr = SegmentHeader::from_slice(&buf);
         let meta_block_size = (1 << hdr.s_meta_blk_shift) as usize;
@@ -476,14 +511,19 @@ impl S3Staging {
         buf.resize(meta_blocks_len, 0);
         // readin meta blocks
         let range = format!("bytes={}-{}", meta_block_off, meta_block_off + meta_blocks_len - 1);
-        let _ = S3Ops::do_get_object(client, bucket, key, &mut buf, Some(&range), false).await?;
+        let start = std::time::Instant::now();
+        let res = S3Ops::do_get_object(client, bucket, key, &mut buf, Some(&range), false).await;
+        if let Some(t) = read_timing {
+            t.add_meta_get(meta_blocks_len, start.elapsed().as_nanos() as u64);
+        }
+        let _ = res?;
 
         Ok((meta_block_off, meta_block_size, meta_blocks, buf))
     }
 
     pub(crate) async fn do_build_block_map(client: &Client, bucket: &str, key: &str) -> Result<Vec<(BlockIndex, BlockPtr)>> {
 
-        let (_meta_block_off, meta_block_size, _meta_blocks, buf) = Self::do_fetch_meta_blocks_chunk(client, bucket, key).await?;
+        let (_meta_block_off, meta_block_size, _meta_blocks, buf) = Self::do_fetch_meta_blocks_chunk(client, bucket, key, None).await?;
 
         // collect all valid entry from all level 0 node
         let mut v = Vec::new();

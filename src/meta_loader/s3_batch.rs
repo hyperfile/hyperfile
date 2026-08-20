@@ -10,6 +10,7 @@ use crate::{BlockPtr, BMapUserData};
 use crate::meta_format::BlockPtrFormat;
 use crate::segment::Segment;
 use crate::s3uri::S3Uri;
+use crate::file::ReadTiming;
 use crate::BlockIndex;
 use crate::staging::s3::S3Staging;
 
@@ -17,6 +18,9 @@ pub struct S3BlockLoader {
     pub client: Client,
     pub bucket: String,
     pub root_path: String,
+    /// Shared with the file's staging handle so meta-block requests
+    /// land in the same counters as data requests.
+    read_timing: Arc<ReadTiming>,
     backlog: Arc<Mutex<HashMap<u64, HashSet<BlockPtr>>>>, // key: segid, val: blkptr
 }
 
@@ -26,18 +30,20 @@ impl Clone for S3BlockLoader {
             client: self.client.to_owned(),
             bucket: self.bucket.clone(),
             root_path: self.root_path.clone(),
+            read_timing: self.read_timing.clone(),
             backlog: self.backlog.clone(),
         }
     }
 }
 
 impl S3BlockLoader {
-    pub fn new(client: &Client, bucket: &str, root_path: &str) -> Self {
+    pub fn new(client: &Client, bucket: &str, root_path: &str, read_timing: Arc<ReadTiming>) -> Self {
         Self {
             client: client.to_owned(),
             bucket: bucket.to_string(),
             root_path: root_path.to_string(),
             backlog: Arc::new(Mutex::new(HashMap::new())),
+            read_timing,
         }
     }
 }
@@ -50,7 +56,10 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
         let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(this_segid));
 
         debug!("read meta blocks chunk from s3://{}/{} from s3", self.bucket, &key);
-        let (meta_block_offset, seg_meta_block_size, mut meta_blocks, meta_block_buf) = S3Staging::do_fetch_meta_blocks_chunk(&self.client, &self.bucket, &key).await?;
+        // The chunk fetch issues its own requests and counts them
+        // itself, since it may make two.
+        let (meta_block_offset, seg_meta_block_size, mut meta_blocks, meta_block_buf) =
+            S3Staging::do_fetch_meta_blocks_chunk(&self.client, &self.bucket, &key, Some(&self.read_timing)).await?;
         assert!(meta_block_size == seg_meta_block_size);
         assert!(offset >= meta_block_offset);
 

@@ -646,6 +646,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // a clean block into the dirty tier.
             let cache_hit = self.cache.has(&blk_idx);
             if cache_hit {
+                self.staging.read_timing().add_cache_hit();
                 flush_range(&mut ops, &mut current_range);
                 ops.push(ReadOp::Cache {
                     blk_idx,
@@ -1078,6 +1079,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // whose bmap entry is still a placeholder is served from
         // cache.
         if self.cache.has(&blk_idx) {
+            self.staging.read_timing().add_cache_hit();
             let block = self.cache.get(&blk_idx)
                 .expect("cache lost a block between has() and get() under &mut self");
             return Ok(Some(BlockRef::cached(block)));
@@ -1746,6 +1748,18 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     #[doc(hidden)]
     pub fn is_attr_dirty(&self) -> bool {
         self.inode.is_attr_dirty()
+    }
+
+    /// Read-side counters for this file. See [`ReadTiming`].
+    ///
+    /// [`ReadTiming`]: super::ReadTiming
+    pub fn read_timing(&self) -> &super::ReadTiming {
+        self.staging.read_timing()
+    }
+
+    /// Zero the read counters, to bracket a measurement.
+    pub fn read_timing_reset(&self) {
+        self.staging.read_timing().reset();
     }
 
     /// Test-only: whether the bmap tree has dirty meta nodes.
