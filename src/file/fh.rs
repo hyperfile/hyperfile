@@ -336,6 +336,18 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
+    /// How many data blocks are dirty, i.e. would be written by the
+    /// next flush.
+    ///
+    /// The counterpart of `Hyper::dirty_block_count`. Zero means a
+    /// flush would have no data to write, so a caller can skip one.
+    pub async fn fh_dirty_block_count(&self) -> Result<usize>
+    {
+        let (ctx, rx) = FileContext::new_dirty_block_count();
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
     /// Read-side counters for this file. See
     /// [`ReadTiming`](crate::file::ReadTiming).
     ///

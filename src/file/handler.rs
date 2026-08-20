@@ -109,6 +109,7 @@ pub type FileRespTrunc = Result<()>;
 /// own return value travels on its own channel.
 pub type FileRespWithBlock = Result<bool>;
 pub type FileRespTiming = Result<TimingValue>;
+pub type FileRespDirtyBlockCount = Result<usize>;
 /// The bytes read, truncated to what was actually available.
 pub type FileRespReadOwned = Result<Bytes>;
 pub type FileRespFlush = Result<SegmentId>;
@@ -139,6 +140,7 @@ pub enum FileResp {
     Trunc(oneshot::Sender<FileRespTrunc>),
     WithBlock(oneshot::Sender<FileRespWithBlock>),
     Timing(oneshot::Sender<FileRespTiming>),
+    DirtyBlockCount(oneshot::Sender<FileRespDirtyBlockCount>),
     ReadOwned(oneshot::Sender<FileRespReadOwned>),
     Flush(oneshot::Sender<FileRespFlush>),
     #[cfg(feature = "wal")]
@@ -217,6 +219,13 @@ impl FileResp {
         match self {
             Self::ReadOwned(tx) => tx,
             _ => panic!("FileResp::to_read_owned called on wrong variant"),
+        }
+    }
+
+    pub fn to_dirty_block_count(self) -> oneshot::Sender<FileRespDirtyBlockCount> {
+        match self {
+            Self::DirtyBlockCount(tx) => tx,
+            _ => panic!("FileResp::to_dirty_block_count called on wrong variant"),
         }
     }
 
@@ -418,6 +427,8 @@ pub struct FileReqTiming {
     pub op: TimingOp,
 }
 
+pub struct FileReqDirtyBlockCount {}
+
 /// A counter snapshot, or an acknowledgement for a reset.
 ///
 /// Snapshots are owned values rather than references to the live
@@ -489,6 +500,7 @@ pub enum FileReqOp {
     Trunc,
     WithBlock,
     Timing,
+    DirtyBlockCount,
     Flush,
     FlushData,
     #[cfg(feature = "wal")]
@@ -517,6 +529,7 @@ pub union FileReqBody<'a> {
     trunc: ManuallyDrop<FileReqTrunc>,
     with_block: ManuallyDrop<FileReqWithBlock>,
     timing: ManuallyDrop<FileReqTiming>,
+    dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
     #[cfg(feature = "wal")]
@@ -729,6 +742,16 @@ impl<'a> FileContext<'a> {
             }), },
         };
         let resp = FileResp::ReadOwned(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    pub fn new_dirty_block_count() -> (Self, oneshot::Receiver<FileRespDirtyBlockCount>) {
+        let (tx, rx) = oneshot::channel::<FileRespDirtyBlockCount>();
+        let req = FileReq {
+            op: FileReqOp::DirtyBlockCount,
+            body: FileReqBody { dirty_block_count: ManuallyDrop::new(FileReqDirtyBlockCount {}), },
+        };
+        let resp = FileResp::DirtyBlockCount(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
@@ -1106,6 +1129,12 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let offset = req.offset;
                 let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
+            },
+            FileReqOp::DirtyBlockCount => {
+                let md = unsafe { req.body.dirty_block_count };
+                let _ = ManuallyDrop::into_inner(md);
+                let n = self.inner.dirty_block_count();
+                let _ = resp.to_dirty_block_count().send(Ok(n));
             },
             FileReqOp::Timing => {
                 let md = unsafe { req.body.timing };

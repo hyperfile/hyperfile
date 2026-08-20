@@ -906,3 +906,46 @@ async fn concurrent_owned_reads_overlap() {
 
     tf.cleanup(&client).await;
 }
+
+/// `fh_dirty_block_count` lets a caller skip a flush that would have
+/// nothing to write.
+#[tokio::test]
+#[ignore]
+async fn dirty_block_count_tracks_pending_writes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+
+    assert_eq!(fh.fh_dirty_block_count().await.expect("count"), 0,
+        "a fresh file has nothing to write");
+
+    let _ = fh.fh_write(0, &vec![0x11u8; 3 * BLK]).await.expect("write");
+    assert_eq!(fh.fh_dirty_block_count().await.expect("count"), 3,
+        "three blocks written, three dirty");
+
+    let _ = fh.fh_flush().await.expect("flush");
+    assert_eq!(fh.fh_dirty_block_count().await.expect("count"), 0,
+        "a flush clears the dirty set");
+
+    // A block borrow dirties too.
+    let _ = fh.fh_with_block_mut(1, false, |blk| { blk[0] = 0x22; }).await
+        .expect("with_block_mut").expect("mapped");
+    assert_eq!(fh.fh_dirty_block_count().await.expect("count"), 1,
+        "an in-place block edit is a pending write");
+
+    let _ = fh.fh_flush().await.expect("flush");
+    assert_eq!(fh.fh_dirty_block_count().await.expect("count"), 0);
+
+    // A read leaves nothing to write.
+    let _ = fh.fh_read_owned(0, BLK).await.expect("read_owned");
+    assert_eq!(fh.fh_dirty_block_count().await.expect("count"), 0,
+        "reading must not dirty anything");
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
