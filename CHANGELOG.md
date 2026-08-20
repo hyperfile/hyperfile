@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.1] - 2026-08-20
+
+> **Affects 0.6.0 only.** If you took `fh_read_owned` from 0.6.0
+> expecting reactor-mode concurrency, you got a concurrency of 1. Fixed
+> below; no other release is affected, since that entry point was added
+> in 0.6.0.
+
+### Fixed
+
+- **`fh_read_owned` serialized every concurrent reader.** It ran the
+  whole read — object-store round trip included — inside the handler
+  task, which takes `&mut self` and handles one context at a time. Every
+  concurrent reader queued behind the one before it, whatever the caller
+  spawned.
+
+  Reported with measurements from a mount: eight concurrent readers got
+  3.892 MiB/s against 18.24 for `fh_read`, and concurrent was *slower*
+  than a single reader (3.892 against 4.226), which is what queuing looks
+  like.
+
+  The owned read had its own op and its own arm, and that arm used the
+  serial read path deliberately: the spawning path sends its response
+  from a detached task after the arm returns, which would put the
+  buffer's lifetime back in question. That reasoning is right for
+  `fh_read`, whose buffer belongs to the caller, and wrong for a buffer
+  allocated for the request, which belongs to nobody else and can move
+  along with the work.
+
+  It now does what the write side has done all along: `fh_write_owned`
+  shares `FileReqOp::Write` with the borrowed form and distinguishes
+  itself with an `owned` field, which is why writes have had both
+  concurrency and cancellation safety. Reads match — one op, one spawning
+  arm, `FileReqRead::owned` deciding whether the response carries a byte
+  count or the buffer itself, and travelling with the request through the
+  flush-wait and range-lock requeues.
+
+  Measured after the change, eight concurrent 256 KiB reads against the
+  same reads done one after another: 34–38 ms versus 67 ms in release,
+  52–54 ms versus 96–107 ms in debug, stable across five runs.
+  Serialized they would match.
+
+### Added
+
+- `fh_dirty_block_count`, the reactor counterpart of
+  `Hyper::dirty_block_count`. Without it a caller deciding whether an
+  fsync has anything to write could not ask, and had to assume there was
+  always something pending and run the commit path every time.
+
+### Changed
+
+- `spawn_read` now answers its own errors instead of returning them for
+  the dispatch arm to report. The arm used to clone the response sender
+  to keep a second handle for the error path; an owned read answers on a
+  oneshot, which cannot be cloned. One owner of the reply is clearer
+  regardless. The two requeue paths still deliberately do not answer,
+  leaving that to the retried request.
+
 ## [0.6.0] - 2026-08-20
 
 > **`fh_read` and `fh_write` must not be cancelled.** This has always
