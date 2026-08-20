@@ -331,7 +331,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// **Does not populate the data cache**, like every byte read.
     pub async fn fh_read_owned(&self, off: usize, len: usize) -> Result<bytes::Bytes>
     {
-        let (ctx, rx) = FileContext::new_read_owned(off, len);
+        let (ctx, rx) = FileContext::new_read_owned(off, len, self.inner.clone());
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }

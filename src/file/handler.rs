@@ -187,6 +187,32 @@ impl FileResp {
         }
     }
 
+    /// Answer a read, whichever form it took.
+    ///
+    /// A borrowed read reports how many bytes it put in the caller's
+    /// buffer. An owned read hands the buffer over instead, truncated to
+    /// that same count, so `owned` must be the buffer the read filled.
+    pub fn answer_read(self, n: usize, owned: Option<Vec<u8>>) {
+        match self {
+            Self::Read(tx) => { let _ = tx.try_send(Ok(n)); },
+            Self::ReadOwned(tx) => {
+                let mut buf = owned.unwrap_or_default();
+                buf.truncate(n);
+                let _ = tx.send(Ok(Bytes::from(buf)));
+            },
+            _ => panic!("FileResp::answer_read called on wrong variant"),
+        }
+    }
+
+    /// Fail a read, whichever form it took.
+    pub fn fail_read(self, e: Error) {
+        match self {
+            Self::Read(tx) => { let _ = tx.try_send(Err(e)); },
+            Self::ReadOwned(tx) => { let _ = tx.send(Err(e)); },
+            _ => panic!("FileResp::fail_read called on wrong variant"),
+        }
+    }
+
     pub fn to_read_owned(self) -> oneshot::Sender<FileRespReadOwned> {
         match self {
             Self::ReadOwned(tx) => tx,
@@ -277,6 +303,19 @@ impl FileResp {
 
 // define request params
 pub struct FileReqRead<'a> {
+    /// Set when the reactor, not the caller, owns the destination.
+    ///
+    /// `fh_read` points `buf` at the caller's memory, valid only while
+    /// the caller stays parked on the response. `fh_read_owned` instead
+    /// allocates here and points `buf` into it, so the destination
+    /// belongs to the request and travels with it — through the
+    /// flush-wait and range-lock requeues, into the task that fills it,
+    /// and safely past a caller that has gone away. A `Vec` does not
+    /// move its allocation when the handle moves, so `buf` stays valid.
+    ///
+    /// Which of the two it is decides what the response carries: a byte
+    /// count for a borrowed read, the buffer itself for an owned one.
+    pub owned: Option<Vec<u8>>,
     pub buf: &'a mut [u8],
     pub offset: usize,
     pub fh: ChannelGroup<FileContext<'a>>,
@@ -375,16 +414,6 @@ pub enum TimingOp {
     FlushReset,
 }
 
-/// A read whose buffer the reactor allocates and hands back.
-///
-/// Unlike [`FileReqRead`], nothing here points at the caller. That is
-/// the whole point: the caller has nothing borrowed, so dropping the
-/// future cannot leave the reactor writing into freed memory.
-pub struct FileReqReadOwned {
-    pub offset: usize,
-    pub len: usize,
-}
-
 pub struct FileReqTiming {
     pub op: TimingOp,
 }
@@ -460,7 +489,6 @@ pub enum FileReqOp {
     Trunc,
     WithBlock,
     Timing,
-    ReadOwned,
     Flush,
     FlushData,
     #[cfg(feature = "wal")]
@@ -489,7 +517,6 @@ pub union FileReqBody<'a> {
     trunc: ManuallyDrop<FileReqTrunc>,
     with_block: ManuallyDrop<FileReqWithBlock>,
     timing: ManuallyDrop<FileReqTiming>,
-    read_owned: ManuallyDrop<FileReqReadOwned>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
     #[cfg(feature = "wal")]
@@ -544,7 +571,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespRead>(1);
         let req = FileReq {
             op: FileReqOp::Read,
-            body: FileReqBody { read: ManuallyDrop::new(FileReqRead { buf: buf, offset: offset, fh: fh }), },
+            body: FileReqBody { read: ManuallyDrop::new(FileReqRead { buf: buf, offset: offset, fh: fh, owned: None }), },
         };
         let resp = FileResp::Read(tx.clone());
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
@@ -679,11 +706,27 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
     }
 
-    pub fn new_read_owned(offset: usize, len: usize) -> (Self, oneshot::Receiver<FileRespReadOwned>) {
+    /// A read whose destination the reactor owns. Shares
+    /// [`FileReqOp::Read`] with the borrowed form, so it takes the same
+    /// spawning path; see [`FileReqRead::owned`].
+    pub fn new_read_owned(offset: usize, len: usize, fh: ChannelGroup<FileContext<'a>>)
+        -> (Self, oneshot::Receiver<FileRespReadOwned>)
+    {
         let (tx, rx) = oneshot::channel::<FileRespReadOwned>();
+        let mut owned = vec![0u8; len];
+        // SAFETY: points into the `Vec` stored alongside it. A `Vec`
+        // keeps its allocation put when the handle moves, and the handle
+        // travels with the request, so the referent outlives every
+        // stage that writes to it. The `Vec` is not touched again until
+        // the reads have finished and it is moved out to be returned.
+        let slice: &'a mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(owned.as_mut_ptr(), owned.len())
+        };
         let req = FileReq {
-            op: FileReqOp::ReadOwned,
-            body: FileReqBody { read_owned: ManuallyDrop::new(FileReqReadOwned { offset, len }), },
+            op: FileReqOp::Read,
+            body: FileReqBody { read: ManuallyDrop::new(FileReqRead {
+                buf: slice, offset, fh, owned: Some(owned),
+            }), },
         };
         let resp = FileResp::ReadOwned(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
@@ -872,10 +915,10 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 #[cfg(feature = "range-lock")]
                 let range = req.offset as u64..(req.offset + req.buf.len()) as u64;
-                // prepare error response handler
-                let _resp_read = resp.to_read();
-                let resp_read = _resp_read.clone();
-                let resp = FileResp::Read(_resp_read);
+                // `spawn_read` answers its own errors, so the response
+                // is handed straight over. An owned read replies on a
+                // oneshot, which cannot be cloned for a second owner the
+                // way the borrowed form's mpsc sender was.
                 let res = self.inner.spawn_read(req, resp).await;
                 match res {
                     Ok(_) => {}
@@ -883,7 +926,6 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                         if e.kind() != ErrorKind::ResourceBusy {
                             #[cfg(feature = "range-lock")]
                             self.inner.range_lock.try_unlock(range);
-                            let _ = resp_read.try_send(res);
                         }
                     },
                 }
@@ -1064,26 +1106,6 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let offset = req.offset;
                 let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
-            },
-            FileReqOp::ReadOwned => {
-                let md = unsafe { req.body.read_owned };
-                let r = ManuallyDrop::into_inner(md);
-                // The buffer is local to this arm and the read runs to
-                // completion before the arm returns, so nothing here
-                // outlives its owner. This deliberately uses the
-                // serial read path rather than the spawning one, whose
-                // response is sent from a detached task after the arm
-                // has already returned — that would put the buffer's
-                // lifetime back in question.
-                let mut owned = vec![0u8; r.len];
-                let out = match self.inner.read(r.offset, &mut owned).await {
-                    Ok(n) => {
-                        owned.truncate(n);
-                        Ok(Bytes::from(owned))
-                    },
-                    Err(e) => Err(e),
-                };
-                let _ = resp.to_read_owned().send(out);
             },
             FileReqOp::Timing => {
                 let md = unsafe { req.body.timing };

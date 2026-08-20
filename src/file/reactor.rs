@@ -95,13 +95,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     // for spawn_read/spawn_write resp is based on mpsc channel
     // so use try_send() instead send()
-    pub async fn spawn_read(&mut self, req: FileReqRead<'a>, resp: FileResp) -> Result<usize> {
+    pub async fn spawn_read(&mut self, mut req: FileReqRead<'a>, resp: FileResp) -> Result<usize> {
         // POSIX: a read on a handle not opened for reading fails with
         // EBADF. Checked before the flush-state test and the range
         // lock, for the same reason as spawn_write(): the request must
         // not acquire state that an error path would have to unwind.
+        // Errors are answered here rather than by the caller. The
+        // response may be a oneshot — an owned read cannot clone its
+        // sender the way the borrowed form did — so there is exactly
+        // one owner of the reply, and it is this function. The two
+        // requeue paths below deliberately do not answer: they hand the
+        // response on to the retried request.
         if !self.flags.is_readable() {
-            return Err(Self::ebadf_bad_access_mode());
+            let e = Self::ebadf_bad_access_mode();
+            resp.fail_read(Self::ebadf_bad_access_mode());
+            return Err(e);
         }
         let off = req.offset;
         let len = req.buf.len();
@@ -124,6 +132,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
         }
         let mut buf = req.buf;
+        // Taken now so the send sites below can hand it back. `buf`
+        // already points into it; nothing touches the `Vec` itself until
+        // the reads are done and it is moved into the response.
+        let owned = req.owned.take();
 
         let _permit = self.sema.clone().acquire_owned().await.unwrap();
 
@@ -131,7 +143,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if off >= self.inode.size() {
             #[cfg(feature = "range-lock")]
             self.range_lock.try_unlock(range);
-            let _ = resp.to_read().try_send(Ok(0));
+            resp.answer_read(0, owned);
             return Ok(0);
         }
         // if requested buffer exceed file size, cut off tailing buffer
@@ -149,12 +161,18 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
             #[cfg(feature = "range-lock")]
             self.range_lock.try_unlock(range);
-            let _ = resp.to_read().try_send(Ok(0));
+            resp.answer_read(0, owned);
             return Ok(0);
         }
 
         // Stage 1: build coalesced plan (shared with direct API).
-        let plan = self.plan_read(off, buf_len).await?;
+        let plan = match self.plan_read(off, buf_len).await {
+            Ok(p) => p,
+            Err(e) => {
+                resp.fail_read(Error::new(e.kind(), format!("{e}")));
+                return Err(e);
+            },
+        };
         debug!("spawn_read - planned {} ops for {} bytes", plan.len(), buf_len);
 
         // Stage 2: walk plan + buf in lockstep. Synchronous ops
@@ -232,7 +250,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
             #[cfg(feature = "range-lock")]
             self.range_lock.try_unlock(range);
-            let _ = resp.to_read().try_send(Ok(total_bytes));
+            resp.answer_read(total_bytes, owned);
             return Ok(total_bytes);
         }
 
@@ -251,7 +269,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             assert!(total_bytes == actual);
             #[cfg(feature = "range-lock")]
             range_lock.unlock(range).await;
-            let _ = resp.to_read().try_send(Ok(actual));
+            resp.answer_read(actual, owned);
         });
 
         Ok(total_bytes)

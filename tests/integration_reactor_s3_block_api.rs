@@ -820,3 +820,89 @@ async fn cancelling_the_owned_variants_is_safe() {
     let _ = fh.fh_release().await.expect("release");
     tf.cleanup(&client).await;
 }
+
+/// Concurrent readers must actually overlap.
+///
+/// The owned read used to run to completion inside the handler task,
+/// which processes one request at a time, so every concurrent reader
+/// queued behind the one before it — concurrency was 1 no matter how
+/// many tasks the caller spawned. It now shares the `Read` op with the
+/// borrowed form and takes the same spawning path.
+///
+/// Wall time is the only way to see this, so the assertion is a loose
+/// one: eight concurrent readers must not take as long as doing the
+/// same eight reads one after another. Serialized, they would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn concurrent_owned_reads_overlap() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const N: usize = 8;
+    const CHUNK: usize = 256 * 1024;
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("fh create");
+        let _ = fh.fh_write(0, &vec![0x5Au8; N * CHUNK]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    // Serial baseline, cold handle.
+    let serial = {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
+        ).await.expect("fh open");
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let b = fh.fh_read_owned(i * CHUNK, CHUNK).await.expect("read_owned");
+            assert_eq!(b.len(), CHUNK);
+        }
+        let d = t.elapsed();
+        let _ = fh.fh_release().await.expect("release");
+        d
+    };
+
+    // Concurrent, cold handle. Clones share one reactor task, which is
+    // the point: the requests have to be in flight together.
+    let concurrent = {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
+        ).await.expect("fh open");
+        let t = std::time::Instant::now();
+        let mut set = Vec::new();
+        for i in 0..N {
+            let mut c = fh.clone();
+            set.push(tokio::spawn(async move {
+                let b = c.fh_read_owned(i * CHUNK, CHUNK).await.expect("read_owned");
+                assert_eq!(b.len(), CHUNK);
+                assert!(b.iter().all(|x| *x == 0x5A));
+            }));
+        }
+        for j in set {
+            j.await.expect("task");
+        }
+        let d = t.elapsed();
+        let _ = fh.fh_release().await.expect("release");
+        d
+    };
+
+    eprintln!("owned reads: {N} serial {:?}, {N} concurrent {:?}", serial, concurrent);
+    // Serialized, the concurrent run would match the serial one. Ask
+    // only for a clear improvement, so the test does not turn flaky on a
+    // slow or contended network.
+    // Fully serialized, the concurrent run would match the serial one.
+    // The margin is deliberately loose: the handler still plans and
+    // dispatches requests one at a time, so the overlap is partial, and
+    // network variance is on the same order as the difference.
+    assert!(concurrent * 4 < serial * 3,
+        "{N} concurrent owned reads took {:?} against {:?} serially, so they are \
+         not overlapping — the request is being run to completion inside the handler",
+        concurrent, serial);
+
+    tf.cleanup(&client).await;
+}
