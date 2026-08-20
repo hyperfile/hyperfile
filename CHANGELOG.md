@@ -9,6 +9,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.5.2] - 2026-08-20
+
+### Added
+
+- **Read-side counters**, the counterpart of `FlushTiming`. Read cost is
+  dominated by object-store round trips, and wall-clock timing cannot
+  tell one request for a coalesced range from many, nor a cache hit from
+  a fetch.
+
+  ```rust
+  Hyper::read_timing() -> &ReadTiming        // snapshot() / reset()
+  Hyper::read_timing_reset()
+  ```
+
+  Requests are split by what they fetch — data blocks, index nodes, the
+  inode — because the three answer different questions: how well block
+  reads coalesce, how many nodes a lookup descended, and a per-open
+  constant. `cache_hits` counts block reads that never reached staging,
+  and `staging_ns` lets a share of wall time be attributed rather than
+  inferred.
+
+  For scale, the same 1 MiB of data with only the request granularity
+  varying:
+
+  | | `data_gets` | `meta_gets` |
+  |---|---|---|
+  | one `fs_read` of 1 MiB | 1 | 4 |
+  | 256 `fs_read` of 4 KiB | 256 | 4 |
+  | 256 `fs_block` | 256 | 4 |
+
+- The same counters on the reactor surface: `fh_read_timing` and
+  `fh_read_timing_reset`, plus `fh_flush_timing` and
+  `fh_flush_timing_reset`, which the reactor handle never had. These
+  return owned snapshots rather than references to the live counters,
+  which cannot leave the reactor task.
+
+### Documentation
+
+- **Which entry points populate the data cache is now stated.** The
+  block API populates it, the byte API does not, and both read from it:
+
+  | entry point | populates the data cache |
+  |---|---|
+  | `fs_read` / `fh_read` | no |
+  | `fs_block` / `fh_with_block` | yes |
+  | `fs_block_mut` / `fh_with_block_mut` | yes |
+
+  So reading the same bytes twice through `fs_read` fetches them from
+  staging twice, while borrowing the same block twice fetches it once. A
+  byte read after a block borrow of the same data is served from memory;
+  a block borrow after a byte read is not.
+
+  This is long-standing behavior, not a change, but nothing said so —
+  `docs/block-api.md`'s cache section described only `fs_block`, and
+  `fs_read` and `fh_read` had no doc comment at all. Worth checking if
+  you warm a range with `fs_read` and then borrow its blocks
+  individually: every borrow fetches again. `read_timing` now shows
+  this in one measurement.
+
+  Covered in `docs/block-api.md`, `docs/posix.md`, and the rustdoc for
+  each entry point.
+
+### Tests
+
+- `integration_s3_read_timing`, 7 cases, checking the counters count
+  what they claim: 64 contiguous blocks in one segment costing a single
+  request, the cache-population asymmetry in both directions, index
+  requests counted separately from data requests (including that the
+  batched index fetch reports both of the requests it makes), holes and
+  unflushed writes costing nothing, and `reset` zeroing everything.
+- Three cases added to `integration_reactor_s3_block_api` covering the
+  reactor accessors, and asserting the cache rule holds on that surface
+  too — untestable before the accessors existed.
+
 ## [0.5.1] - 2026-08-19
 
 > **If you used `fs_block_mut` or `fh_with_block_mut` on 0.5.0, some of
