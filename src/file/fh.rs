@@ -4,6 +4,30 @@ use hyperfile_reactor::Reactor;
 use tokio::sync::oneshot;
 use crate::BlockIndex;
 use crate::file::handler::{ChannelGroup, build_channel_group, BlockAction, TimingOp, TimingValue};
+
+/// Stops a borrowed closure from running after the caller has gone.
+///
+/// `fh_with_block*` erases the lifetime of a closure that may borrow
+/// the caller's locals, so the closure must not run once the caller
+/// has returned, unwound, or been cancelled. This guard marks the
+/// shared gate on drop; the dispatcher checks it under the same lock
+/// and skips the closure if it is set.
+///
+/// Dropping it blocks only if the closure is running at that instant,
+/// and the dispatcher takes the gate after the block is in hand, so
+/// the wait is one closure body with no I/O in it. Waiting across I/O
+/// would deadlock: the reactor's object-store work can be driven by
+/// the caller's runtime.
+struct BorrowGuard {
+    gate: crate::file::handler::BlockActionGate,
+}
+
+impl Drop for BorrowGuard {
+    fn drop(&mut self) {
+        let mut cancelled = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        *cancelled = true;
+    }
+}
 use crate::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use crate::staging::{s3::S3Staging, StagingIntercept};
@@ -301,20 +325,40 @@ impl<'a: 'static> HyperFileHandler<'a> {
     ///
     /// So the action travels to the block. `f` runs inside the reactor
     /// task while it holds the real borrow, and only owned values
-    /// cross the channel — hence the `Send + 'static` bounds. Move
-    /// what `f` needs into it and return what the caller needs out.
+    /// cross the channel.
+    ///
+    /// `f` may borrow the caller's locals — it is not required to be
+    /// `'static`. That is what lets a caller copy straight out of the
+    /// block into a buffer it already owns, rather than returning an
+    /// owned buffer and copying again. `Send` is still required,
+    /// because `f` runs on the reactor's thread.
     ///
     /// The slice is always `data_block_size` bytes.
+    ///
+    /// # Cancellation
+    ///
+    /// If this future is dropped while the reactor is still running
+    /// `f`, `Drop` blocks until the reactor is finished with it. `f`
+    /// may hold references into the caller's frame, and a cancelled
+    /// caller must not free what `f` still points at. The block is
+    /// short — one closure body, no I/O, since the block is already in
+    /// hand by then — and the ordinary path never blocks at all.
     pub async fn fh_with_block<R, F>(&mut self, idx: BlockIndex, f: F) -> Result<Option<R>>
     where
-        F: FnOnce(&[u8]) -> R + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce(&[u8]) -> R + Send,
+        R: Send,
     {
         let (rtx, rrx) = oneshot::channel::<R>();
-        let action = BlockAction::Ref(Box::new(move |buf: &[u8]| {
+        let action: Box<dyn FnOnce(&[u8]) + Send + '_> = Box::new(move |buf: &[u8]| {
             let _ = rtx.send(f(buf));
-        }));
-        self.dispatch_with_block(idx, false, action, rrx).await
+        });
+        // SAFETY: erases the closure's lifetime so it can travel to the
+        // reactor, whose request type is `'static`. The closure is only
+        // reachable until the reactor drops the request, and
+        // `BlockActionDone` makes the caller wait for exactly that
+        // before returning or unwinding — see `dispatch_with_block`.
+        let action: Box<dyn FnOnce(&[u8]) + Send + 'static> = unsafe { std::mem::transmute(action) };
+        self.dispatch_with_block(idx, false, BlockAction::Ref(action), rrx).await
     }
 
     /// Run `f` against block `idx` for modification, and return what
@@ -327,21 +371,24 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// changed.
     ///
     /// **Populates the data cache**, and the block stays cached after
-    /// the flush that persists it. See [`Hyper::fs_block_mut`] for the full semantics and
-    /// [`Self::fh_with_block`] for why this takes a closure rather
-    /// than returning a guard.
+    /// the flush that persists it. See [`Hyper::fs_block_mut`] for the
+    /// full semantics and [`Self::fh_with_block`] for why this takes a
+    /// closure rather than returning a guard, for the `Send`-but-not-
+    /// `'static` bound, and for what cancellation does.
     ///
     /// [`Hyper::fs_block_mut`]: crate::file::hyper::Hyper::fs_block_mut
     pub async fn fh_with_block_mut<R, F>(&mut self, idx: BlockIndex, create: bool, f: F) -> Result<Option<R>>
     where
-        F: FnOnce(&mut [u8]) -> R + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce(&mut [u8]) -> R + Send,
+        R: Send,
     {
         let (rtx, rrx) = oneshot::channel::<R>();
-        let action = BlockAction::Mut(Box::new(move |buf: &mut [u8]| {
+        let action: Box<dyn FnOnce(&mut [u8]) + Send + '_> = Box::new(move |buf: &mut [u8]| {
             let _ = rtx.send(f(buf));
-        }));
-        self.dispatch_with_block(idx, create, action, rrx).await
+        });
+        // SAFETY: as in `fh_with_block`.
+        let action: Box<dyn FnOnce(&mut [u8]) + Send + 'static> = unsafe { std::mem::transmute(action) };
+        self.dispatch_with_block(idx, create, BlockAction::Mut(action), rrx).await
     }
 
     /// Shared tail of the two `fh_with_block*` entry points: send the
@@ -354,10 +401,20 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rrx: oneshot::Receiver<R>,
     ) -> Result<Option<R>>
     {
-        let (ctx, rx) = FileContext::new_with_block(idx, create, action);
+        // Shared with the request. Dropping the guard — on the normal
+        // path, on an early return, while unwinding, or on
+        // cancellation — closes the gate, so the borrowed closure
+        // cannot run afterwards.
+        let gate: crate::file::handler::BlockActionGate =
+            std::sync::Arc::new(std::sync::Mutex::new(false));
+        let guard = BorrowGuard { gate: gate.clone() };
+
+        let (ctx, rx) = FileContext::new_with_block(idx, create, action, gate);
         self.inner.send(ctx)?;
         let ran = rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))??;
+        // The action has already run by the time the reactor answers.
+        drop(guard);
         if !ran {
             return Ok(None);
         }

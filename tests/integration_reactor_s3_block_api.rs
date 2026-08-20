@@ -514,3 +514,151 @@ async fn reactor_flush_timing_and_resets() {
     let _ = fh.fh_release().await.expect("release");
     tf.cleanup(&client).await;
 }
+
+// --- borrowing closures ---
+//
+// `fh_with_block*` requires `Send` but not `'static`, so a closure may
+// borrow the caller's locals. That is what lets a caller copy straight
+// out of a block into a buffer it already owns, instead of returning an
+// owned buffer and copying a second time.
+
+/// The read direction: copy out of the block into a caller-owned
+/// buffer, by mutable reference. Under a `'static` bound this could
+/// not be expressed.
+#[tokio::test]
+#[ignore]
+async fn with_block_closure_may_borrow_caller_locals() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+
+    let mut payload = vec![0u8; 2 * BLK];
+    payload[0..BLK].fill(0xA1);
+    payload[BLK..].fill(0xB2);
+    let _ = fh.fh_write(0, &payload).await.expect("write");
+    let _ = fh.fh_flush().await.expect("flush");
+
+    // Borrow a local buffer mutably from inside the closure.
+    let mut out = vec![0u8; BLK];
+    let n = fh.fh_with_block(0, |blk| {
+        out.copy_from_slice(blk);
+        blk.len()
+    }).await.expect("with_block").expect("mapped");
+    assert_eq!(n, BLK);
+    assert!(out.iter().all(|b| *b == 0xA1), "the closure should have filled the caller's buffer");
+
+    // Borrow immutably too, and mix with a mutable borrow of something
+    // else, to be sure the bound is genuinely just `Send`.
+    let expect = 0xB2u8;
+    let mut hits = 0usize;
+    let all_match = fh.fh_with_block(1, |blk| {
+        hits += 1;
+        blk.iter().all(|b| *b == expect)
+    }).await.expect("with_block").expect("mapped");
+    assert!(all_match);
+    assert_eq!(hits, 1, "the closure should have run exactly once");
+
+    // The write direction: copy the caller's bytes in without an
+    // intervening owned copy.
+    let src: Vec<u8> = (0..64u8).collect();
+    let written = fh.fh_with_block_mut(0, false, |blk| {
+        blk[0..src.len()].copy_from_slice(&src);
+        src.len()
+    }).await.expect("with_block_mut").expect("mapped");
+    assert_eq!(written, src.len());
+    let _ = fh.fh_flush().await.expect("flush");
+
+    let mut check = vec![0u8; 64];
+    let _ = fh.fh_read(0, &mut check).await.expect("read back");
+    assert_eq!(check, src, "the in-place write should have landed");
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
+
+/// A closure that borrows a local must still be able to report an
+/// error out, and a hole must leave the borrowed state untouched.
+#[tokio::test]
+#[ignore]
+async fn borrowing_closure_on_a_hole_does_not_run() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+    let _ = fh.fh_write(2 * BLK, &vec![0xDDu8; BLK]).await.expect("write");
+    let _ = fh.fh_flush().await.expect("flush");
+
+    let mut touched = false;
+    let got = fh.fh_with_block(1, |_| { touched = true; }).await.expect("with_block");
+    assert!(got.is_none(), "a hole must report None");
+    assert!(!touched, "the closure must not run for a hole, so the borrow is untouched");
+
+    // The same local is still usable afterwards.
+    let got = fh.fh_with_block(2, |blk| { touched = true; blk[0] }).await
+        .expect("with_block").expect("mapped");
+    assert_eq!(got, 0xDD);
+    assert!(touched);
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
+
+/// Cancelling the future must not leave the reactor running a closure
+/// that points into a freed frame. `Drop` waits for the reactor to be
+/// done, so the handle stays usable and nothing is corrupted.
+///
+/// This cannot observe the unsound version failing — that would be
+/// undefined behavior, not a test failure — but it does exercise the
+/// wait, and asserts the handle and the data survive.
+#[tokio::test]
+#[ignore]
+async fn cancelling_a_borrowing_closure_is_safe() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+    let _ = fh.fh_write(0, &vec![0x33u8; 4 * BLK]).await.expect("write");
+    let _ = fh.fh_flush().await.expect("flush");
+
+    // Cancel repeatedly with a timeout short enough to often fire
+    // before the reactor answers.
+    for i in 0..32u64 {
+        let mut scratch = vec![0u8; BLK];
+        let fut = fh.fh_with_block(i % 4, |blk| {
+            scratch.copy_from_slice(blk);
+            scratch[0]
+        });
+        match tokio::time::timeout(std::time::Duration::from_micros(1), fut).await {
+            Ok(Ok(Some(b))) => assert_eq!(b, 0x33),
+            Ok(Ok(None)) => panic!("block {} should be mapped", i % 4),
+            Ok(Err(e)) => panic!("with_block failed: {e}"),
+            Err(_) => { /* cancelled; the guard waited for the reactor */ },
+        }
+        // `scratch` drops here. Under the unsound version the reactor
+        // could still be writing into it.
+    }
+
+    // The handle is still usable and the data is intact.
+    let b = fh.fh_with_block(0, |blk| blk[0]).await.expect("with_block").expect("mapped");
+    assert_eq!(b, 0x33);
+    let mut buf = vec![0u8; 4 * BLK];
+    let n = fh.fh_read(0, &mut buf).await.expect("read");
+    assert_eq!(n, 4 * BLK);
+    assert!(buf.iter().all(|b| *b == 0x33), "data must be intact after cancellations");
+
+    let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}

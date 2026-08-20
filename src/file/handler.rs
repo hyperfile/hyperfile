@@ -1,5 +1,6 @@
 //! impl request handler style IO process
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use std::io::{Error, Result, ErrorKind};
 #[cfg(feature = "wal")]
 use log::{warn, info, debug};
@@ -314,10 +315,35 @@ pub struct FileReqTrunc {
 /// closure in one that sends the result down a dedicated channel,
 /// which keeps this type free of the caller's return type and so
 /// storable in `FileReqBody`.
+///
+/// The boxes are `'static` in the type but not in fact: the closure
+/// may borrow the caller's locals, and `fh_with_block*` erases that
+/// lifetime to get it here. What keeps that sound is
+/// [`BlockActionDone`], not the type.
 pub enum BlockAction {
     Ref(Box<dyn FnOnce(&[u8]) + Send>),
     Mut(Box<dyn FnOnce(&mut [u8]) + Send>),
 }
+
+/// Decides whether a borrowed closure may still run.
+///
+/// The closure may hold references into the caller's frame, so it must
+/// not run after the caller has gone. Awaiting the response covers the
+/// ordinary path, but an awaiting future can be dropped, and a
+/// cancelled caller would free what the closure still points at.
+///
+/// `true` means the caller is gone. The caller sets it when its guard
+/// drops; the dispatcher checks it while holding the lock and skips the
+/// closure if set. Holding the lock across the check and the call is
+/// what closes the race.
+///
+/// The lock is deliberately taken *after* the block has been fetched,
+/// so the critical section is one closure body with no I/O in it. A
+/// cancelling caller therefore blocks for microseconds at worst. This
+/// matters: the reactor's object-store I/O can be driven by the
+/// caller's runtime, so blocking the caller across an await would
+/// deadlock.
+pub type BlockActionGate = Arc<std::sync::Mutex<bool>>;
 
 /// Which counters a timing request is about.
 #[derive(Clone, Copy, Debug)]
@@ -349,6 +375,9 @@ pub struct FileReqWithBlock {
     /// Ignored by [`BlockAction::Ref`], which cannot create.
     pub create: bool,
     pub action: BlockAction,
+    /// Guards `action` against running after the caller is gone. See
+    /// [`BlockActionGate`].
+    pub gate: BlockActionGate,
 }
 
 pub struct FileReqGetAttr {}
@@ -602,14 +631,14 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
-    pub fn new_with_block(blk_idx: BlockIndex, create: bool, action: BlockAction)
+    pub fn new_with_block(blk_idx: BlockIndex, create: bool, action: BlockAction, gate: BlockActionGate)
         -> (Self, oneshot::Receiver<FileRespWithBlock>)
     {
         let (tx, rx) = oneshot::channel::<FileRespWithBlock>();
         let req = FileReq {
             op: FileReqOp::WithBlock,
             body: FileReqBody {
-                with_block: ManuallyDrop::new(FileReqWithBlock { blk_idx, create, action }),
+                with_block: ManuallyDrop::new(FileReqWithBlock { blk_idx, create, action, gate }),
             },
         };
         let resp = FileResp::WithBlock(tx);
@@ -988,21 +1017,36 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::WithBlock => {
                 let md = unsafe { req.body.with_block };
                 let req = ManuallyDrop::into_inner(md);
-                let FileReqWithBlock { blk_idx, create, action } = req;
+                let FileReqWithBlock { blk_idx, create, action, gate } = req;
                 // The borrow stays inside this task for the whole
                 // call; only the action's own result leaves, on the
                 // channel its closure captured.
+                // Fetch the block first, then take the gate to run the
+                // action. Nothing awaits inside the gate, so a
+                // cancelling caller waits only for the closure body.
                 let res = match action {
                     BlockAction::Ref(f) => {
                         match self.inner.block(blk_idx).await {
-                            Ok(Some(block)) => { f(block.as_slice()); Ok(true) },
+                            Ok(Some(block)) => {
+                                let cancelled = gate.lock().unwrap_or_else(|e| e.into_inner());
+                                if !*cancelled {
+                                    f(block.as_slice());
+                                }
+                                Ok(true)
+                            },
                             Ok(None) => Ok(false),
                             Err(e) => Err(e),
                         }
                     },
                     BlockAction::Mut(f) => {
                         match self.inner.block_mut(blk_idx, create).await {
-                            Ok(Some(mut block)) => { f(block.as_mut_slice()); Ok(true) },
+                            Ok(Some(mut block)) => {
+                                let cancelled = gate.lock().unwrap_or_else(|e| e.into_inner());
+                                if !*cancelled {
+                                    f(block.as_mut_slice());
+                                }
+                                Ok(true)
+                            },
                             Ok(None) => Ok(false),
                             Err(e) => Err(e),
                         }
@@ -1192,6 +1236,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
 mod tests {
     use super::*;
     use std::mem::ManuallyDrop;
+use std::sync::Arc;
     use tokio::task::LocalSet;
     use hyperfile_reactor::Reactor;
 

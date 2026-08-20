@@ -31,11 +31,16 @@ On `HyperFileHandler` (reactor API) — closure-scoped, see
 
 ```rust
 async fn fh_with_block<R, F>(&mut self, idx: BlockIndex, f: F) -> Result<Option<R>>
-where F: FnOnce(&[u8]) -> R + Send + 'static, R: Send + 'static;
+where F: FnOnce(&[u8]) -> R + Send, R: Send;
 
 async fn fh_with_block_mut<R, F>(&mut self, idx: BlockIndex, create: bool, f: F) -> Result<Option<R>>
-where F: FnOnce(&mut [u8]) -> R + Send + 'static, R: Send + 'static;
+where F: FnOnce(&mut [u8]) -> R + Send, R: Send;
 ```
+
+`f` may borrow the caller's locals — it is not `'static`. That is what
+lets a caller copy straight out of a block into a buffer it already
+owns, instead of returning an owned buffer and copying again. `Send` is
+still required, because `f` runs on the reactor's thread.
 
 Both forms address blocks by index, and the slice is always exactly
 `data_block_size` bytes.
@@ -148,6 +153,15 @@ what the closure needs into it, and return what the caller needs out.
 
 `fh_with_block*` returns `Ok(None)` without running the closure when
 the block has no data.
+
+### Cancellation
+
+Because `f` may borrow the caller's frame, it must not run once the
+caller is gone. If the future is dropped before the reactor has run
+`f`, `f` is skipped; if it is dropped while `f` is running, `Drop`
+waits for `f` to finish. The wait is one closure body — the block is
+already in hand by then and nothing awaits — so it is bounded and
+cannot deadlock against the reactor's I/O.
 
 ## Access mode
 
