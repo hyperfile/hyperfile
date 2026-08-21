@@ -103,6 +103,39 @@ including a failed requeue; leaving it set would stall every subsequent
 operation, which is why nothing releases a range lock by panicking out of
 a spawned task.
 
+### Reads during a flush, and what WAL changes
+
+Without WAL a flush stops the world. It drains the dirty cache and
+rewrites the bmap underneath, and there is nowhere else to get the data,
+so `spawn_read` and the block read path defer for as long as
+`state.is_flushing()` is set and retry afterwards.
+
+With WAL they do not defer, and this is a large part of why writing the
+WAL first is worth doing. A WAL-protected flush publishes the bmap
+pointing at the new segment, keeps that segment pinned in memory
+registered in `flushing_segments`, and hands the upload to a background
+task. Because the WAL already holds the data, the flush's completion is a
+given: a failure is recovered by replaying the WAL rather than by
+unwinding what the flush published. So the pinned buffer can be treated as
+though it were already on staging, and the read planner emits an `Inmem`
+op that copies from it — no S3 GET, and no waiting for one.
+
+The window is real and reads land in it routinely: a reader running
+against a task that writes and flushes in a loop serves thousands of reads
+from the pinned segment where deferring managed a couple of hundred, since
+a deferred read spends the window being requeued and retried rather than
+answering.
+
+A read planned as `Inmem` can still find the segment gone by the time it
+runs — the flush completes, the entry is removed and the buffer dropped.
+That is not a failure either: the same bytes are on staging at the same
+offset, so the read falls back to reading them from there. Both outcomes
+occur in a single run of the test that covers this.
+
+Note that this applies to reads only. Writes still wait for a flush even
+under WAL, although the machinery to serve them from a pinned segment
+exists on the write path too.
+
 ### Why two modes, why two strategies
 
 The direct API is the simplest integration point: call a method, await,

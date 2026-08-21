@@ -130,7 +130,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // Stop the world while a flush is in progress, as the byte read
         // path does. While this fetched inline the arm could not overlap
         // a flush; now that it spawns, it could.
-        if self.state.is_flushing() {
+        // Under WAL this need not wait at all.
+        if self.read_must_wait_for_flush() {
             let ctx = FileContext::reform_with_block(blk_idx, false, BlockAction::Ref(f), gate, fh.clone(), resp);
             let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
@@ -195,6 +196,33 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(())
     }
 
+    /// Whether a read has to wait for a flush that is in progress.
+    ///
+    /// Without WAL it does. The flush is rewriting the bmap and draining
+    /// the dirty cache underneath, and there is nowhere else to get the
+    /// data from, so the world stops until it finishes.
+    ///
+    /// With WAL it does not, and this is the point of the WAL read path.
+    /// The segment being flushed stays pinned in memory and registered in
+    /// `flushing_segments`, and the WAL makes the flush's completion a
+    /// given: a failure is recovered by replaying the WAL, not by
+    /// unwinding what the flush already published. So the bmap can point
+    /// at the new segment before it reaches staging, and a read of those
+    /// blocks can be served from the pinned buffer as though it were
+    /// already there — that is what the planner's `Inmem` op is for.
+    /// Waiting would give up the point of writing the WAL first, which is
+    /// that a flush stops blocking the front end.
+    fn read_must_wait_for_flush(&self) -> bool {
+        if !self.state.is_flushing() {
+            return false;
+        }
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() {
+            return false;
+        }
+        true
+    }
+
     pub async fn spawn_read(&mut self, mut req: FileReqRead<'a>, resp: FileResp) -> Result<usize> {
         // POSIX: a read on a handle not opened for reading fails with
         // EBADF. Checked before the flush-state test and the range
@@ -214,8 +242,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let off = req.offset;
         let len = req.buf.len();
 
-        // we need to stop world if flush is processing
-        if self.state.is_flushing() {
+        // Stop the world while a flush runs, unless WAL makes that
+        // unnecessary. See `read_must_wait_for_flush`.
+        if self.read_must_wait_for_flush() {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_read(req, resp);
             let _ = fh.send_highprio(ctx);
