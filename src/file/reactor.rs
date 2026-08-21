@@ -1,7 +1,7 @@
 //! IO function used by LocalSpawner reactor
 use std::io::{Result, Error, ErrorKind};
 use std::sync::Arc;
-use log::debug;
+use log::{debug, warn};
 use btree_ondisk::{BlockLoader, NodeCache};
 use tokio::task::JoinHandle;
 use tokio::sync::Semaphore;
@@ -224,6 +224,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         #[cfg(feature = "range-lock")]
         let range = off as u64..(off + len) as u64;
+        // A flush waiting to start has to see every range released. Taking
+        // a new one here would keep pushing that moment out of reach, and
+        // a steady stream of reads would starve the flush indefinitely.
+        #[cfg(feature = "range-lock")]
+        if self.state.is_flush_pending() {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_read(req, resp);
+            let _ = fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is pending"));
+        }
         #[cfg(feature = "range-lock")]
         if self.range_lock.try_lock(range.clone()) == false {
             let fh = req.fh.clone();
@@ -378,14 +388,32 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let mut range_lock = self.range_lock.clone();
         self.rt.as_ref().unwrap().spawn(async move {
             let mut actual = imm_bytes;
+            let mut failed = None;
             for join in joins {
-                let bytes = join.await.unwrap();
-                actual += bytes;
+                match join.await {
+                    Ok(bytes) => actual += bytes,
+                    // A load task that panicked or was cancelled must not
+                    // take the range lock down with it. Releasing it is
+                    // the only thing that lets a waiting flush start, so
+                    // do not leave by way of a panic here: the read would
+                    // report an error to its caller and the file would
+                    // never flush or accept another range again.
+                    Err(e) => {
+                        warn!("read load task failed: {:?}", e);
+                        failed = Some(Error::other(format!("read load task failed: {}", e)));
+                    },
+                }
             }
-            assert!(total_bytes == actual);
+            if failed.is_none() && total_bytes != actual {
+                warn!("short read: expected {} bytes, got {}", total_bytes, actual);
+                failed = Some(Error::other(format!("short read: expected {} bytes, got {}", total_bytes, actual)));
+            }
             #[cfg(feature = "range-lock")]
             range_lock.unlock(range).await;
-            resp.answer_read(actual, owned);
+            match failed {
+                Some(e) => resp.fail_read(e),
+                None => resp.answer_read(actual, owned),
+            }
         });
 
         Ok(total_bytes)
@@ -408,6 +436,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // to update the block data
         for block in fetched.into_iter() {
             let blk_idx = block.index();
+            // Another write, or a read populating the cache, landed on
+            // this block while we were fetching it. The resident copy is
+            // newer than what we just read out of staging, so drop the
+            // fetch: installing it would lose that write. `update_cache`
+            // below then edits the resident block, promoting it out of
+            // the clean tier if that is where it sits.
+            //
+            // Skipping is only safe because the block is resident. With
+            // nothing resident, `update_cache` would fabricate a
+            // zero-filled block, and the bytes this write does not cover
+            // would read back as zeroes instead of the staged data.
+            if self.cache.has(&blk_idx) {
+                debug!("absorb - block index {} already resident, dropping the fetched copy", blk_idx);
+                continue;
+            }
             let None = self.cache.insert(blk_idx, block) else {
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
@@ -503,6 +546,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // to update the block data
         for block in fetched.into_iter() {
             let blk_idx = block.index();
+            // Another write, or a read populating the cache, landed on
+            // this block while we were fetching it. The resident copy is
+            // newer than what we just read out of staging, so drop the
+            // fetch: installing it would lose that write. `update_cache`
+            // below then edits the resident block, promoting it out of
+            // the clean tier if that is where it sits.
+            //
+            // Skipping is only safe because the block is resident. With
+            // nothing resident, `update_cache` would fabricate a
+            // zero-filled block, and the bytes this write does not cover
+            // would read back as zeroes instead of the staged data.
+            if self.cache.has(&blk_idx) {
+                debug!("absorb - block index {} already resident, dropping the fetched copy", blk_idx);
+                continue;
+            }
             let None = self.cache.insert(blk_idx, block) else {
                 panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
             };
@@ -755,6 +813,15 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         #[cfg(feature = "range-lock")]
         let range = off as u64..(off + len) as u64;
+        // See the note in `spawn_read`: a pending flush is waiting for
+        // every range to be released, so do not take a new one.
+        #[cfg(feature = "range-lock")]
+        if self.state.is_flush_pending() {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write(req, resp);
+            let _ = fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is pending"));
+        }
         #[cfg(feature = "range-lock")]
         if self.range_lock.try_lock(range) == false {
             let fh = req.fh.clone();
@@ -811,6 +878,15 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         #[cfg(feature = "range-lock")]
         let range = off as u64..(off + len) as u64;
+        // See the note in `spawn_read`: a pending flush is waiting for
+        // every range to be released, so do not take a new one.
+        #[cfg(feature = "range-lock")]
+        if self.state.is_flush_pending() {
+            let fh = req.fh.clone();
+            let ctx = FileContext::reform_write_zero(req, resp);
+            let _ = fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is pending"));
+        }
         #[cfg(feature = "range-lock")]
         if self.range_lock.try_lock(range) == false {
             let fh = req.fh.clone();

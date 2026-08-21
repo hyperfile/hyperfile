@@ -22,6 +22,7 @@ tests/
 ├── integration_s3_read_timing.rs            ← read-side counters (`read_timing`)
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
 ├── integration_reactor_s3_block_api.rs      ← reactor block access (`fh_with_block*`)
+├── integration_reactor_s3_contention.rs     ← reactor under concurrent use (no stalls)
 ├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
 ├── integration_reactor_s3_wal.rs            ← reactor + wal
 └── integration_reactor_s3_all_features.rs   ← reactor + wal + range-lock
@@ -328,6 +329,41 @@ documented for the byte and block APIs holds on this surface too —
 which was untestable before those accessors existed.
 
 Runs in ~1 s.
+
+### `integration_reactor_s3_contention`
+
+Concurrent use of one handle must not stall. Every regression this suite
+covers was a hang rather than a wrong answer, so each test carries a
+watchdog that reports which operation was outstanding when progress
+stopped, and asserts before joining the workload.
+
+Covers the reported shape (concurrent `fh_read_owned` while another task
+writes and flushes), the same with `fh_truncate`, several writers plus
+readers with the resulting data checked block by block, every
+permit-taking operation driven at once, and colliding unaligned writes
+to one cold block checking that the bytes neither writer touched keep
+their staged contents.
+
+Two details matter when extending it. A **block-aligned** write needs no
+retrieve, so it never holds the per-file permit across a callback hop and
+exercises none of this — the writes here are deliberately unaligned and
+walk cold blocks. And concurrent readers can mask a stall in another
+operation, because a read put back on the high-priority queue outranks
+one queued behind it, so the narrower cases run without readers.
+
+Run it under `range-lock` as well as default features: the mechanisms
+differ, and `concurrent_reads_do_not_stall_writes` covers the flush drain
+that only exists there. Worth running in debug too — one of the races it
+catches showed up only in a debug build.
+
+```bash
+cargo test --test integration_reactor_s3_contention -- --ignored --test-threads=1
+cargo test --features range-lock --test integration_reactor_s3_contention \
+    -- --ignored --test-threads=1
+```
+
+Runs in ~20 s. On failure the process may hang after reporting, because
+a stalled reactor thread cannot be shut down; run it under a timeout.
 
 ### `integration_reactor_s3_range_lock`
 

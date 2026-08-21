@@ -78,6 +78,31 @@ Flush interacts with this: the handler checks
 `range_lock.is_locked()` before kicking a flush so flush never races
 with an in-flight write.
 
+`is_locked` is "any range is held", not "any range conflicts with mine",
+which is the right test for a flush — a flush covers the whole file, so
+everything conflicts. Note that reads take range locks too, so a flush
+waits behind in-flight reads as well as writes.
+
+That check is a drain: `state.is_flushing()` stops *new* operations once
+a flush has begun, but it cannot recall the ones already in flight, so
+the flush defers until they have released their ranges. Deferring alone
+is not enough. New reads and writes are still being admitted while the
+flush waits, and under a steady stream of them the range map is never
+observed empty — the flush is starved for as long as the traffic lasts,
+with no upper bound. Six readers looping on one handle were enough to
+starve a flush indefinitely.
+
+So the wait is announced: on deferring, the flush sets a flush-pending
+flag, and `spawn_read` / `spawn_write` / `spawn_write_zero` defer instead
+of taking a fresh range lock while it is set. In-flight ranges drain, the
+flush runs, the flag clears. This makes flush progress guaranteed rather
+than dependent on a gap in the arrival pattern, at the cost of a short
+stall for operations arriving during the drain — bounded, because a flush
+completes. The flag must be cleared on every path that stops waiting,
+including a failed requeue; leaving it set would stall every subsequent
+operation, which is why nothing releases a range lock by panicking out of
+a spawned task.
+
 ### Why two modes, why two strategies
 
 The direct API is the simplest integration point: call a method, await,

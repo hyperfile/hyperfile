@@ -1340,11 +1340,19 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let _req = ManuallyDrop::into_inner(md);
                 #[cfg(feature = "range-lock")]
                 if self.inner.range_lock.is_locked() {
+                    // Hold off new range locks while we wait for the
+                    // in-flight ones to drain, otherwise arriving reads
+                    // and writes keep the map non-empty for good.
+                    self.inner.state.set_flush_pending();
                     let fh = _req.fh.clone();
                     let ctx = FileContext::reform_flush(_req, resp);
-                    let _ = fh.send_cb(ctx);
+                    if fh.send_cb(ctx).is_err() {
+                        self.inner.state.clear_flush_pending();
+                    }
                     return;
                 }
+                #[cfg(feature = "range-lock")]
+                self.inner.state.clear_flush_pending();
                 let res = self.inner.flush().await;
                 let _ = resp.to_flush().send(res);
             },
@@ -1357,11 +1365,17 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let _req = ManuallyDrop::into_inner(md);
                 #[cfg(feature = "range-lock")]
                 if self.inner.range_lock.is_locked() {
+                    // See the note on the flush arm above.
+                    self.inner.state.set_flush_pending();
                     let fh = _req.fh.clone();
                     let ctx = FileContext::reform_flush_data(_req, resp);
-                    let _ = fh.send_cb(ctx);
+                    if fh.send_cb(ctx).is_err() {
+                        self.inner.state.clear_flush_pending();
+                    }
                     return;
                 }
+                #[cfg(feature = "range-lock")]
+                self.inner.state.clear_flush_pending();
                 let res = self.inner.flush_data().await;
                 let _ = resp.to_flush().send(res);
             },
@@ -1371,13 +1385,20 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 #[cfg(feature = "range-lock")]
                 if self.inner.range_lock.is_locked() {
+                    // See the note on the non-WAL flush arm: without this
+                    // the drain never completes under steady traffic.
+                    self.inner.state.set_flush_pending();
                     let fh = req.fh.clone();
                     let ctx = FileContext::reform_flush(req, resp);
                     // move flush op to cb queue
                     // so that flush op can run immediately after all inflight write op finished
-                    let _ = fh.send_cb(ctx);
+                    if fh.send_cb(ctx).is_err() {
+                        self.inner.state.clear_flush_pending();
+                    }
                     return;
                 }
+                #[cfg(feature = "range-lock")]
+                self.inner.state.clear_flush_pending();
                 let res = if self.inner.wal.is_none() {
                     let res = self.inner.flush().await;
                     if res.is_err() {

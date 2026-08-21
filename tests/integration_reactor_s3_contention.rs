@@ -13,9 +13,15 @@
 //! first iteration.
 //!
 //! Every operation that takes the permit is now non-blocking on the
-//! handler task and puts its request back on a contention miss, and `cb`
-//! outranks `highprio` so the retry can never overtake the hop it waits
-//! on. These tests drive all of them at once.
+//! handler task and puts its request back on a contention miss. These
+//! tests drive all of them at once.
+//!
+//! Under `range-lock` the permit is unbounded, so that deadlock cannot
+//! happen — but a flush there waits for in-flight ranges to drain, and
+//! without holding off new ones the drain never finishes under a steady
+//! stream of readers. Run this suite under `--features range-lock` too;
+//! `concurrent_reads_do_not_stall_writes` covers that and fails without
+//! the flush-pending gate.
 //!
 //! A failure here is a hang, not an assertion, so each test carries its
 //! own watchdog and reports which operation was outstanding.
@@ -480,7 +486,6 @@ async fn every_permit_taking_operation_under_contention() {
     for r in 0..4u64 {
         let (c, stop, inflight) = (fh.clone(), wd.stop.clone(), wd.inflight.clone());
         tasks.push(tokio::spawn(async move {
-            let mut c = c;
             let mut i = r;
             while !stop.load(Ordering::Relaxed) {
                 inflight.fetch_add(1, Ordering::SeqCst);
@@ -524,5 +529,86 @@ async fn every_permit_taking_operation_under_contention() {
     let mut fh = fh;
     let _ = fh.fh_flush().await.expect("final flush");
     let _ = fh.fh_release().await.expect("release");
+    tf.cleanup(&client).await;
+}
+
+/// Two writers hitting the *same* cold block with unaligned writes, which
+/// is what drives a write through the retrieve-and-absorb pipeline. When
+/// the second one absorbs, the block is already resident from the first,
+/// and the copy it fetched out of staging has to be dropped rather than
+/// installed — installing it would discard the other write.
+///
+/// The assertions are what make this worth having: as well as checking
+/// both writers' bytes survived, it checks that the bytes *neither* wrote
+/// still hold the pre-existing pattern. That is the part that would catch
+/// dropping a fetch with nothing resident to drop it in favour of, since
+/// the block would then be fabricated zero-filled and the staged content
+/// would be gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn colliding_unaligned_writes_keep_the_untouched_bytes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const NB: u64 = 60;
+    const PAT: u8 = 0xAA;
+    const A_OFF: usize = 100;
+    const B_OFF: usize = 2000;
+    const SUB: usize = 64;
+    const A_BYTE: u8 = 0xA1;
+    const B_BYTE: u8 = 0xB2;
+
+    // Lay down a known pattern and get it onto staging, so the blocks the
+    // writers touch are cold and a partial write has to retrieve first.
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file()).await.unwrap();
+        let _ = fh.fh_write(0, &vec![PAT; NB as usize * BLK]).await.unwrap();
+        let _ = fh.fh_flush().await.unwrap();
+        let _ = fh.fh_release().await.unwrap();
+    }
+
+    let fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdwr()).await.unwrap();
+
+    // Both walk the same blocks in the same order, so they collide.
+    let mut tasks = Vec::new();
+    for (sub_off, byte) in [(A_OFF, A_BYTE), (B_OFF, B_BYTE)] {
+        let mut c = fh.clone();
+        tasks.push(tokio::spawn(async move {
+            for blk in 0..NB {
+                let off = blk as usize * BLK + sub_off;
+                c.fh_write(off, &vec![byte; SUB]).await.expect("unaligned write");
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.expect("writer");
+    }
+
+    let mut fh = fh;
+    let _ = fh.fh_flush().await.expect("flush");
+    let _ = fh.fh_release().await.expect("release");
+
+    // Re-open so the checks read what actually landed on staging.
+    let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly()).await.unwrap();
+    for blk in 0..NB {
+        let got = fh.fh_read_owned(blk as usize * BLK, BLK).await.expect("read");
+        assert_eq!(got.len(), BLK, "block {} short read", blk);
+        for (i, &b) in got.iter().enumerate() {
+            let want = if (A_OFF..A_OFF + SUB).contains(&i) {
+                A_BYTE
+            } else if (B_OFF..B_OFF + SUB).contains(&i) {
+                B_BYTE
+            } else {
+                PAT
+            };
+            assert_eq!(b, want,
+                "block {} byte {}: expected {:#x}, got {:#x} — a fetched block was dropped or installed wrongly",
+                blk, i, want, b);
+        }
+    }
+    let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
