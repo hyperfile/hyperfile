@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.2] - 2026-08-21
+
+### Fixed
+
+- **`fh_with_block` serialized every concurrent reader.** The read-only
+  block action was fetched inside the handler arm, and the handler takes
+  `&mut self` and runs one context at a time, so concurrent readers
+  queued behind each other — concurrency was 1 whatever the caller
+  spawned. Reported from a cold-metadata walk: eight concurrent walkers
+  over 800 records scaled 1.05x. Measured here at 0.96x, 48 cold blocks
+  taking 226 ms concurrently against 218 ms serially.
+
+  This was the last operation still doing that; the byte reads and all
+  the writes already fetched off the handler task.
+
+  Split by whether the arm has to await. A cache hit awaits nothing and
+  stays on the handler task, where overlapping it would buy nothing. A
+  miss is an object-store round trip and moves off: the block it fills
+  comes from `Cache::new_block`, so it is owned rather than borrowed
+  from the file, and the load, the closure and the cancellation gate
+  travel into a spawned task together. `HyperFile::block` cannot be used
+  for this — it yields a guard borrowed from `&mut self` — which is why
+  the arm ran to completion before.
+
+  The filled block is requeued afterwards to be cached, the way the
+  write path's retrieve requeues its fetched blocks. Skipping that would
+  have given away the reason to use the block path: caching keeps
+  repeated access at one request instead of one per access, and the
+  reporter measured the byte path costing 2.3x the requests for exactly
+  that reason.
+
+  Measured after the change: 48 cold blocks, 223 ms serially against
+  26 ms concurrently, 8.7x, with the request count unchanged.
+
+- The read-only block path now defers while a flush is in progress, as
+  the byte paths do. It did not matter while the fetch ran inline, since
+  a non-WAL flush occupies the handler arm and a fetch could not overlap
+  it; now that the fetch spawns, it could.
+
+### Documentation
+
+- **What the reactor costs**, in `docs/concurrency.md`. Every `fh_*` call
+  is a request and a response across a channel, which is two thread
+  wakeups when the reactor is idle. Measured per block access:
+
+  | | direct | reactor, serial | reactor, concurrent |
+  |---|---|---|---|
+  | cache hit (work itself 0.02 µs) | 0.02 µs | 16.2 µs | 1.25 µs |
+  | cold, one object request | 4623 µs | 4687 µs | 475 µs |
+
+  The cost is latency, not throughput: the wakeups are only paid when
+  the queue is empty, so keeping requests outstanding removes most of
+  them. On anything that reaches the object store the two modes are
+  within 1.4%. The reactor's return is concurrency and only concurrency,
+  so it punishes serial use and rewards concurrent use — which is worth
+  knowing before benchmarking one mode against the other sequentially
+  and drawing a conclusion.
+
+  Referenced from the `reactor` and `blocking` feature documentation,
+  and from `docs/block-api.md`.
+
+- `docs/block-api.md` gains a table of which reactor entry point fetches
+  off the handler task, and why `fh_with_block_mut` deliberately does
+  not.
+
 ## [0.6.1] - 2026-08-20
 
 > **Affects 0.6.0 only.** If you took `fh_read_owned` from 0.6.0
