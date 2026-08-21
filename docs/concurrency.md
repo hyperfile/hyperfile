@@ -99,6 +99,47 @@ useful for highly parallel workloads.
   per-range writes, enable `range-lock`. Otherwise leave it off for
   simpler serialization.
 
+### What the reactor costs
+
+Every `fh_*` call is a request and a response across a channel to the
+reactor's thread. When the reactor is idle that means two thread
+wakeups: the caller wakes the reactor, the reactor wakes the caller.
+Each is a futex wake plus a context switch.
+
+Measured per block access, same file, same data:
+
+| | direct (`fs_block`) | reactor, serial | reactor, concurrent |
+|---|---|---|---|
+| **cache hit** (the work itself is 0.02 µs) | 0.02 µs | 16.2 µs | 1.25 µs |
+| **cold**, one object request per block | 4623 µs | 4687 µs | 475 µs |
+
+Three things follow, and they decide which mode to use:
+
+**The cost is latency, not throughput.** Those two wakeups are only
+paid when the queue is empty. Keep several requests outstanding and the
+reactor takes the next one without sleeping, which is the 16.2 µs →
+1.25 µs column. Batching many operations into one message would help a
+strictly serial caller; keeping requests in flight helps more and needs
+nothing new.
+
+**On anything that reaches the object store, the two modes are within
+noise.** 4623 against 4687 µs is 1.4%: the channel is 16 µs against a
+4.6 ms round trip. So a sequential benchmark of cold I/O will show the
+two modes as equal, and a sequential benchmark of *warm* operations will
+show the reactor as much worse. Neither generalizes.
+
+**The reactor's return is concurrency, and only concurrency.** Cold
+reads overlap — 4687 µs down to 475 µs above, and see
+[Block API](block-api.md#concurrency) for which entry points fetch off
+the handler task. A caller that uses `fh_*` serially pays the wakeups
+and gets nothing for them.
+
+So: the reactor punishes serial use and rewards concurrent use. If a
+path is hot, cheap, and serial — a per-block metadata walk, a write
+issued one block at a time — either drive it concurrently or use the
+direct API for it. The mode is a property of how you call, not only of
+what you call.
+
 ## S3 optimistic concurrency control (OCC)
 
 On flush, Hyperfile persists two kinds of objects:

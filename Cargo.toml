@@ -130,12 +130,22 @@ concurrent-segment-build = []
 # Use the `fh_*` family in `src/file/fh.rs` (HyperFileHandler /
 # HyperFileTokio) from application code; do not call `fs_*` directly
 # on the inner Hyper. Selected by the default feature set.
+#
+# Every call is a request/response across a channel, which costs two
+# thread wakeups when the reactor is idle — far more than a cache hit
+# itself. That is repaid only by concurrency, so drive it with several
+# requests outstanding. See docs/concurrency.md, "What the reactor
+# costs".
 reactor = ["dep:hyperfile-reactor", "btree-ondisk/arc", "btree-ondisk/value-check", "btree-ondisk/mt" ]
 
 # Blocking mode. The general-purpose single-task model: call the
 # `fs_*` family in `src/file/fs.rs` directly on the file and provide
 # your own concurrency control. Uses Rc instead of Arc for
 # btree-ondisk nodes, avoiding some atomics.
+#
+# Cheapest per operation, since there is no channel: a cache hit costs
+# what the access costs. No concurrency within one file. See
+# docs/concurrency.md, "What the reactor costs", for the comparison.
 #
 # Do not enable together with `reactor`.
 blocking = ["btree-ondisk/rc"]

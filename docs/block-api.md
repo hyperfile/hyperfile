@@ -180,6 +180,12 @@ the block, installs a block-map placeholder and joins the next flush;
 those are serialized against everything else, and overlapping them is a
 much larger question than overlapping a read.
 
+What a reactor round trip costs, and when that cost matters, is in
+[Concurrency semantics](concurrency.md#what-the-reactor-costs). The
+short version: a cache hit through `fh_*` costs far more in channel
+latency than the access itself, and the way out is to keep requests in
+flight rather than to issue them one at a time.
+
 ### Cancellation
 
 Because `f` may borrow the caller's frame, it must not run once the
