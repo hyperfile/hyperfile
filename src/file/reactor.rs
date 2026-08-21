@@ -570,10 +570,17 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             if self.cache.has(&blk_idx) || req.fetched.iter().any(|b| b.index() == blk_idx) {
                 continue;
             }
+            // Usually recoverable right here, with no object request: the
+            // flush that took it is still uploading, so the block is a
+            // memcpy out of the pinned segment.
+            #[cfg(feature = "wal")]
+            if self.try_refill_block_in_place(blk_idx).await? {
+                continue;
+            }
             refetch.push(blk_idx);
         }
         if !refetch.is_empty() {
-            debug!("absorb_write_bh - {} block(s) went away under a flush, fetching again", refetch.len());
+            debug!("absorb_write_bh - {} block(s) need an object request after a flush took them", refetch.len());
             self.spawn_write_refetch(req, resp, refetch).await?;
             return Err(Error::new(ErrorKind::ResourceBusy, "refetch blocks taken by a flush"));
         }
@@ -727,10 +734,15 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             if self.cache.has(&blk_idx) || req.fetched.iter().any(|b| b.index() == blk_idx) {
                 continue;
             }
+            // See `absorb_write_bh`: normally no object request is needed.
+            #[cfg(feature = "wal")]
+            if self.try_refill_block_in_place(blk_idx).await? {
+                continue;
+            }
             refetch.push(blk_idx);
         }
         if !refetch.is_empty() {
-            debug!("absorb_write_zero_bh - {} block(s) went away under a flush, fetching again", refetch.len());
+            debug!("absorb_write_zero_bh - {} block(s) need an object request after a flush took them", refetch.len());
             self.spawn_write_zero_refetch(req, resp, refetch).await?;
             return Err(Error::new(ErrorKind::ResourceBusy, "refetch blocks taken by a flush"));
         }
@@ -879,6 +891,70 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         });
 
         Ok(())
+    }
+
+    /// Put a block a flush took back in the cache, without leaving the
+    /// handler task and without an object request.
+    ///
+    /// Returns whether the block is resident afterwards. Anything that
+    /// would need to read staging returns `false` and is left to
+    /// `spawn_write_refetch`, because waiting for an object request here
+    /// would stall the handler for every other request too.
+    ///
+    /// The case worth having is the middle one: the flush that took the
+    /// block is usually still uploading its segment, and that segment is
+    /// pinned in memory, so the block's contents are a memcpy away. A
+    /// block with nothing behind it, or a hole, is free as well — a fresh
+    /// block already reads as zeroes.
+    #[cfg(feature = "wal")]
+    async fn try_refill_block_in_place(&mut self, blk_idx: BlockIndex) -> Result<bool> {
+        let blk_ptr = match self.bmap.lookup(&blk_idx).await {
+            Ok(blk_ptr) => blk_ptr,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                self.insert_fresh_block(blk_idx);
+                return Ok(true);
+            },
+            Err(e) => return Err(e),
+        };
+        if BlockPtrFormat::is_zero_block(&blk_ptr) {
+            self.insert_fresh_block(blk_idx);
+            return Ok(true);
+        }
+        if !BlockPtrFormat::is_on_staging(&blk_ptr) {
+            return Ok(false);
+        }
+        let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
+        if segid <= self.inode().get_last_ondisk_cno() {
+            // Already written out, so reading it means an object request.
+            return Ok(false);
+        }
+        let flushing_segments = self.flushing_segments.clone();
+        let lock = flushing_segments.read().await;
+        let Some(data) = lock.get(&segid).and_then(|weak| weak.upgrade()) else {
+            // The upload finished and the buffer went with it.
+            return Ok(false);
+        };
+        let block = self.cache.new_block(blk_idx);
+        block.set_should_cache();
+        let buf = block.as_mut_slice();
+        let end = staging_off + buf.len();
+        buf.copy_from_slice(&data[staging_off..end]);
+        drop(lock);
+        let None = self.cache.insert(blk_idx, block) else {
+            panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+        };
+        Ok(true)
+    }
+
+    /// A block with no contents to recover: a fresh one reads as zeroes,
+    /// which is what a hole or an unbacked block should read as.
+    #[cfg(feature = "wal")]
+    fn insert_fresh_block(&mut self, blk_idx: BlockIndex) {
+        let block = self.cache.new_block(blk_idx);
+        block.set_should_cache();
+        let None = self.cache.insert(blk_idx, block) else {
+            panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+        };
     }
 
     /// Fetch blocks again for a write that has already been through the
