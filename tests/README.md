@@ -543,5 +543,8 @@ aws s3 rm s3://$HYPERFILE_TEST_BUCKET/hyperfile-test/ --recursive \
 - [`docs/concurrency.md`](../docs/concurrency.md) — how
   `FlushConflictPolicy` and S3 OCC interact; reference for the
   concurrency suite.
+- [`docs/flush.md`](../docs/flush.md) — what a flush does and what
+  the front end may do while it happens; reference for the
+  contention suite and the reads and writes that overlap a flush.
 - [`docs/posix.md`](../docs/posix.md) — POSIX semantics, sync mode
   behavior.

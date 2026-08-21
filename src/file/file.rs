@@ -114,6 +114,27 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     pub(crate) rt: Option<tokio::runtime::Runtime>,
     #[cfg(feature = "wal")]
     pub(crate) wal: Option<Box<dyn WalReadWrite + Send>>,
+    /// Segments that have been built and published but not yet written
+    /// out, kept reachable so the front end can read them meanwhile.
+    ///
+    /// A WAL-protected flush repoints the bmap at its new segment, hands
+    /// the upload to a spawned task, and registers the segment's buffer
+    /// here. Until that upload finishes the newest data lives only in
+    /// this buffer, and reads and writes are served from it rather than
+    /// waiting for the flush — which is safe because the WAL already
+    /// holds the data, so the flush completing is a given and a failure
+    /// replays the WAL instead of unwinding what was published.
+    ///
+    /// `wal_set_mem_segment` puts an entry here and `wal_flush_done`
+    /// removes it, the latter in the same arm as it advances
+    /// `last_ondisk_cno`. That pairing is the invariant everything else
+    /// relies on: `segid > last_ondisk_cno` means "in here", and nothing
+    /// on the handler task can observe one without the other. The entry
+    /// is a `Weak`, so a caller that finds it gone has to fall back to
+    /// reading staging.
+    ///
+    /// See [`docs/flush.md`](../../docs/flush.md) for the lifecycle and
+    /// what it costs.
     #[cfg(feature = "wal")]
     pub(crate) flushing_segments: Arc<RwLock<HashMap<SegmentId, Weak<Pin<Box<Vec<u8>>>>>>>,
 }

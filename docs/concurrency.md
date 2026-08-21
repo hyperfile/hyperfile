@@ -74,93 +74,12 @@ by the `range-lock` feature:
   high-priority queue and retried later. Non-overlapping ranges run in
   parallel.
 
-Flush interacts with this: the handler checks
-`range_lock.is_locked()` before kicking a flush so flush never races
-with an in-flight write.
+Flush interacts with this. It waits for operations already in flight
+before it starts, which needs admission control to terminate, and under
+WAL it stops blocking the front end altogether — the segment stays pinned
+in memory and reads and writes are served from it while it is written out.
+Both are in [flush.md](flush.md).
 
-`is_locked` is "any range is held", not "any range conflicts with mine",
-which is the right test for a flush — a flush covers the whole file, so
-everything conflicts. Note that reads take range locks too, so a flush
-waits behind in-flight reads as well as writes.
-
-That check is a drain: `state.is_flushing()` stops *new* operations once
-a flush has begun, but it cannot recall the ones already in flight, so
-the flush defers until they have released their ranges. Deferring alone
-is not enough. New reads and writes are still being admitted while the
-flush waits, and under a steady stream of them the range map is never
-observed empty — the flush is starved for as long as the traffic lasts,
-with no upper bound. Six readers looping on one handle were enough to
-starve a flush indefinitely.
-
-So the wait is announced: on deferring, the flush sets a flush-pending
-flag, and `spawn_read` / `spawn_write` / `spawn_write_zero` defer instead
-of taking a fresh range lock while it is set. In-flight ranges drain, the
-flush runs, the flag clears. This makes flush progress guaranteed rather
-than dependent on a gap in the arrival pattern, at the cost of a short
-stall for operations arriving during the drain — bounded, because a flush
-completes. The flag must be cleared on every path that stops waiting,
-including a failed requeue; leaving it set would stall every subsequent
-operation, which is why nothing releases a range lock by panicking out of
-a spawned task.
-
-### Reads during a flush, and what WAL changes
-
-Without WAL a flush stops the world. It drains the dirty cache and
-rewrites the bmap underneath, and there is nowhere else to get the data,
-so `spawn_read` and the block read path defer for as long as
-`state.is_flushing()` is set and retry afterwards.
-
-With WAL they do not defer, and this is a large part of why writing the
-WAL first is worth doing. A WAL-protected flush publishes the bmap
-pointing at the new segment, keeps that segment pinned in memory
-registered in `flushing_segments`, and hands the upload to a background
-task. Because the WAL already holds the data, the flush's completion is a
-given: a failure is recovered by replaying the WAL rather than by
-unwinding what the flush published. So the pinned buffer can be treated as
-though it were already on staging, and the read planner emits an `Inmem`
-op that copies from it — no S3 GET, and no waiting for one.
-
-The window is real and reads land in it routinely: a reader running
-against a task that writes and flushes in a loop serves thousands of reads
-from the pinned segment where deferring managed a couple of hundred, since
-a deferred read spends the window being requeued and retried rather than
-answering.
-
-A read planned as `Inmem` can still find the segment gone by the time it
-runs — the flush completes, the entry is removed and the buffer dropped.
-That is not a failure either: the same bytes are on staging at the same
-offset, so the read falls back to reading them from there. Both outcomes
-occur in a single run of the test that covers this.
-
-Writes overlap a flush as well, for the same reason. A write's two halves
-can straddle one, because the WAL write hands the handler task back in
-between, so `absorb_write_bh` fetches again anything the flush took rather
-than applying the write over a block rebuilt from nothing.
-
-What this costs a concurrent reader depends on what the writer holds while
-it overlaps, and that differs by feature:
-
-| | reader on the writer's blocks | reader on other blocks |
-|---|---|---|
-| `wal` | much slower | **much slower** |
-| `wal` + `range-lock` | much slower | **unaffected** |
-
-Without `range-lock` the per-file semaphore has a single permit for the
-*whole file*, and a write holds it across its WAL PUT. Block disjointness
-cannot help, because the permit is not per-block: in one measurement a
-reader on unrelated blocks dropped from 720 reads to 152 once writes
-stopped waiting for the flush.
-
-With `range-lock` the permit is unbounded and a range is what excludes, so
-a reader on other blocks is unaffected — 848 reads before, 712 after, which
-is inside the run-to-run spread. A reader on the blocks being written still
-pays, since it genuinely conflicts.
-
-So a workload that both writes and reads heavily through one handle wants
-`range-lock`, and wants its readers and writers not to chase the same
-blocks. The numbers above come from a deliberately harsh shape — a writer
-looping on eight blocks with the data cache off — and are worth taking as
-the direction of the effect rather than its magnitude.
 ### Why two modes, why two strategies
 
 The direct API is the simplest integration point: call a method, await,

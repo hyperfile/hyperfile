@@ -100,6 +100,16 @@ through, the next open starts from scratch and replays the same
 set of segids again. The replay is deterministic because `seq`
 gives a total order of writes within a segid.
 
+## Flushing without stopping the front end
+
+Because the WAL makes a flush's completion a given, the flush does not
+have to block the front end: the segment stays pinned in memory while it
+is written out, and reads and writes are served from it rather than
+waiting. That is the main thing the WAL buys beyond durability, and it is
+described in [flush.md](flush.md#with-wal-the-segment-is-pinned-and-the-front-end-carries-on)
+together with what a write has to do differently and what it costs a
+concurrent reader.
+
 ## Cleanup (WAL object delete)
 
 After a successful flush (in the reactor WAL path,
@@ -136,7 +146,9 @@ whole `<uri>/...` tree including WAL.
   Large writes may be more costly (the WAL PUT is one S3 object
   per write, regardless of payload).
 - **Flush**: no direct overhead. The delete that happens after
-  flush runs off the critical path.
+  flush runs off the critical path, and the segment upload does
+  too — reads and writes carry on against the pinned segment while
+  it happens, see [flush.md](flush.md).
 - **Open**: adds a `list_segments` call. On a recently-flushed
   file the list is empty. On crash recovery, the open pays the
   replay cost proportional to the number of unflushed writes.
@@ -170,5 +182,7 @@ measure.
 - `reactor_wal_crash_recovery_multiple_handles` — multiple
   handler clones with concurrent writes via `tokio::join!`,
   survive crash.
+- Tests covering reads and writes during a flush are listed in
+  [flush.md](flush.md#related-tests).
 - S3Wal unit tests in `src/wal/s3.rs` cover `next_seq`,
   `reset_seq`, `encode`, and `decode`.
