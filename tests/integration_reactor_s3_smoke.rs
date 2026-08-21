@@ -31,6 +31,11 @@ use std::io::SeekFrom;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use common::*;
 use common_reactor::*;
+use hyperfile::file::hyper::Hyper;
+use hyperfile::file::flags::HyperFileFlags;
+use hyperfile::file::mode::HyperFileMode;
+use hyperfile::config::HyperFileConfigBuilder;
+use hyperfile::staging::config::StagingConfig;
 
 use hyperfile::file::fh::HyperFileHandler;
 use hyperfile::file::tokio_wrapper::HyperFileTokio;
@@ -536,6 +541,97 @@ async fn reactor_handler_wronly_read_is_ebadf() {
         assert!(buf[..50].iter().all(|&b| b == 0xAA));
         assert!(buf[50..150].iter().all(|&b| b == 0xBB));
         assert!(buf[150..].iter().all(|&b| b == 0xAA));
+        let _ = fh.fh_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// A staging read that fails must fail the read, not report success over
+/// a buffer nothing was written into.
+///
+/// The reactor plans a cold read as a spawned ranged GET. That task used
+/// to discard the result of the load and report the full byte count
+/// regardless, so an unreadable segment produced a successful read whose
+/// buffer still held whatever the caller's allocation happened to
+/// contain — a wrong answer rather than an error.
+///
+/// Deleting the segment object while keeping the inode is a stand-in for
+/// any failure of that GET. The data cache is disabled so the read cannot
+/// be answered from memory and has to go to staging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_read_reports_a_failed_staging_load() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const BLK: usize = 4096;
+
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_blocks = 0;
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    // Write something and get it onto staging.
+    {
+        let hyper = Hyper::create(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+        fh.fh_write(0, &vec![0x7Eu8; 4 * BLK]).await.expect("write");
+        fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    // Sanity check: it reads back before we break it.
+    let bucket = test_bucket();
+    let prefix = tf.uri().trim_start_matches("s3://")
+        .trim_start_matches(&bucket)
+        .trim_start_matches('/')
+        .to_string() + "/";
+    {
+        let hyper = Hyper::open(client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly())).await.expect("open");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+        let got = fh.fh_read_owned(0, BLK).await.expect("read before deletion");
+        assert!(got.iter().all(|&v| v == 0x7E), "precondition: content should read back");
+        let _ = fh.fh_release().await;
+    }
+
+    // Delete the segment objects, keep the inode so open still works.
+    let listed = client.list_objects_v2().bucket(&bucket).prefix(&prefix).send().await.expect("list");
+    let mut deleted = 0;
+    for obj in listed.contents() {
+        let key = obj.key().unwrap_or_default();
+        let name = key.rsplit('/').next().unwrap_or_default();
+        if !name.is_empty() && name.len() == 10 && name.chars().all(|c| c.is_ascii_digit()) {
+            client.delete_object().bucket(&bucket).key(key).send().await.expect("delete segment");
+            deleted += 1;
+        }
+    }
+    assert!(deleted > 0, "no segment object found to delete under {}", prefix);
+
+    // The read must now fail rather than hand back an unfilled buffer.
+    {
+        let hyper = Hyper::open(client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly())).await.expect("open");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+        let res = fh.fh_read_owned(0, BLK).await;
+        match res {
+            Err(e) => eprintln!("read failed as it should: {}", e),
+            Ok(buf) => panic!(
+                "read reported success over {} bytes with the segment deleted; \
+                 first bytes {:?} — a failed staging load was swallowed",
+                buf.len(), &buf[..8.min(buf.len())]),
+        }
         let _ = fh.fh_release().await;
     }
 

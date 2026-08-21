@@ -584,13 +584,26 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 }
                 #[cfg(feature = "wal")]
                 ReadOp::Inmem { segid, s3_off, dst_len: _ } => {
-                    let lock = self.flushing_segments.read().await;
-                    let weak = lock.get(&segid)
-                        .unwrap_or_else(|| panic!("inflight segid {segid} not registered"));
-                    let data = weak.upgrade()
-                        .unwrap_or_else(|| panic!("inflight data for segid {segid} dropped"));
-                    let end = s3_off + this.len();
-                    this.copy_from_slice(&data[s3_off..end]);
+                    // The segment can reach staging between the planner
+                    // classifying it as in flight and this copy, at which
+                    // point the entry is gone and the pinned buffer with
+                    // it. Read it the ordinary way instead: a flush
+                    // finishing is not a failure.
+                    let copied = {
+                        let lock = self.flushing_segments.read().await;
+                        match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                            Some(data) => {
+                                let end = s3_off + this.len();
+                                this.copy_from_slice(&data[s3_off..end]);
+                                true
+                            },
+                            None => false,
+                        }
+                    };
+                    if !copied {
+                        debug!("read - segid {} no longer held in memory, reading it from staging", segid);
+                        self.staging.load_range(segid, s3_off, this).await?;
+                    }
                 }
                 ReadOp::Range { segid, s3_off, dst_len: _ } => {
                     self.staging.load_range(segid, s3_off, this).await?;
@@ -1909,17 +1922,25 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
-                let lock = self.flushing_segments.read().await;
-                let Some(weak_data) = lock.get(&segid) else {
-                    panic!("unable to find segid: {segid} from inflight flushing segments");
+                let copied = {
+                    let lock = self.flushing_segments.read().await;
+                    match lock.get(&segid).and_then(|weak_data| weak_data.upgrade()) {
+                        Some(data) => {
+                            let start_off = staging_off + offset;
+                            let end = start_off + data_buf.len();
+                            data_buf.copy_from_slice(&data[start_off..end]);
+                            true
+                        },
+                        None => false,
+                    }
                 };
-                let Some(data) = weak_data.upgrade() else {
-                    panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
-                };
-                let start_off = staging_off + offset;
-                let end = start_off + data_buf.len();
-                data_buf.copy_from_slice(&data[start_off..end]);
-                return Ok(());
+                if copied {
+                    return Ok(());
+                }
+                // The flush landed on the way here, so the pinned buffer is
+                // gone and the segment is on staging. Fall through and read
+                // it from there: a flush completing is not a failure.
+                debug!("segid {} no longer held in memory, reading it from staging", segid);
             }
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
@@ -1947,17 +1968,25 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
-                let lock = self.flushing_segments.read().await;
-                let Some(weak_data) = lock.get(&segid) else {
-                    panic!("unable to find segid: {segid} from inflight flushing segments");
+                let copied = {
+                    let lock = self.flushing_segments.read().await;
+                    match lock.get(&segid).and_then(|weak_data| weak_data.upgrade()) {
+                        Some(data) => {
+                            let start_off = staging_off + offset;
+                            let end = start_off + data_buf.len();
+                            data_buf.copy_from_slice(&data[start_off..end]);
+                            true
+                        },
+                        None => false,
+                    }
                 };
-                let Some(data) = weak_data.upgrade() else {
-                    panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
-                };
-                let start_off = staging_off + offset;
-                let end = start_off + data_buf.len();
-                data_buf.copy_from_slice(&data[start_off..end]);
-                return Ok(());
+                if copied {
+                    return Ok(());
+                }
+                // The flush landed on the way here, so the pinned buffer is
+                // gone and the segment is on staging. Fall through and read
+                // it from there: a flush completing is not a failure.
+                debug!("segid {} no longer held in memory, reading it from staging", segid);
             }
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {

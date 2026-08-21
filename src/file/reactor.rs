@@ -308,7 +308,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let read_max_concurrency = self.config.runtime.read_max_concurrency;
         let semaphore = Arc::new(Semaphore::new(read_max_concurrency));
 
-        let mut joins: Vec<JoinHandle<usize>> = Vec::new();
+        let mut joins: Vec<JoinHandle<Result<usize>>> = Vec::new();
         let mut imm_bytes: usize = 0;
         let mut remaining = buf;
         for op in plan {
@@ -334,17 +334,34 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         std::slice::from_raw_parts_mut(this.as_mut_ptr() as *mut u8, this.len())
                     };
                     let flushing_segments = self.flushing_segments.clone();
+                    let staging = self.staging.clone();
                     let sema = semaphore.clone();
                     let join = self.rt.as_ref().unwrap().spawn(async move {
                         let _slot = sema.acquire_owned().await.unwrap();
-                        let lock = flushing_segments.read().await;
-                        let weak = lock.get(&segid)
-                            .unwrap_or_else(|| panic!("inflight segid {segid} not registered"));
-                        let data = weak.upgrade()
-                            .unwrap_or_else(|| panic!("inflight data for segid {segid} dropped"));
-                        let end = s3_off + data_buf.len();
-                        data_buf.copy_from_slice(&data[s3_off..end]);
-                        data_buf.len()
+                        let len = data_buf.len();
+                        // The planner saw this segment as in flight, but its
+                        // flush can land between that decision and this task
+                        // running: once the segment is on staging the entry is
+                        // removed and the pinned buffer dropped. That is not a
+                        // failure — the same bytes are now readable the
+                        // ordinary way, at the same offset — so fall back to
+                        // it rather than treating a completed flush as a bug.
+                        let copied = {
+                            let lock = flushing_segments.read().await;
+                            match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                                Some(data) => {
+                                    let end = s3_off + len;
+                                    data_buf.copy_from_slice(&data[s3_off..end]);
+                                    true
+                                },
+                                None => false,
+                            }
+                        };
+                        if !copied {
+                            debug!("read - segid {} no longer held in memory, reading it from staging", segid);
+                            staging.load_range(segid, s3_off, data_buf).await?;
+                        }
+                        Ok(len)
                     });
                     joins.push(join);
                 }
@@ -358,8 +375,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     let sema = semaphore.clone();
                     let join = self.rt.as_ref().unwrap().spawn(async move {
                         let _slot = sema.acquire_owned().await.unwrap();
-                        let _ = staging.load_range(segid, s3_off, data_buf).await;
-                        data_buf.len()
+                        let len = data_buf.len();
+                        // Report a failed GET. Discarding it here would hand
+                        // the caller a successful read over a buffer that was
+                        // never filled.
+                        staging.load_range(segid, s3_off, data_buf).await?;
+                        Ok(len)
                     });
                     joins.push(join);
                 }
@@ -391,7 +412,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let mut failed = None;
             for join in joins {
                 match join.await {
-                    Ok(bytes) => actual += bytes,
+                    Ok(Ok(bytes)) => actual += bytes,
+                    // A load that failed. Reporting it is the point: the
+                    // buffer was not filled, so answering with a byte
+                    // count would hand the caller stale memory as data.
+                    Ok(Err(e)) => {
+                        warn!("read load failed: {:?}", e);
+                        failed = Some(e);
+                    },
                     // A load task that panicked or was cancelled must not
                     // take the range lock down with it. Releasing it is
                     // the only thing that lets a waiting flush start, so

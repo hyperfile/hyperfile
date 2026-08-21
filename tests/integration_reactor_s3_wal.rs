@@ -604,3 +604,120 @@ async fn direct_api_wal_delete_after_flush() {
 
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// Read a block whose segment is still being uploaded.
+///
+/// A WAL-protected flush hands the segment upload to a background task,
+/// so for a short window the newest data lives only in a memory-pinned
+/// buffer registered in `flushing_segments`. Reads of those blocks are
+/// planned as `Inmem` and served from that buffer rather than staging.
+///
+/// It takes a *concurrent* reader to see that window: `fh_flush` does not
+/// answer until the upload is done, so one task writing and flushing in
+/// sequence never observes it. Here one task writes and flushes in a loop
+/// while another reads the same blocks. The data cache is disabled, so
+/// those reads cannot be answered from cache and have to go through the
+/// planner.
+///
+/// The reader also has to survive the flush landing mid-flight: the
+/// planner decides `Inmem` from `last_ondisk_cno`, and by the time the
+/// spawned read runs the upload may have finished, the entry been removed
+/// and the pinned buffer dropped. The same bytes are on staging at that
+/// point, so the read falls back to reading them from there. Either way it
+/// must return data — this used to panic in the spawned task.
+///
+/// Reads race writes, so the check is that a block is *uniform* and holds
+/// one of the patterns written so far. A read served from a half-released
+/// buffer, or from a buffer at the wrong offset, shows up as a mixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn reactor_wal_read_block_in_segment_still_uploading() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let reactor = make_reactor();
+
+    // Data cache off, so a read cannot come from cache.
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_uri = format!("{}/wal", tf.uri());
+    let wal_config = HyperFileWalConfig::new(&wal_uri);
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_blocks = 0;
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    const BLK: usize = 4096;
+    const NB: usize = 8;
+    const ROUNDS: u8 = 20;
+    const FIRST: u8 = 0x40;
+
+    let hyper = Hyper::create(
+        client.clone(),
+        config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+    )
+    .await
+    .expect("create hyper with wal");
+    let fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+
+    // Seed, so the reader never looks at a hole.
+    {
+        let mut w = fh.clone();
+        for b in 0..NB {
+            w.fh_write(b * BLK, &vec![FIRST; BLK]).await.expect("seed write");
+        }
+        w.fh_flush().await.expect("seed flush");
+    }
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let writer = {
+        let (mut w, done) = (fh.clone(), done.clone());
+        tokio::spawn(async move {
+            for round in 1..ROUNDS {
+                let byte = FIRST + round;
+                for b in 0..NB {
+                    w.fh_write(b * BLK, &vec![byte; BLK]).await.expect("write");
+                }
+                w.fh_flush().await.expect("flush");
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+
+    let reader = {
+        let (r, done) = (fh.clone(), done.clone());
+        tokio::spawn(async move {
+            let mut reads = 0usize;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                for b in 0..NB {
+                    let got = r.fh_read_owned(b * BLK, BLK).await.expect("read");
+                    assert_eq!(got.len(), BLK, "block {} short read", b);
+                    let first = got[0];
+                    assert!((FIRST..FIRST + ROUNDS).contains(&first),
+                        "block {} starts with {:#x}, which was never written", b, first);
+                    assert!(got.iter().all(|&v| v == first),
+                        "block {} is not uniform: starts {:#x}, mismatch at {:?} — \
+                         a read of an in-flight segment returned the wrong bytes",
+                        b, first, got.iter().position(|&v| v != first));
+                    reads += 1;
+                }
+            }
+            reads
+        })
+    };
+
+    writer.await.expect("writer");
+    let reads = reader.await.expect("reader");
+    assert!(reads > 0, "the reader never ran");
+    eprintln!("verified {} concurrent reads across {} flushes", reads, ROUNDS - 1);
+
+    let mut fh = fh;
+    let _ = fh.fh_release().await.expect("release");
+    cleanup_with_wal(&client, tf.uri()).await;
+}
