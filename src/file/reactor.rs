@@ -36,7 +36,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         L: BlockLoader<BlockPtr> + Clone + 'static,
         C: NodeCache<BlockPtr> + Clone,
 {
-    pub(crate) fn spawn_load_data_block_write_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {        debug!("spawn_load_data_block_write_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
+    pub(crate) fn spawn_load_data_block_write_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {
+        debug!("spawn_load_data_block_write_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
             blk_id, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
