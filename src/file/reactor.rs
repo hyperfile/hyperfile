@@ -14,6 +14,16 @@ use crate::buffer::DataBlock;
 use super::file::{HyperFile, ReadOp};
 use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext, ChannelGroup, BlockAction};
 
+/// Where a write retrieve sends the request once its loads finish.
+pub(crate) enum AfterRetrieve {
+    /// To the absorb, which under WAL still has the WAL write ahead of it.
+    Absorb,
+    /// Straight to applying the data. For a request whose WAL write has
+    /// already happened and must not be repeated — a flush took a block
+    /// out from under it and it came back for that block only.
+    AbsorbBh,
+}
+
 pub(crate) enum ImmOrJoinSize {
     ImmSize(usize),
     JoinSize(JoinHandle<usize>),
@@ -581,7 +591,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
         if !refetch.is_empty() {
             debug!("absorb_write_bh - {} block(s) need an object request after a flush took them", refetch.len());
-            self.spawn_write_refetch(req, resp, refetch).await?;
+            self.spawn_write_retrieve(req, resp, refetch, AfterRetrieve::AbsorbBh).await?;
             return Err(Error::new(ErrorKind::ResourceBusy, "refetch blocks taken by a flush"));
         }
 
@@ -743,7 +753,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
         if !refetch.is_empty() {
             debug!("absorb_write_zero_bh - {} block(s) need an object request after a flush took them", refetch.len());
-            self.spawn_write_zero_refetch(req, resp, refetch).await?;
+            self.spawn_write_zero_retrieve(req, resp, refetch, AfterRetrieve::AbsorbBh).await?;
             return Err(Error::new(ErrorKind::ResourceBusy, "refetch blocks taken by a flush"));
         }
 
@@ -849,7 +859,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(bytes_write)
     }
 
-    async fn spawn_write_retrieve(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
+    /// Fetch the blocks a write needs to modify, then hand the request to
+    /// `after`.
+    ///
+    /// Serves both directions a write can arrive from: its first pass,
+    /// which still has the WAL write ahead of it, and a second pass for
+    /// blocks a flush took away in between, which must not repeat that
+    /// write. See `AfterRetrieve`.
+    async fn spawn_write_retrieve(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, list: Vec<BlockIndex>, after: AfterRetrieve) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
         for blk_idx in list {
@@ -886,7 +903,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
             let fh = req.fh.clone();
-            let ctx = FileContext::write_absorb(req, resp);
+            let ctx = match after {
+                AfterRetrieve::Absorb => FileContext::write_absorb(req, resp),
+                AfterRetrieve::AbsorbBh => FileContext::write_absorb_bh(req, resp),
+            };
             let _ = fh.send_cb(ctx);
         });
 
@@ -973,102 +993,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// flush persisted. Unlike `spawn_write_retrieve` this returns to
     /// `write_absorb_bh`: the WAL write has already happened and must not
     /// be repeated.
-    async fn spawn_write_refetch(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
-        let mut joins = Vec::new();
-        let mut fetched = Vec::new();
-        for blk_idx in list {
-            match self.bmap.lookup(&blk_idx).await {
-                Ok(blk_ptr) => {
-                    let block = self.cache.new_block(blk_idx);
-                    block.set_should_cache();
-                    if BlockPtrFormat::is_zero_block(&blk_ptr) {
-                        // A hole reads as zeroes, which a new block already is.
-                        fetched.push(block);
-                        continue;
-                    }
-                    let buf = block.as_mut_slice();
-                    let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
-                    joins.push(join);
-                    fetched.push(block);
-                },
-                Err(e) => {
-                    if e.kind() != ErrorKind::NotFound {
-                        return Err(e);
-                    }
-                    let block = self.cache.new_block(blk_idx);
-                    block.set_should_cache();
-                    fetched.push(block);
-                },
-            }
-        }
-
-        self.rt.as_ref().unwrap().spawn(async move {
-            while let Some(o) = joins.pop() {
-                match o {
-                    ImmOrJoinSize::ImmSize(_) => {},
-                    ImmOrJoinSize::JoinSize(j) => { let _ = j.await; },
-                }
-            }
-            req.fetched.append(&mut fetched);
-            let fh = req.fh.clone();
-            let ctx = FileContext::write_absorb_bh(req, resp);
-            let _ = fh.send_cb(ctx);
-        });
-
-        Ok(())
-    }
-
-    /// `spawn_write_refetch` for a zeroing write. Same reason: a partial
+     /// `spawn_write_refetch` for a zeroing write. Same reason: a partial
     /// zero has to keep the bytes it does not cover, so it needs the
     /// block's current contents, and a flush may have taken them since
     /// this request last ran.
-    async fn spawn_write_zero_refetch(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
-        let mut joins = Vec::new();
-        let mut fetched = Vec::new();
-        for blk_idx in list {
-            match self.bmap.lookup(&blk_idx).await {
-                Ok(blk_ptr) => {
-                    let block = self.cache.new_block(blk_idx);
-                    block.set_should_cache();
-                    if BlockPtrFormat::is_zero_block(&blk_ptr) {
-                        fetched.push(block);
-                        continue;
-                    }
-                    let buf = block.as_mut_slice();
-                    let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
-                    joins.push(join);
-                    fetched.push(block);
-                },
-                Err(e) => {
-                    if e.kind() != ErrorKind::NotFound {
-                        return Err(e);
-                    }
-                    let block = self.cache.new_block(blk_idx);
-                    block.set_should_cache();
-                    fetched.push(block);
-                },
-            }
-        }
-
-        self.rt.as_ref().unwrap().spawn(async move {
-            while let Some(o) = joins.pop() {
-                match o {
-                    ImmOrJoinSize::ImmSize(_) => {},
-                    ImmOrJoinSize::JoinSize(j) => { let _ = j.await; },
-                }
-            }
-            req.fetched.append(&mut fetched);
-            let fh = req.fh.clone();
-            let ctx = FileContext::write_zero_absorb_bh(req, resp);
-            let _ = fh.send_cb(ctx);
-        });
-
-        Ok(())
-    }
-
-    // duplicate logic of spawn_write_retrieve()
+     // duplicate logic of spawn_write_retrieve()
     // TODO: can be merge with spawn_write_retrieve
-    async fn spawn_write_zero_retrieve(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
+    async fn spawn_write_zero_retrieve(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, list: Vec<BlockIndex>, after: AfterRetrieve) -> Result<()> {
         let mut joins = Vec::new();
         let mut fetched = Vec::new();
         for blk_idx in list {
@@ -1105,7 +1036,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             req.fetched.append(&mut fetched);
             let _ = actual_bytes;
             let fh = req.fh.clone();
-            let ctx = FileContext::write_zero_absorb(req, resp);
+            let ctx = match after {
+                AfterRetrieve::Absorb => FileContext::write_zero_absorb(req, resp),
+                AfterRetrieve::AbsorbBh => FileContext::write_zero_absorb_bh(req, resp),
+            };
             let _ = fh.send_cb(ctx);
         });
 
@@ -1194,7 +1128,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
-            self.spawn_write_retrieve(req, resp, v).await?;
+            self.spawn_write_retrieve(req, resp, v, AfterRetrieve::Absorb).await?;
             return Err(Error::new(ErrorKind::ResourceBusy, "hand over to spawn write retrieve"));
         }
 
@@ -1260,7 +1194,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let v: Vec<BlockIndex> = self.write_prepare(off, len);
         if v.len() > 0 {
             // retrieve data by spawn
-            self.spawn_write_zero_retrieve(req, resp, v).await?;
+            self.spawn_write_zero_retrieve(req, resp, v, AfterRetrieve::Absorb).await?;
             return Err(Error::new(ErrorKind::ResourceBusy, "hand over to spawn write zero retrieve"));
         }
 
