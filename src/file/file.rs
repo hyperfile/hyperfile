@@ -958,7 +958,15 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     // write in batch style, all blocks in input vec should be full block
-    pub(crate) async fn write_aligned_batch(&mut self, mut blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize> {
+    /// Blocking-acquire wrapper. The reactor takes the permit itself
+    /// with `try_lock`, so it can put the request back instead of
+    /// waiting on the handler task; see `HyperFile::try_lock`.
+    pub(crate) async fn write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize> {
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        self.write_aligned_batch_locked(blocks, permit).await
+    }
+
+    pub(crate) async fn write_aligned_batch_locked(&mut self, mut blocks: Vec<AlignedDataBlockWrapper>, permit: OwnedSemaphorePermit) -> Result<usize> {
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -972,7 +980,6 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         blocks.dedup_by_key(|b| b.index());
         blocks.reverse();
 
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
         let data_block_size = self.config.meta.data_block_size;
 
         let mut bytes_write = 0;
@@ -1118,6 +1125,25 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
     }
 
+    /// Take the per-file permit, or report that it is taken.
+    ///
+    /// Used by every operation the reactor's handler task can run
+    /// directly. Waiting for this permit on that task deadlocks: a
+    /// write's retrieve carries the permit from `spawn_write` until
+    /// `absorb_write`, and the handler is the only thing that can run
+    /// the callback which releases it, so a handler blocked here waits
+    /// on work only it could perform. The caller must put the request
+    /// back instead.
+    ///
+    /// On the direct API this cannot fail. Those methods take
+    /// `&mut self`, so no second operation on the same file can be in
+    /// flight to hold the permit.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn try_lock(&self) -> Result<OwnedSemaphorePermit> {
+        self.sema.clone().try_acquire_owned()
+            .map_err(|_| Error::new(ErrorKind::ResourceBusy, "per-file permit busy"))
+    }
+
     /// Cache a block that a spawned read-only fetch filled.
     ///
     /// Dropped rather than cached if the index has since become
@@ -1184,6 +1210,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 return Ok(None);
             }
 
+            #[cfg(feature = "reactor")]
+            let permit = self.try_lock()?;
+            #[cfg(not(feature = "reactor"))]
             let permit = self.sema.clone().acquire_owned().await.unwrap();
             // `new_block` allocates zeroed, which is what a created
             // block needs and also the correct starting point for an
@@ -1602,7 +1631,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     // truncate
+    /// Blocking-acquire wrapper; see `HyperFile::try_lock`.
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        self.truncate_locked(new_size, permit).await
+    }
+
+    pub async fn truncate_locked(&mut self, new_size: usize, permit: OwnedSemaphorePermit) -> Result<()> {
         // POSIX ftruncate: "If fildes is not a valid file descriptor
         // open for writing, the ftruncate() function shall fail."
         // The spec allows EBADF or EINVAL here; we use EBADF to match
@@ -1610,7 +1645,6 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
         let size = self.inode.size();
         debug!("truncate - file size from {} to {}", size, new_size);
         if new_size == size {
@@ -1956,7 +1990,13 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
 
 impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: BlockLoader<BlockPtr> + Clone + 'static, C: NodeCache<BlockPtr> + Clone> HyperFile<'a, T, L, C> {
     // write in batch style, input blocks could be incomplete
+    /// Blocking-acquire wrapper; see `HyperFile::try_lock`.
     pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
+        let permit = self.sema.clone().acquire_owned().await.unwrap();
+        self.write_batch_locked(blocks, permit).await
+    }
+
+    pub async fn write_batch_locked(&mut self, blocks: Vec<BatchDataBlockWrapper>, permit: OwnedSemaphorePermit) -> Result<usize> {
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -2000,7 +2040,6 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             merged.insert(blk_idx, m);
         }
 
-        let permit = self.sema.clone().acquire_owned().await.unwrap();
 
         // write prepare
         let mut v_need_retrieve = Vec::new();

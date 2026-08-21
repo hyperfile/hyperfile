@@ -129,7 +129,7 @@ impl<'a: 'static> HyperFileTokio<'a> {
     }
 
     pub async fn set_len(&self, size: u64) -> Result<()> {
-        let (ctx, rx) = FileContext::new_trunc(size as usize);
+        let (ctx, rx) = FileContext::new_trunc(size as usize, self.inner.clone());
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }

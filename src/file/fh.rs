@@ -247,14 +247,14 @@ impl<'a: 'static> HyperFileHandler<'a> {
 
     pub async fn fh_write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize>
     {
-        let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks);
+        let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks, self.inner.clone());
         self.inner.send(ctx)?;
         rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
     pub async fn fh_write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize>
     {
-        let (ctx, mut rx) = FileContext::new_write_batch(blocks);
+        let (ctx, mut rx) = FileContext::new_write_batch(blocks, self.inner.clone());
         self.inner.send(ctx)?;
         rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
@@ -278,7 +278,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
 
     pub async fn fh_truncate(&mut self, offset: usize) -> Result<()>
     {
-        let (ctx, rx) = FileContext::new_trunc(offset);
+        let (ctx, rx) = FileContext::new_trunc(offset, self.inner.clone());
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }

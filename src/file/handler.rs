@@ -26,18 +26,29 @@ use super::HyperTrait;
 ///
 /// ## Channel priorities
 ///
-/// - `highprio` (priority 0): retried requests after a contention
-///   miss (range-lock taken, semaphore busy). They were already
-///   accepted from the user but couldn't proceed; we put them
-///   ahead of new user requests so the request being retried
-///   doesn't get starved.
-/// - `cb` (priority 1): internal callback re-routes (multi-hop
-///   pipelines like WAL write -> WAL PUT done -> cache update).
-///   Higher than `user` so the in-progress hop finishes before a
-///   new request starts a new hop and grabs the per-file
-///   semaphore.
+/// Lower number is served first.
+///
+/// - `highprio` (priority 0): requests put back after a contention
+///   miss, when the range lock or the per-file permit was taken. They
+///   were already accepted from the user, so they rank above new
+///   requests and are not starved by them.
+/// - `cb` (priority 1): internal callback re-routes — the later hops of
+///   a multi-hop pipeline (write retrieve -> absorb, WAL write -> PUT
+///   done -> cache update, a spawned block fetch handing its block back
+///   to be cached). Above `user` so an in-progress hop finishes before a
+///   new request starts one.
 /// - `user` (priority 2): incoming user requests from
 ///   `HyperFileHandler::fh_*` / `HyperFileTokio::*`.
+///
+/// Note that a hop in flight can be holding the per-file permit:
+/// `FileReqWrite::spawn_write_permit` carries one from `spawn_write`
+/// until `absorb_write`, and only the handler task can run the hop that
+/// releases it. Nothing on this task may therefore *wait* for that
+/// permit — see `HyperFile::try_lock`. Ranking `cb` above `highprio`
+/// looks like it would help and does not: it changes which of two
+/// racing writes lands first, and under the `range-lock` feature that
+/// was enough to make two of them retrieve the same block and collide
+/// in `absorb_write`.
 pub struct ChannelGroup<Ctx> {
     inner: TaskHandler<Ctx>,
     highprio: Channel<Ctx>,
@@ -375,16 +386,22 @@ pub struct FileReqWriteZero<'a> {
     pub fh: ChannelGroup<FileContext<'a>>,
 }
 
-pub struct FileReqWriteAlignedBatch {
+pub struct FileReqWriteAlignedBatch<'a> {
     pub data_blocks: Vec<AlignedDataBlockWrapper>,
+    /// Needed to put the request back after a contention miss.
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
-pub struct FileReqWriteBatch {
+pub struct FileReqWriteBatch<'a> {
     pub data_blocks: Vec<BatchDataBlockWrapper>,
+    /// Needed to put the request back after a contention miss.
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
-pub struct FileReqTrunc {
+pub struct FileReqTrunc<'a> {
     pub offset: usize,
+    /// Needed to put the request back after a contention miss.
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 /// A caller-supplied action to run against a borrowed data block.
@@ -562,9 +579,9 @@ pub union FileReqBody<'a> {
     read: ManuallyDrop<FileReqRead<'a>>,
     write: ManuallyDrop<FileReqWrite<'a>>,
     write_zero: ManuallyDrop<FileReqWriteZero<'a>>,
-    write_aligned_batch: ManuallyDrop<FileReqWriteAlignedBatch>,
-    write_batch: ManuallyDrop<FileReqWriteBatch>,
-    trunc: ManuallyDrop<FileReqTrunc>,
+    write_aligned_batch: ManuallyDrop<FileReqWriteAlignedBatch<'a>>,
+    write_batch: ManuallyDrop<FileReqWriteBatch<'a>>,
+    trunc: ManuallyDrop<FileReqTrunc<'a>>,
     with_block: ManuallyDrop<FileReqWithBlock<'a>>,
     timing: ManuallyDrop<FileReqTiming>,
     dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
@@ -703,31 +720,31 @@ impl<'a> FileContext<'a> {
         Self { req: Some(new_req), resp: Some(resp), }
     }
 
-    pub fn new_write_aligned_batch(v: Vec<AlignedDataBlockWrapper>) -> (Self, mpsc::Receiver<FileRespWrite>) {
+    pub fn new_write_aligned_batch(v: Vec<AlignedDataBlockWrapper>, fh: ChannelGroup<FileContext<'a>>) -> (Self, mpsc::Receiver<FileRespWrite>) {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let new_req = FileReq {
             op: FileReqOp::WriteAlignedBatch,
-            body: FileReqBody { write_aligned_batch: ManuallyDrop::new(FileReqWriteAlignedBatch { data_blocks: v }), },
+            body: FileReqBody { write_aligned_batch: ManuallyDrop::new(FileReqWriteAlignedBatch { data_blocks: v, fh }), },
         };
         let resp = FileResp::WriteAlignedBatch(tx);
         (Self { req: Some(new_req), resp: Some(resp), }, rx)
     }
 
-    pub fn new_write_batch(v: Vec<BatchDataBlockWrapper>) -> (Self, mpsc::Receiver<FileRespWrite>) {
+    pub fn new_write_batch(v: Vec<BatchDataBlockWrapper>, fh: ChannelGroup<FileContext<'a>>) -> (Self, mpsc::Receiver<FileRespWrite>) {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let new_req = FileReq {
             op: FileReqOp::WriteBatch,
-            body: FileReqBody { write_batch: ManuallyDrop::new(FileReqWriteBatch { data_blocks: v }), },
+            body: FileReqBody { write_batch: ManuallyDrop::new(FileReqWriteBatch { data_blocks: v, fh }), },
         };
         let resp = FileResp::WriteBatch(tx);
         (Self { req: Some(new_req), resp: Some(resp), }, rx)
     }
 
-    pub fn new_trunc(offset: usize) -> (Self, oneshot::Receiver<FileRespTrunc>) {
+    pub fn new_trunc(offset: usize, fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespTrunc>) {
         let (tx, rx) = oneshot::channel::<FileRespTrunc>();
         let req = FileReq {
             op: FileReqOp::Trunc,
-            body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset: offset }), },
+            body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset: offset, fh }), },
         };
         let resp = FileResp::Trunc(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
@@ -782,6 +799,38 @@ impl<'a> FileContext<'a> {
         };
         let resp = FileResp::ReadOwned(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    /// Rebuild a truncate so it can be retried after a contention miss.
+    pub fn reform_trunc(offset: usize, fh: ChannelGroup<FileContext<'a>>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::Trunc,
+            body: FileReqBody { trunc: ManuallyDrop::new(FileReqTrunc { offset, fh }) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    /// Rebuild an aligned batch write so it can be retried. The blocks
+    /// travel back with it, so a contention miss costs no data.
+    pub fn reform_write_aligned_batch(data_blocks: Vec<AlignedDataBlockWrapper>,
+        fh: ChannelGroup<FileContext<'a>>, resp: FileResp) -> Self
+    {
+        let req = FileReq {
+            op: FileReqOp::WriteAlignedBatch,
+            body: FileReqBody { write_aligned_batch: ManuallyDrop::new(FileReqWriteAlignedBatch { data_blocks, fh }) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    /// Rebuild a batch write so it can be retried.
+    pub fn reform_write_batch(data_blocks: Vec<BatchDataBlockWrapper>,
+        fh: ChannelGroup<FileContext<'a>>, resp: FileResp) -> Self
+    {
+        let req = FileReq {
+            op: FileReqOp::WriteBatch,
+            body: FileReqBody { write_batch: ManuallyDrop::new(FileReqWriteBatch { data_blocks, fh }) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
     }
 
     /// Rebuild a block-action request so it can be retried, as the byte
@@ -1176,22 +1225,41 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::WriteAlignedBatch => {
                 let md = unsafe { req.body.write_aligned_batch };
                 let req = ManuallyDrop::into_inner(md);
-                let blocks = req.data_blocks;
-                let res = self.inner.write_aligned_batch(blocks).await;
+                // Take the permit before the blocks are consumed, so a
+                // contention miss can put them back. Waiting here would
+                // block the one task that can release the permit.
+                let Ok(permit) = self.inner.try_lock() else {
+                    let fh = req.fh.clone();
+                    let ctx = FileContext::reform_write_aligned_batch(req.data_blocks, req.fh, resp);
+                    let _ = fh.send_highprio(ctx);
+                    return;
+                };
+                let res = self.inner.write_aligned_batch_locked(req.data_blocks, permit).await;
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::WriteBatch => {
                 let md = unsafe { req.body.write_batch };
                 let req = ManuallyDrop::into_inner(md);
-                let blocks = req.data_blocks;
-                let res = self.inner.write_batch(blocks).await;
+                let Ok(permit) = self.inner.try_lock() else {
+                    let fh = req.fh.clone();
+                    let ctx = FileContext::reform_write_batch(req.data_blocks, req.fh, resp);
+                    let _ = fh.send_highprio(ctx);
+                    return;
+                };
+                let res = self.inner.write_batch_locked(req.data_blocks, permit).await;
                 let _ = resp.to_write().try_send(res);
             },
             FileReqOp::Trunc => {
                 let md = unsafe { req.body.trunc };
                 let req = ManuallyDrop::into_inner(md);
                 let offset = req.offset;
-                let res = self.inner.truncate(offset).await;
+                let Ok(permit) = self.inner.try_lock() else {
+                    let fh = req.fh.clone();
+                    let ctx = FileContext::reform_trunc(offset, req.fh, resp);
+                    let _ = fh.send_highprio(ctx);
+                    return;
+                };
+                let res = self.inner.truncate_locked(offset, permit).await;
                 let _ = resp.to_trunc().send(res);
             },
             FileReqOp::BlockAbsorb => {
@@ -1226,6 +1294,9 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let md = unsafe { req.body.with_block };
                 let req = ManuallyDrop::into_inner(md);
                 let FileReqWithBlock { blk_idx, create, action, gate, fh } = req;
+                // One handle travels in the rebuilt request, one is used
+                // to send it.
+                let ctx_fh = fh.clone();
                 match action {
                     // Read-only: fetched off this task when it has to be
                     // fetched, so concurrent readers overlap.
@@ -1239,19 +1310,26 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     // everything else. The borrow lives only as long as
                     // the closure call.
                     BlockAction::Mut(f) => {
-                        let _ = fh;
-                        let res = match self.inner.block_mut(blk_idx, create).await {
+                        match self.inner.block_mut(blk_idx, create).await {
                             Ok(Some(mut block)) => {
                                 let cancelled = gate.lock().unwrap_or_else(|e| e.into_inner());
                                 if !*cancelled {
                                     f(block.as_mut_slice());
                                 }
-                                Ok(true)
+                                resp.answer_with_block(Ok(true));
                             },
-                            Ok(None) => Ok(false),
-                            Err(e) => Err(e),
-                        };
-                        resp.answer_with_block(res);
+                            Ok(None) => resp.answer_with_block(Ok(false)),
+                            // The permit is held by a pipeline only this
+                            // task can advance, so put the request back
+                            // rather than wait or fail. `cb` outranks
+                            // `highprio`, so that pipeline goes first.
+                            Err(e) if e.kind() == ErrorKind::ResourceBusy => {
+                                let ctx = FileContext::reform_with_block(
+                                    blk_idx, create, BlockAction::Mut(f), gate, fh, resp);
+                                let _ = ctx_fh.send_highprio(ctx);
+                            },
+                            Err(e) => resp.answer_with_block(Err(e)),
+                        }
                     },
                 }
             },
@@ -1437,8 +1515,6 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
 mod tests {
     use super::*;
     use std::mem::ManuallyDrop;
-use std::sync::Arc;
-use bytes::Bytes;
     use tokio::task::LocalSet;
     use hyperfile_reactor::Reactor;
 
@@ -1502,7 +1578,8 @@ use bytes::Bytes;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let local = LocalSet::new();
         local.block_on(&rt, async {
-            let (ctx, rx) = FileContext::new_trunc(4096);
+            let fh = make_handler().await;
+            let (ctx, rx) = FileContext::new_trunc(4096, fh);
             let (req, resp) = ctx.take();
             assert!(matches!(req.op, FileReqOp::Trunc));
             let body = ManuallyDrop::into_inner(unsafe { req.body.trunc });
@@ -1627,7 +1704,8 @@ use bytes::Bytes;
                 AlignedDataBlockWrapper::new(0, 4096, false),
                 AlignedDataBlockWrapper::new(1, 4096, true),
             ];
-            let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks);
+            let fh = make_handler().await;
+            let (ctx, mut rx) = FileContext::new_write_aligned_batch(blocks, fh);
             let (req, resp) = ctx.take();
             assert!(matches!(req.op, FileReqOp::WriteAlignedBatch));
             let body = ManuallyDrop::into_inner(unsafe { req.body.write_aligned_batch });
@@ -1645,7 +1723,8 @@ use bytes::Bytes;
         let local = LocalSet::new();
         local.block_on(&rt, async {
             let blocks = vec![BatchDataBlockWrapper::new(0, 4096, false)];
-            let (ctx, mut rx) = FileContext::new_write_batch(blocks);
+            let fh = make_handler().await;
+            let (ctx, mut rx) = FileContext::new_write_batch(blocks, fh);
             let (req, resp) = ctx.take();
             assert!(matches!(req.op, FileReqOp::WriteBatch));
             let body = ManuallyDrop::into_inner(unsafe { req.body.write_batch });

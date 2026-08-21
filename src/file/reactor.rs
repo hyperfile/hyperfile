@@ -231,13 +231,29 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "read range locked"));
         }
+        // Take the per-file permit without waiting. Waiting here would
+        // block the handler task, and the handler is the only thing that
+        // can run the callback hop which releases the permit — a write's
+        // retrieve carries it from `spawn_write` until `absorb_write`.
+        // Waiting would therefore deadlock against exactly the work that
+        // would let the wait finish. Put the request back instead; `cb`
+        // outranks `highprio`, so the hop we are waiting on runs first.
+        let permit = match self.sema.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let fh = req.fh.clone();
+                let ctx = FileContext::reform_read(req, resp);
+                let _ = fh.send_highprio(ctx);
+                return Err(Error::new(ErrorKind::ResourceBusy, "per-file permit busy"));
+            },
+        };
+
         let mut buf = req.buf;
         // Taken now so the send sites below can hand it back. `buf`
         // already points into it; nothing touches the `Vec` itself until
         // the reads are done and it is moved into the response.
         let owned = req.owned.take();
-
-        let _permit = self.sema.clone().acquire_owned().await.unwrap();
+        let _permit = permit;
 
         debug!("READ - off: {}, buf len: {}", off, len);
         if off >= self.inode.size() {
