@@ -12,7 +12,7 @@ use crate::file::HyperTrait;
 use crate::meta_format::BlockPtrFormat;
 use crate::buffer::DataBlock;
 use super::file::{HyperFile, ReadOp};
-use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext};
+use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext, ChannelGroup, BlockAction};
 
 pub(crate) enum ImmOrJoinSize {
     ImmSize(usize),
@@ -26,8 +26,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         L: BlockLoader<BlockPtr> + Clone + 'static,
         C: NodeCache<BlockPtr> + Clone,
 {
-    pub(crate) fn spawn_load_data_block_write_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {
-        debug!("spawn_load_data_block_write_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
+    pub(crate) fn spawn_load_data_block_write_path(&mut self, blk_id: BlockIndex, blk_ptr: BlockPtr, offset: usize, buf: &mut [u8]) -> Result<ImmOrJoinSize> {        debug!("spawn_load_data_block_write_path - block index: {}, offset: {}, bytes: {}, block ptr: {}",
             blk_id, offset, buf.len(), self.blk_ptr_decode_display(&blk_ptr));
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
@@ -95,6 +94,107 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     // for spawn_read/spawn_write resp is based on mpsc channel
     // so use try_send() instead send()
+    /// Run a read-only block action, fetching the block off the handler
+    /// task when it has to be fetched at all.
+    ///
+    /// The handler takes `&mut self` and runs one context at a time, so
+    /// anything it awaits serializes every other request. A cache hit
+    /// awaits nothing and stays here; a miss is an object-store round
+    /// trip and must not.
+    ///
+    /// A miss can move off because the block it needs is owned rather
+    /// than borrowed from the file — `Cache::new_block` hands out a
+    /// fresh one, exactly as the write path's retrieve does — so the
+    /// load, the closure and the gate all travel into a spawned task and
+    /// nothing here stays borrowed past the return. `HyperFile::block`
+    /// cannot do this: it yields a `BlockRef` borrowed from `&mut self`.
+    ///
+    /// The filled block is requeued for caching rather than dropped; see
+    /// `absorb_block`. Caching is what makes repeated block access cost
+    /// one request instead of one each.
+    pub async fn spawn_block_ref(
+        &mut self,
+        blk_idx: BlockIndex,
+        f: Box<dyn FnOnce(&[u8]) + Send>,
+        gate: crate::file::handler::BlockActionGate,
+        resp: FileResp,
+        fh: ChannelGroup<FileContext<'a>>,
+    ) -> Result<()>
+    {
+        if !self.flags.is_readable() {
+            let e = Self::ebadf_bad_access_mode();
+            resp.fail_with_block(Self::ebadf_bad_access_mode());
+            return Err(e);
+        }
+
+        // Stop the world while a flush is in progress, as the byte read
+        // path does. While this fetched inline the arm could not overlap
+        // a flush; now that it spawns, it could.
+        if self.state.is_flushing() {
+            let ctx = FileContext::reform_with_block(blk_idx, false, BlockAction::Ref(f), gate, fh.clone(), resp);
+            let _ = fh.send_highprio(ctx);
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
+        }
+
+        // Resident: no I/O, so run it here and answer.
+        if self.cache.has(&blk_idx) {
+            self.staging.read_timing().add_cache_hit();
+            let block = self.cache.get(&blk_idx)
+                .expect("cache lost a block between has() and get() under &mut self");
+            {
+                let cancelled = gate.lock().unwrap_or_else(|e| e.into_inner());
+                if !*cancelled {
+                    f(block.as_slice());
+                }
+            }
+            block.unlock();
+            resp.answer_with_block(Ok(true));
+            return Ok(());
+        }
+
+        let blk_ptr = match self.bmap.lookup(&blk_idx).await {
+            Ok(p) => p,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                resp.answer_with_block(Ok(false));
+                return Ok(());
+            },
+            Err(e) => {
+                resp.fail_with_block(Error::new(e.kind(), format!("{e}")));
+                return Err(e);
+            },
+        };
+        if BlockPtrFormat::is_zero_block(&blk_ptr) {
+            resp.answer_with_block(Ok(false));
+            return Ok(());
+        }
+
+        let block = self.cache.new_block(blk_idx);
+        block.set_should_cache();
+        let buf = block.as_mut_slice();
+        let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
+
+        self.rt.as_ref().unwrap().spawn(async move {
+            match join {
+                ImmOrJoinSize::ImmSize(_) => {},
+                ImmOrJoinSize::JoinSize(j) => { let _ = j.await; },
+            }
+            // The gate is taken only now, after the load, so a caller
+            // that cancels waits for a closure body and never for I/O.
+            {
+                let cancelled = gate.lock().unwrap_or_else(|e| e.into_inner());
+                if !*cancelled {
+                    f(block.as_slice());
+                }
+            }
+            resp.answer_with_block(Ok(true));
+            // Hand the block over to be cached. The caller already has
+            // its answer, so this is off the critical path.
+            let _ = fh.send_cb(FileContext::block_absorb(blk_idx, block));
+        });
+
+        Ok(())
+    }
+
     pub async fn spawn_read(&mut self, mut req: FileReqRead<'a>, resp: FileResp) -> Result<usize> {
         // POSIX: a read on a handle not opened for reading fails with
         // EBADF. Checked before the flush-state test and the range

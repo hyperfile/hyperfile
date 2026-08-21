@@ -949,3 +949,95 @@ async fn dirty_block_count_tracks_pending_writes() {
     let _ = fh.fh_release().await.expect("release");
     tf.cleanup(&client).await;
 }
+
+/// Concurrent read-only block access must overlap.
+///
+/// `BlockAction::Ref` used to fetch the block inside the handler arm,
+/// and the handler takes `&mut self` and handles one context at a time,
+/// so every concurrent reader queued behind the one before it —
+/// concurrency was 1 whatever the caller spawned. Measured at 0.99:
+/// 289.6 ms serial against 292.1 ms for the same reads concurrently.
+///
+/// The fix mirrors what the write path's retrieve already does: the
+/// block is owned rather than borrowed from the file, so the load moves
+/// into a spawned task along with the closure, and the arm returns.
+///
+/// Same shape as `concurrent_owned_reads_overlap`, and the same loose
+/// threshold for the same reason: cache hits and planning still run one
+/// at a time in the handler, so the overlap is partial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn concurrent_block_reads_overlap() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const N: u64 = 48;
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("fh create");
+        let _ = fh.fh_write(0, &vec![0x5Au8; N as usize * BLK]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    // Serial baseline, every block cold.
+    let serial = {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
+        ).await.expect("fh open");
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let b = fh.fh_with_block(i, |blk| blk[0]).await
+                .expect("with_block").expect("mapped");
+            assert_eq!(b, 0x5A);
+        }
+        let d = t.elapsed();
+        let s = fh.fh_read_timing().await.expect("timing");
+        assert_eq!(s.data_gets, N, "each cold block should cost one request");
+        let _ = fh.fh_release().await.expect("release");
+        d
+    };
+
+    // Concurrent, every block cold again. Clones share one reactor
+    // task, which is the point.
+    let concurrent = {
+        let mut fh = HyperFileHandler::fh_open(
+            &reactor, &client, tf.uri(), FileFlags::rdonly(),
+        ).await.expect("fh open");
+        fh.fh_read_timing_reset().await.expect("reset");
+        let t = std::time::Instant::now();
+        let mut set = Vec::new();
+        for i in 0..N {
+            let mut c = fh.clone();
+            set.push(tokio::spawn(async move {
+                let b = c.fh_with_block(i, |blk| blk[0]).await
+                    .expect("with_block").expect("mapped");
+                assert_eq!(b, 0x5A);
+            }));
+        }
+        for j in set {
+            j.await.expect("task");
+        }
+        let d = t.elapsed();
+        let s = fh.fh_read_timing().await.expect("timing");
+        // The efficiency of the block path is the other half of the
+        // point: concurrency must not cost extra requests.
+        assert!(s.data_gets <= N + 4,
+            "concurrent block reads should not fetch more than the {N} blocks, got {}",
+            s.data_gets);
+        let _ = fh.fh_release().await.expect("release");
+        d
+    };
+
+    eprintln!("block reads: {N} serial {:?}, {N} concurrent {:?}", serial, concurrent);
+    assert!(concurrent * 4 < serial * 3,
+        "{N} concurrent block reads took {:?} against {:?} serially, so they are not \
+         overlapping — the fetch is being run to completion inside the handler",
+        concurrent, serial);
+
+    tf.cleanup(&client).await;
+}

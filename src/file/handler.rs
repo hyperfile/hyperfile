@@ -141,6 +141,8 @@ pub enum FileResp {
     WithBlock(oneshot::Sender<FileRespWithBlock>),
     Timing(oneshot::Sender<FileRespTiming>),
     DirtyBlockCount(oneshot::Sender<FileRespDirtyBlockCount>),
+    /// No response: the requester was answered before requeuing.
+    BlockAbsorb,
     ReadOwned(oneshot::Sender<FileRespReadOwned>),
     Flush(oneshot::Sender<FileRespFlush>),
     #[cfg(feature = "wal")]
@@ -233,6 +235,23 @@ impl FileResp {
         match self {
             Self::Timing(tx) => tx,
             _ => panic!("FileResp::to_timing called on wrong variant"),
+        }
+    }
+
+    /// Answer a block action. Split from `to_with_block` because the
+    /// spawning path answers from a task rather than the arm, and has no
+    /// use for the sender itself.
+    pub fn answer_with_block(self, res: FileRespWithBlock) {
+        match self {
+            Self::WithBlock(tx) => { let _ = tx.send(res); },
+            _ => panic!("FileResp::answer_with_block called on wrong variant"),
+        }
+    }
+
+    pub fn fail_with_block(self, e: Error) {
+        match self {
+            Self::WithBlock(tx) => { let _ = tx.send(Err(e)); },
+            _ => panic!("FileResp::fail_with_block called on wrong variant"),
         }
     }
 
@@ -429,6 +448,21 @@ pub struct FileReqTiming {
 
 pub struct FileReqDirtyBlockCount {}
 
+/// Hands a block loaded by a spawned task back for caching.
+///
+/// A spawned read-only block fetch owns the block it filled, and
+/// putting it in the cache needs `&mut self`, which only a handler arm
+/// has. So the task requeues this, the same way the write path's
+/// retrieve requeues its fetched blocks for `absorb_write` to insert.
+///
+/// Caching is what makes the block path cheaper than the byte path —
+/// repeated access to the same blocks costs one request instead of one
+/// each — so skipping this would give away the reason to use it.
+pub struct FileReqBlockAbsorb {
+    pub blk_idx: BlockIndex,
+    pub block: DataBlock,
+}
+
 /// A counter snapshot, or an acknowledgement for a reset.
 ///
 /// Snapshots are owned values rather than references to the live
@@ -440,7 +474,7 @@ pub enum TimingValue {
     Reset,
 }
 
-pub struct FileReqWithBlock {
+pub struct FileReqWithBlock<'a> {
     pub blk_idx: BlockIndex,
     /// Materialize a zero-filled block if the index has no data.
     /// Ignored by [`BlockAction::Ref`], which cannot create.
@@ -449,6 +483,9 @@ pub struct FileReqWithBlock {
     /// Guards `action` against running after the caller is gone. See
     /// [`BlockActionGate`].
     pub gate: BlockActionGate,
+    /// Needed to requeue: the read-only path hands the block back for
+    /// caching, and defers to a retry while a flush is in progress.
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 pub struct FileReqGetAttr {}
@@ -501,6 +538,7 @@ pub enum FileReqOp {
     WithBlock,
     Timing,
     DirtyBlockCount,
+    BlockAbsorb,
     Flush,
     FlushData,
     #[cfg(feature = "wal")]
@@ -527,9 +565,10 @@ pub union FileReqBody<'a> {
     write_aligned_batch: ManuallyDrop<FileReqWriteAlignedBatch>,
     write_batch: ManuallyDrop<FileReqWriteBatch>,
     trunc: ManuallyDrop<FileReqTrunc>,
-    with_block: ManuallyDrop<FileReqWithBlock>,
+    with_block: ManuallyDrop<FileReqWithBlock<'a>>,
     timing: ManuallyDrop<FileReqTiming>,
     dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
+    block_absorb: ManuallyDrop<FileReqBlockAbsorb>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
     #[cfg(feature = "wal")]
@@ -745,6 +784,30 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
+    /// Rebuild a block-action request so it can be retried, as the byte
+    /// paths do when a flush is in progress.
+    pub fn reform_with_block(blk_idx: BlockIndex, create: bool, action: BlockAction,
+        gate: BlockActionGate, fh: ChannelGroup<FileContext<'a>>, resp: FileResp) -> Self
+    {
+        let req = FileReq {
+            op: FileReqOp::WithBlock,
+            body: FileReqBody {
+                with_block: ManuallyDrop::new(FileReqWithBlock { blk_idx, create, action, gate, fh }),
+            },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    /// Requeue a loaded block for caching. Carries no response: the
+    /// caller has already been answered by the task that filled it.
+    pub fn block_absorb(blk_idx: BlockIndex, block: DataBlock) -> Self {
+        let req = FileReq {
+            op: FileReqOp::BlockAbsorb,
+            body: FileReqBody { block_absorb: ManuallyDrop::new(FileReqBlockAbsorb { blk_idx, block }), },
+        };
+        Self { req: Some(req), resp: Some(FileResp::BlockAbsorb) }
+    }
+
     pub fn new_dirty_block_count() -> (Self, oneshot::Receiver<FileRespDirtyBlockCount>) {
         let (tx, rx) = oneshot::channel::<FileRespDirtyBlockCount>();
         let req = FileReq {
@@ -765,14 +828,15 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
-    pub fn new_with_block(blk_idx: BlockIndex, create: bool, action: BlockAction, gate: BlockActionGate)
+    pub fn new_with_block(blk_idx: BlockIndex, create: bool, action: BlockAction,
+        gate: BlockActionGate, fh: ChannelGroup<FileContext<'a>>)
         -> (Self, oneshot::Receiver<FileRespWithBlock>)
     {
         let (tx, rx) = oneshot::channel::<FileRespWithBlock>();
         let req = FileReq {
             op: FileReqOp::WithBlock,
             body: FileReqBody {
-                with_block: ManuallyDrop::new(FileReqWithBlock { blk_idx, create, action, gate }),
+                with_block: ManuallyDrop::new(FileReqWithBlock { blk_idx, create, action, gate, fh }),
             },
         };
         let resp = FileResp::WithBlock(tx);
@@ -1130,6 +1194,11 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let res = self.inner.truncate(offset).await;
                 let _ = resp.to_trunc().send(res);
             },
+            FileReqOp::BlockAbsorb => {
+                let md = unsafe { req.body.block_absorb };
+                let r = ManuallyDrop::into_inner(md);
+                self.inner.absorb_block(r.blk_idx, r.block);
+            },
             FileReqOp::DirtyBlockCount => {
                 let md = unsafe { req.body.dirty_block_count };
                 let _ = ManuallyDrop::into_inner(md);
@@ -1156,29 +1225,22 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::WithBlock => {
                 let md = unsafe { req.body.with_block };
                 let req = ManuallyDrop::into_inner(md);
-                let FileReqWithBlock { blk_idx, create, action, gate } = req;
-                // The borrow stays inside this task for the whole
-                // call; only the action's own result leaves, on the
-                // channel its closure captured.
-                // Fetch the block first, then take the gate to run the
-                // action. Nothing awaits inside the gate, so a
-                // cancelling caller waits only for the closure body.
-                let res = match action {
+                let FileReqWithBlock { blk_idx, create, action, gate, fh } = req;
+                match action {
+                    // Read-only: fetched off this task when it has to be
+                    // fetched, so concurrent readers overlap.
+                    // `spawn_block_ref` answers, including on error.
                     BlockAction::Ref(f) => {
-                        match self.inner.block(blk_idx).await {
-                            Ok(Some(block)) => {
-                                let cancelled = gate.lock().unwrap_or_else(|e| e.into_inner());
-                                if !*cancelled {
-                                    f(block.as_slice());
-                                }
-                                Ok(true)
-                            },
-                            Ok(None) => Ok(false),
-                            Err(e) => Err(e),
-                        }
+                        let _ = self.inner.spawn_block_ref(blk_idx, f, gate, resp, fh).await;
                     },
+                    // Mutable: dirties the block, installs a bmap
+                    // placeholder and joins the next flush, so it stays
+                    // on this task where those are serialized with
+                    // everything else. The borrow lives only as long as
+                    // the closure call.
                     BlockAction::Mut(f) => {
-                        match self.inner.block_mut(blk_idx, create).await {
+                        let _ = fh;
+                        let res = match self.inner.block_mut(blk_idx, create).await {
                             Ok(Some(mut block)) => {
                                 let cancelled = gate.lock().unwrap_or_else(|e| e.into_inner());
                                 if !*cancelled {
@@ -1188,10 +1250,10 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                             },
                             Ok(None) => Ok(false),
                             Err(e) => Err(e),
-                        }
+                        };
+                        resp.answer_with_block(res);
                     },
-                };
-                let _ = resp.to_with_block().send(res);
+                }
             },
             // single flush interface for extenral
             #[cfg(not(feature = "wal"))]

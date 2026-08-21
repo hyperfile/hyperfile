@@ -1118,6 +1118,22 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
     }
 
+    /// Cache a block that a spawned read-only fetch filled.
+    ///
+    /// Dropped rather than cached if the index has since become
+    /// resident some other way: a `block_mut` or a write between the
+    /// spawn and here would have made it dirty, and that copy is the
+    /// current one. Two concurrent misses on the same index also arrive
+    /// here twice; the second is redundant but harmless.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn absorb_block(&mut self, blk_idx: BlockIndex, block: DataBlock) {
+        if self.cache.has(&blk_idx) {
+            debug!("absorb_block - block index {} already resident, dropping the loaded copy", blk_idx);
+            return;
+        }
+        let _ = self.cache.insert_clean(blk_idx, block);
+    }
+
     /// Borrow block `blk_idx` for modification, loading it from
     /// staging if it is not already cached.
     ///

@@ -154,6 +154,32 @@ what the closure needs into it, and return what the caller needs out.
 `fh_with_block*` returns `Ok(None)` without running the closure when
 the block has no data.
 
+### Concurrency
+
+The reactor's handler task takes `&mut self` and runs one request at a
+time, so anything it awaits serializes every other request. Whether an
+entry point fetches on that task or off it therefore decides whether
+concurrent callers overlap:
+
+| | fetch runs | concurrent callers overlap |
+|---|---|---|
+| `fh_read` / `fh_read_owned` | off the handler task | yes |
+| `fh_with_block` | off it, when the block has to be fetched | yes |
+| `fh_with_block_mut` | on it | no |
+
+A `fh_with_block` that hits the cache is served on the handler task,
+which costs nothing to overlap because it awaits nothing. A miss is an
+object-store round trip, and moves off: the block it fills is owned
+rather than borrowed from the file, so the load, the closure and the
+gate travel into a spawned task together. The filled block is handed
+back afterwards to be cached, which is what keeps repeated block access
+at one request rather than one per access.
+
+`fh_with_block_mut` stays on the handler task deliberately. It dirties
+the block, installs a block-map placeholder and joins the next flush;
+those are serialized against everything else, and overlapping them is a
+much larger question than overlapping a read.
+
 ### Cancellation
 
 Because `f` may borrow the caller's frame, it must not run once the

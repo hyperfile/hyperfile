@@ -509,7 +509,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
             std::sync::Arc::new(std::sync::Mutex::new(false));
         let guard = BorrowGuard { gate: gate.clone() };
 
-        let (ctx, rx) = FileContext::new_with_block(idx, create, action, gate);
+        let (ctx, rx) = FileContext::new_with_block(idx, create, action, gate, self.inner.clone());
         self.inner.send(ctx)?;
         let ran = rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))??;
