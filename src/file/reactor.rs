@@ -144,7 +144,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // path does. While this fetched inline the arm could not overlap
         // a flush; now that it spawns, it could.
         // Under WAL this need not wait at all.
-        if self.read_must_wait_for_flush() {
+        if self.must_wait_for_flush() {
             let ctx = FileContext::reform_with_block(blk_idx, false, BlockAction::Ref(f), gate, fh.clone(), resp);
             let _ = fh.send_highprio(ctx);
             return Err(Error::new(ErrorKind::ResourceBusy, "flush is ongoing"));
@@ -209,7 +209,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(())
     }
 
-    /// Whether a read has to wait for a flush that is in progress.
+    /// Whether an operation has to wait for a flush that is in progress.
     ///
     /// Without WAL it does. The flush is rewriting the bmap and draining
     /// the dirty cache underneath, and there is nowhere else to get the
@@ -226,12 +226,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// the point of writing the WAL first, which is that a flush stops
     /// blocking the front end.
     ///
-    /// Writes deliberately still wait. A WAL write is a multi-hop
-    /// pipeline, and a flush interleaving between the hop that fetches a
-    /// block and the hop that modifies it takes that block away, leaving
-    /// the write to rebuild it from nothing. Letting writes overlap a
-    /// flush needs that fixed first.
-    fn read_must_wait_for_flush(&self) -> bool {
+    /// Writes may overlap a flush too. Their two halves can straddle one,
+    /// because a WAL write hands the handler task back in between, so
+    /// `absorb_write_bh` fetches again anything the flush took rather than
+    /// applying the write over a block rebuilt from nothing.
+    ///
+    /// Note what a write holds while it overlaps: without `range-lock` the
+    /// per-file permit, which is a single permit for the whole file, and
+    /// with `range-lock` the range it is writing. Either is held across
+    /// the WAL PUT, so an overlapping write costs concurrent readers of
+    /// the *same* blocks a great deal, and readers of other blocks
+    /// nothing at all — but only under `range-lock`, where the permit is
+    /// unbounded and the range is what excludes.
+    fn must_wait_for_flush(&self) -> bool {
         if !self.state.is_flushing() {
             return false;
         }
@@ -263,7 +270,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         // Stop the world while a flush runs, unless WAL makes that
         // unnecessary. See `read_must_wait_for_flush`.
-        if self.read_must_wait_for_flush() {
+        if self.must_wait_for_flush() {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_read(req, resp);
             let _ = fh.send_highprio(ctx);
@@ -400,6 +407,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                                 Some(data) => {
                                     let end = s3_off + len;
                                     data_buf.copy_from_slice(&data[s3_off..end]);
+                                    staging.read_timing().add_inflight_read();
                                     true
                                 },
                                 None => false,
@@ -1070,8 +1078,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         };
         req.offset = off;
 
-        // we need to stop world if flush is processing
-        if self.state.is_flushing() {
+        // Stop the world while a flush runs, unless WAL makes that
+        // unnecessary. See `must_wait_for_flush`.
+        if self.must_wait_for_flush() {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write(req, resp);
             let _ = fh.send_highprio(ctx);
@@ -1135,8 +1144,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         };
         req.offset = off;
 
-        // we need to stop world if flush is processing
-        if self.state.is_flushing() {
+        // Stop the world while a flush runs, unless WAL makes that
+        // unnecessary. See `must_wait_for_flush`.
+        if self.must_wait_for_flush() {
             let fh = req.fh.clone();
             let ctx = FileContext::reform_write_zero(req, resp);
             let _ = fh.send_highprio(ctx);

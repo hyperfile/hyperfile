@@ -715,18 +715,19 @@ async fn reactor_wal_read_block_in_segment_still_uploading() {
     writer.await.expect("writer");
     let reads = reader.await.expect("reader");
 
-    // The count is the regression detector for the fast path itself.
-    // Reads that wait for the flush instead of reading the pinned segment
-    // spend the whole window being put back on the queue and retried: the
-    // same workload managed 168 reads that way, against roughly 8000
-    // reading straight from memory. Correctness alone would not notice
-    // the difference, so assert the throughput too, with enough margin
-    // not to be flaky.
-    assert!(reads > 1000,
-        "only {} reads completed across {} flushes — reads look like they are \
-         waiting for the flush rather than reading the in-flight segment",
+    // Correctness alone cannot tell a read served from the pinned segment
+    // from one that waited for the flush and then read staging, so assert
+    // on the counter that distinguishes them. Throughput would not do:
+    // writes also overlap a flush now, and their contention brings the
+    // read count down to roughly what deferring produced.
+    let timing = fh.fh_read_timing().await.expect("read timing");
+    assert!(timing.inflight_reads > 0,
+        "no read was served from a segment still being written out, so the \
+         WAL read path did not run: {} reads completed across {} flushes",
         reads, ROUNDS - 1);
-    eprintln!("verified {} concurrent reads across {} flushes", reads, ROUNDS - 1);
+    eprintln!("verified {} concurrent reads across {} flushes, {} of them served \
+        from a segment still being written out",
+        reads, ROUNDS - 1, timing.inflight_reads);
 
     let mut fh = fh;
     let _ = fh.fh_release().await.expect("release");

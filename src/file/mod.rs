@@ -139,6 +139,12 @@ pub struct ReadTiming {
     /// wall time can be attributed to the object store rather than
     /// inferred.
     pub staging_ns: AtomicU64,
+    /// Block reads answered from a segment that is still being written
+    /// out, which only happens with `wal`. These cost no object request
+    /// and no wait for the flush, which is the point of doing them —
+    /// counting them separately is the only way to tell that the WAL read
+    /// path is working rather than merely correct.
+    pub inflight_reads: AtomicU64,
 }
 
 /// Snapshot of [`ReadTiming`] values at a single point in time.
@@ -151,6 +157,7 @@ pub struct ReadTimingSnapshot {
     pub inode_gets: u64,
     pub cache_hits: u64,
     pub staging_ns: u64,
+    pub inflight_reads: u64,
 }
 
 impl ReadTimingSnapshot {
@@ -176,6 +183,7 @@ impl ReadTiming {
             inode_gets: self.inode_gets.load(Ordering::Relaxed),
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             staging_ns: self.staging_ns.load(Ordering::Relaxed),
+            inflight_reads: self.inflight_reads.load(Ordering::Relaxed),
         }
     }
 
@@ -187,6 +195,7 @@ impl ReadTiming {
         self.inode_gets.store(0, Ordering::Relaxed);
         self.cache_hits.store(0, Ordering::Relaxed);
         self.staging_ns.store(0, Ordering::Relaxed);
+        self.inflight_reads.store(0, Ordering::Relaxed);
     }
 
     #[inline]
@@ -212,6 +221,12 @@ impl ReadTiming {
     #[inline]
     pub(crate) fn add_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "wal")]
+    #[inline]
+    pub(crate) fn add_inflight_read(&self) {
+        self.inflight_reads.fetch_add(1, Ordering::Relaxed);
     }
 }
 

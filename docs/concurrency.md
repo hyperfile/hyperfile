@@ -132,10 +132,35 @@ That is not a failure either: the same bytes are on staging at the same
 offset, so the read falls back to reading them from there. Both outcomes
 occur in a single run of the test that covers this.
 
-Note that this applies to reads only. Writes still wait for a flush even
-under WAL, although the machinery to serve them from a pinned segment
-exists on the write path too.
+Writes overlap a flush as well, for the same reason. A write's two halves
+can straddle one, because the WAL write hands the handler task back in
+between, so `absorb_write_bh` fetches again anything the flush took rather
+than applying the write over a block rebuilt from nothing.
 
+What this costs a concurrent reader depends on what the writer holds while
+it overlaps, and that differs by feature:
+
+| | reader on the writer's blocks | reader on other blocks |
+|---|---|---|
+| `wal` | much slower | **much slower** |
+| `wal` + `range-lock` | much slower | **unaffected** |
+
+Without `range-lock` the per-file semaphore has a single permit for the
+*whole file*, and a write holds it across its WAL PUT. Block disjointness
+cannot help, because the permit is not per-block: in one measurement a
+reader on unrelated blocks dropped from 720 reads to 152 once writes
+stopped waiting for the flush.
+
+With `range-lock` the permit is unbounded and a range is what excludes, so
+a reader on other blocks is unaffected — 848 reads before, 712 after, which
+is inside the run-to-run spread. A reader on the blocks being written still
+pays, since it genuinely conflicts.
+
+So a workload that both writes and reads heavily through one handle wants
+`range-lock`, and wants its readers and writers not to chase the same
+blocks. The numbers above come from a deliberately harsh shape — a writer
+looping on eight blocks with the data cache off — and are worth taking as
+the direction of the effect rather than its magnitude.
 ### Why two modes, why two strategies
 
 The direct API is the simplest integration point: call a method, await,
