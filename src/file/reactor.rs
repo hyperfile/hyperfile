@@ -26,7 +26,11 @@ pub(crate) enum AfterRetrieve {
 
 pub(crate) enum ImmOrJoinSize {
     ImmSize(usize),
-    JoinSize(JoinHandle<usize>),
+    /// A spawned load. `Err` means the block was not filled, which the
+    /// caller has to treat as a failed write rather than absorb: the
+    /// buffer is a fresh block, so absorbing it would replace the block's
+    /// contents with zeroes and persist that.
+    JoinSize(JoinHandle<Result<usize>>),
 }
 
 impl<'a, T, L, C> HyperFile<'a, T, L, C>
@@ -67,11 +71,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                             None => false,
                         }
                     };
+                    let len = data_buf.len();
                     if !copied {
                         debug!("write retrieve - segid {} no longer held in memory, reading it from staging", segid);
-                        let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
+                        staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await?;
                     }
-                    data_buf.len()
+                    Ok(len)
                 });
                 return Ok(ImmOrJoinSize::JoinSize(join));
             }
@@ -84,8 +89,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
             };
             let join = self.rt.as_ref().unwrap().spawn(async move {
-                let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
-                data_buf.len()
+                let len = data_buf.len();
+                staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await?;
+                Ok(len)
             });
             return Ok(ImmOrJoinSize::JoinSize(join));
         } else if BlockPtrFormat::is_dummy_value(&blk_ptr) {
@@ -525,6 +531,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     // WalFlush is another story, it's internal process
 
     pub(crate) async fn absorb_write(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
+        // A block this write needs could not be read. Applying the write
+        // now would put its bytes into a block that was never filled and
+        // mark it dirty, so the next flush would persist zeroes over
+        // whatever the block held. Fail the write instead: the arm
+        // releases the range lock and answers the caller, and dropping the
+        // request returns the permit.
+        if let Some(e) = req.fetch_err.take() {
+            return Err(e);
+        }
+
         // Carry the fetched blocks on in the request rather than putting
         // them in the cache here.
         //
@@ -559,6 +575,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub(crate) async fn absorb_write_bh(&mut self, mut req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
+        // A block this write needs could not be read. Applying the write
+        // now would put its bytes into a block that was never filled and
+        // mark it dirty, so the next flush would persist zeroes over
+        // whatever the block held. Fail the write instead: the arm
+        // releases the range lock and answers the caller, and dropping the
+        // request returns the permit.
+        if let Some(e) = req.fetch_err.take() {
+            return Err(e);
+        }
+
         let off = req.offset;
         let len = req.buf.len();
         let buf = req.buf;
@@ -689,6 +715,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub(crate) async fn absorb_write_zero(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
+        // A block this write needs could not be read. Applying the write
+        // now would put its bytes into a block that was never filled and
+        // mark it dirty, so the next flush would persist zeroes over
+        // whatever the block held. Fail the write instead: the arm
+        // releases the range lock and answers the caller, and dropping the
+        // request returns the permit.
+        if let Some(e) = req.fetch_err.take() {
+            return Err(e);
+        }
+
         // Carry the fetched blocks on in the request rather than putting
         // them in the cache here.
         //
@@ -723,6 +759,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub(crate) async fn absorb_write_zero_bh(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
+        // A block this write needs could not be read. Applying the write
+        // now would put its bytes into a block that was never filled and
+        // mark it dirty, so the next flush would persist zeroes over
+        // whatever the block held. Fail the write instead: the arm
+        // releases the range lock and answers the caller, and dropping the
+        // request returns the permit.
+        if let Some(e) = req.fetch_err.take() {
+            return Err(e);
+        }
+
         let off = req.offset;
         let len = req.len;
         let mut bytes_write = 0;
@@ -893,16 +939,27 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
 
         self.rt.as_ref().unwrap().spawn(async move {
-            let mut actual_bytes = 0;
-            while let Some(o) = joins.pop() {
-                let bytes = match o {
-                    ImmOrJoinSize::ImmSize(size) => size,
-                    ImmOrJoinSize::JoinSize(j) => j.await.unwrap(),
+            // A load that failed leaves its block a fresh, zeroed one.
+            // Absorbing that would replace the block's real contents with
+            // zeroes and persist them, so record the failure and let the
+            // absorb fail the write instead. Keep going through the rest
+            // of the joins either way, so nothing is left dangling.
+            for o in joins.drain(..) {
+                let res = match o {
+                    ImmOrJoinSize::ImmSize(size) => Ok(size),
+                    ImmOrJoinSize::JoinSize(j) => match j.await {
+                        Ok(res) => res,
+                        Err(e) => Err(Error::other(format!("write retrieve task failed: {}", e))),
+                    },
                 };
-                actual_bytes += bytes;
+                if let Err(e) = res {
+                    warn!("write retrieve failed: {:?}", e);
+                    if req.fetch_err.is_none() {
+                        req.fetch_err = Some(e);
+                    }
+                }
             }
             req.fetched.append(&mut fetched);
-            let _ = actual_bytes;
             let fh = req.fh.clone();
             let ctx = match after {
                 AfterRetrieve::Absorb => FileContext::write_absorb(req, resp),
@@ -1026,16 +1083,27 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
 
         self.rt.as_ref().unwrap().spawn(async move {
-            let mut actual_bytes = 0;
-            while let Some(o) = joins.pop() {
-                let bytes = match o {
-                    ImmOrJoinSize::ImmSize(size) => size,
-                    ImmOrJoinSize::JoinSize(j) => j.await.unwrap(),
+            // A load that failed leaves its block a fresh, zeroed one.
+            // Absorbing that would replace the block's real contents with
+            // zeroes and persist them, so record the failure and let the
+            // absorb fail the write instead. Keep going through the rest
+            // of the joins either way, so nothing is left dangling.
+            for o in joins.drain(..) {
+                let res = match o {
+                    ImmOrJoinSize::ImmSize(size) => Ok(size),
+                    ImmOrJoinSize::JoinSize(j) => match j.await {
+                        Ok(res) => res,
+                        Err(e) => Err(Error::other(format!("write retrieve task failed: {}", e))),
+                    },
                 };
-                actual_bytes += bytes;
+                if let Err(e) = res {
+                    warn!("write retrieve failed: {:?}", e);
+                    if req.fetch_err.is_none() {
+                        req.fetch_err = Some(e);
+                    }
+                }
             }
             req.fetched.append(&mut fetched);
-            let _ = actual_bytes;
             let fh = req.fh.clone();
             let ctx = match after {
                 AfterRetrieve::Absorb => FileContext::write_zero_absorb(req, resp),

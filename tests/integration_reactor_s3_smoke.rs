@@ -637,3 +637,96 @@ async fn reactor_read_reports_a_failed_staging_load() {
 
     tf.cleanup(&client).await;
 }
+
+/// A write whose read-modify-write cannot read the block must fail, not
+/// apply itself over a block that was never filled.
+///
+/// A partial write needs the block's current contents before it can put
+/// its own bytes in. That fetch is a spawned staging read, and its result
+/// used to be discarded: the task reported the full byte count whatever
+/// happened, so a failed read left the block as the freshly allocated,
+/// zeroed buffer it started as. The write then applied its bytes to that,
+/// marked it dirty and reported success, and the next flush persisted
+/// zeroes over everything the block used to hold. Silent, and permanent —
+/// worse than the read-side version of the same mistake, which only gave
+/// one caller a wrong answer.
+///
+/// Deleting the segment object stands in for any failure of that read.
+/// The write must report it, and the handle must remain usable
+/// afterwards: the failing request holds the per-file permit and, under
+/// `range-lock`, a range, and neither is released by the path that
+/// completes a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_write_reports_a_failed_read_modify_write() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const BLK: usize = 4096;
+    const PAT: u8 = 0x7E;
+
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_blocks = 0;
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    {
+        let hyper = Hyper::create(client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file())).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+        fh.fh_write(0, &vec![PAT; 4 * BLK]).await.expect("seed write");
+        fh.fh_flush().await.expect("seed flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    // Break the staging read the retrieve will need.
+    let bucket = test_bucket();
+    let prefix = tf.uri().trim_start_matches("s3://")
+        .trim_start_matches(&bucket).trim_start_matches('/').to_string() + "/";
+    let listed = client.list_objects_v2().bucket(&bucket).prefix(&prefix).send().await.expect("list");
+    let mut deleted = 0;
+    for obj in listed.contents() {
+        let key = obj.key().unwrap_or_default();
+        let name = key.rsplit('/').next().unwrap_or_default();
+        if name.len() == 10 && name.chars().all(|c| c.is_ascii_digit()) {
+            client.delete_object().bucket(&bucket).key(key).send().await.expect("delete segment");
+            deleted += 1;
+        }
+    }
+    assert!(deleted > 0, "no segment object found under {}", prefix);
+
+    let hyper = Hyper::open(client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr())).await.expect("open");
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+
+    // 64 bytes inside block 0, so the block has to be read first.
+    match fh.fh_write(1000, &vec![0xC7u8; 64]).await {
+        Err(e) => eprintln!("partial write failed as it should: {}", e),
+        Ok(n) => panic!(
+            "partial write reported {} bytes written although the block could not \
+             be read; the block was rebuilt from zeroes and would be persisted", n),
+    }
+
+    // The handle has to still work, which it will not if the failing write
+    // kept the permit or its range. A whole-block write needs no retrieve,
+    // so this is about the locks rather than about staging.
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fh.fh_write(0, &vec![0x33u8; BLK]),
+    ).await;
+    match res {
+        Err(_) => panic!("a whole-block write hung after the failed one, so the \
+                          failed write did not give back the permit or its range"),
+        Ok(r) => { r.expect("whole-block write after a failed one"); },
+    }
+
+    let _ = fh.fh_flush().await.expect("flush");
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}

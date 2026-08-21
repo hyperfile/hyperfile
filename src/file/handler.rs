@@ -364,6 +364,11 @@ pub struct FileReqWrite<'a> {
     pub buf: &'a [u8],
     pub offset: usize,
     pub fetched: Vec<DataBlock>,
+    /// Set when a block this write needed could not be read. The absorb
+    /// fails the write rather than applying it over a block that was
+    /// never filled, which would replace its contents with zeroes and
+    /// persist that at the next flush.
+    pub fetch_err: Option<Error>,
     pub spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
     pub fh: ChannelGroup<FileContext<'a>>,
     /// Keeps `buf`'s referent alive when the caller does not.
@@ -382,6 +387,8 @@ pub struct FileReqWriteZero<'a> {
     pub offset: usize,
     pub len: usize,
     pub fetched: Vec<DataBlock>,
+    /// See `FileReqWrite::fetch_err`.
+    pub fetch_err: Option<Error>,
     pub spawn_write_permit: Option<OwnedSemaphorePermit>, // hold owned permit for spawn_write
     pub fh: ChannelGroup<FileContext<'a>>,
 }
@@ -651,7 +658,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWrite>(1);
         let req = FileReq {
             op: FileReqOp::Write,
-            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, spawn_write_permit: None, fh: fh, fetched: Vec::new(), owned: None, }), },
+            body: FileReqBody { write: ManuallyDrop::new(FileReqWrite { buf: buf, offset: offset, spawn_write_permit: None, fh: fh, fetched: Vec::new(), fetch_err: None, owned: None, }), },
         };
         let resp = FileResp::Write(tx.clone());
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
@@ -688,7 +695,7 @@ impl<'a> FileContext<'a> {
         let (tx, rx) = mpsc::channel::<FileRespWriteZero>(1);
         let req = FileReq {
             op: FileReqOp::WriteZero,
-            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, spawn_write_permit: None, fh: fh, fetched: Vec::new(), }), },
+            body: FileReqBody { write_zero: ManuallyDrop::new(FileReqWriteZero { offset: offset, len: len, spawn_write_permit: None, fh: fh, fetched: Vec::new(), fetch_err: None, }), },
         };
         let resp = FileResp::WriteZero(tx.clone());
         (Self { req: Some(req), resp: Some(resp), }, tx, rx)
@@ -768,7 +775,7 @@ impl<'a> FileContext<'a> {
             op: FileReqOp::Write,
             body: FileReqBody { write: ManuallyDrop::new(FileReqWrite {
                 buf: slice, offset, spawn_write_permit: None, fh,
-                fetched: Vec::new(), owned: Some(buf),
+                fetched: Vec::new(), fetch_err: None, owned: Some(buf),
             }), },
         };
         let resp = FileResp::Write(tx.clone());
@@ -1138,6 +1145,8 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::WriteAbsorbBh => {
                 let md = unsafe { req.body.write };
                 let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                let range = req.offset as u64..(req.offset + req.buf.len()) as u64;
                 let _resp_write = resp.to_write();
                 let resp_write = _resp_write.clone();
                 let resp = FileResp::Write(_resp_write);
@@ -1148,7 +1157,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     // stay with the request, which is why nothing is
                     // released here.
                     Err(ref e) if e.kind() == ErrorKind::ResourceBusy => {},
-                    _ => { let _ = resp_write.try_send(res); },
+                    // A real failure ends the write here, so the range it
+                    // held has to be given back. The success path releases
+                    // it inside `absorb_write_bh`.
+                    Err(_) => {
+                        #[cfg(feature = "range-lock")]
+                        self.inner.range_lock.try_unlock(range);
+                        let _ = resp_write.try_send(res);
+                    },
+                    Ok(_) => { let _ = resp_write.try_send(res); },
                 }
             },
             FileReqOp::WriteZero => {
@@ -1223,6 +1240,8 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
             FileReqOp::WriteZeroAbsorbBh => {
                 let md = unsafe { req.body.write_zero };
                 let req = ManuallyDrop::into_inner(md);
+                #[cfg(feature = "range-lock")]
+                let range = req.offset as u64..(req.offset + req.len) as u64;
                 let _resp_write = resp.to_write_zero();
                 let resp_write = _resp_write.clone();
                 let resp = FileResp::WriteZero(_resp_write);
@@ -1230,7 +1249,12 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 match res {
                     // See the WriteAbsorbBh arm: handed on for a refetch.
                     Err(ref e) if e.kind() == ErrorKind::ResourceBusy => {},
-                    _ => { let _ = resp_write.try_send(res); },
+                    Err(_) => {
+                        #[cfg(feature = "range-lock")]
+                        self.inner.range_lock.try_unlock(range);
+                        let _ = resp_write.try_send(res);
+                    },
+                    Ok(_) => { let _ = resp_write.try_send(res); },
                 }
             },
             FileReqOp::WriteAlignedBatch => {
