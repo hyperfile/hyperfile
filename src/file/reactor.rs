@@ -36,17 +36,30 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
                 let flushing_segments = self.flushing_segments.clone();
+                let staging = self.staging.clone();
+                let data_block_size = self.config.meta.data_block_size;
                 let join = self.rt.as_ref().unwrap().spawn(async move {
-                    let lock = flushing_segments.read().await;
-                    let Some(weak_data) = lock.get(&segid) else {
-                        panic!("unable to find segid: {segid} from inflight flushing segments");
+                    // As on the read path: the flush can land between the
+                    // decision to read this from memory and getting here,
+                    // taking the entry and the pinned buffer with it. The
+                    // same bytes are on staging by then, so read them from
+                    // there rather than treating a finished flush as a bug.
+                    let copied = {
+                        let lock = flushing_segments.read().await;
+                        match lock.get(&segid).and_then(|weak_data| weak_data.upgrade()) {
+                            Some(data) => {
+                                let start_off = staging_off + offset;
+                                let end = start_off + data_buf.len();
+                                data_buf.copy_from_slice(&data[start_off..end]);
+                                true
+                            },
+                            None => false,
+                        }
                     };
-                    let Some(data) = weak_data.upgrade() else {
-                        panic!("failed to get back shared data ref of inflight flushing segid: {segid}");
-                    };
-                    let start_off = staging_off + offset;
-                    let end = start_off + data_buf.len();
-                    data_buf.copy_from_slice(&data[start_off..end]);
+                    if !copied {
+                        debug!("write retrieve - segid {} no longer held in memory, reading it from staging", segid);
+                        let _ = staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await;
+                    }
                     data_buf.len()
                 });
                 return Ok(ImmOrJoinSize::JoinSize(join));
@@ -207,11 +220,17 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// `flushing_segments`, and the WAL makes the flush's completion a
     /// given: a failure is recovered by replaying the WAL, not by
     /// unwinding what the flush already published. So the bmap can point
-    /// at the new segment before it reaches staging, and a read of those
-    /// blocks can be served from the pinned buffer as though it were
-    /// already there — that is what the planner's `Inmem` op is for.
-    /// Waiting would give up the point of writing the WAL first, which is
-    /// that a flush stops blocking the front end.
+    /// at the new segment before it reaches staging, and blocks in it can
+    /// be served from the pinned buffer as though it were already there —
+    /// that is what the planner's `Inmem` op is for. Waiting would give up
+    /// the point of writing the WAL first, which is that a flush stops
+    /// blocking the front end.
+    ///
+    /// Writes deliberately still wait. A WAL write is a multi-hop
+    /// pipeline, and a flush interleaving between the hop that fetches a
+    /// block and the hop that modifies it takes that block away, leaving
+    /// the write to rebuild it from nothing. Letting writes overlap a
+    /// flush needs that fixed first.
     fn read_must_wait_for_flush(&self) -> bool {
         if !self.state.is_flushing() {
             return false;
@@ -486,32 +505,27 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     // for wal* task, it is always in the middle of process, so only handle Err(e) is enough
     // WalFlush is another story, it's internal process
 
-    pub(crate) async fn absorb_write(&mut self, req: FileReqWrite<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
-        // insert fetched block back to dirty list,
-        // for the case: block idx exists on dirty
-        // means some other writes success before this write, let's ignore feched data and go ahead
-        // to update the block data
-        for block in fetched.into_iter() {
-            let blk_idx = block.index();
-            // Another write, or a read populating the cache, landed on
-            // this block while we were fetching it. The resident copy is
-            // newer than what we just read out of staging, so drop the
-            // fetch: installing it would lose that write. `update_cache`
-            // below then edits the resident block, promoting it out of
-            // the clean tier if that is where it sits.
-            //
-            // Skipping is only safe because the block is resident. With
-            // nothing resident, `update_cache` would fabricate a
-            // zero-filled block, and the bytes this write does not cover
-            // would read back as zeroes instead of the staged data.
-            if self.cache.has(&blk_idx) {
-                debug!("absorb - block index {} already resident, dropping the fetched copy", blk_idx);
-                continue;
-            }
-            let None = self.cache.insert(blk_idx, block) else {
-                panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
-            };
-        }
+    pub(crate) async fn absorb_write(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
+        // Carry the fetched blocks on in the request rather than putting
+        // them in the cache here.
+        //
+        // Under WAL this arm ends by requeueing for the WAL write, which
+        // hands the handler task back, and a flush running in that gap
+        // would take a block that is in the dirty list but has not been
+        // modified yet — `clear_data_blocks_dirty` sweeps it into the
+        // segment, or drops it outright when the data cache is off. The
+        // write would then reach `update_cache` with nothing resident and
+        // rebuild the block from zeroes, keeping only the bytes it covers
+        // and losing the rest.
+        //
+        // Installing them in `absorb_write_bh` instead, immediately before
+        // the data is applied and in the same arm, leaves no such gap. A
+        // block that is not in the cache is not a block a flush can take,
+        // and a read that wants it in the meantime still finds the
+        // pre-write contents through the bmap, which is what it should
+        // see while this write is unfinished.
+        let mut fetched = fetched;
+        req.fetched.append(&mut fetched);
 
         #[cfg(feature = "wal")]
         if let Some(_) = &mut self.wal {
@@ -531,11 +545,63 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let buf = req.buf;
         let mut bytes_write = 0;
 
+        // A partial write needs its block's current contents to modify.
+        // Anything this write fetched is still in hand, but a block that
+        // was in the dirty list when the write started had nothing
+        // fetched for it, and a flush arriving between then and now takes
+        // it into a segment. Fetch those again rather than applying the
+        // write over a block rebuilt from nothing. Checked before the
+        // permit is taken so the requeued request keeps holding it.
+        let data_block_size = self.config.meta.data_block_size;
+        let mut refetch = Vec::new();
+        for (blk_idx, blk_off, blk_len) in BlockIndexIter::new(off, len, data_block_size) {
+            if blk_off == 0 && blk_len == data_block_size {
+                // Fully overwritten, so its previous contents do not matter.
+                continue;
+            }
+            if self.cache.has(&blk_idx) || req.fetched.iter().any(|b| b.index() == blk_idx) {
+                continue;
+            }
+            refetch.push(blk_idx);
+        }
+        if !refetch.is_empty() {
+            debug!("absorb_write_bh - {} block(s) went away under a flush, fetching again", refetch.len());
+            self.spawn_write_refetch(req, resp, refetch).await?;
+            return Err(Error::new(ErrorKind::ResourceBusy, "refetch blocks taken by a flush"));
+        }
+
         // restore spawn_write permit
         let opt_permit = req.spawn_write_permit.take();
         assert!(opt_permit.is_some());
 
-        let data_block_size = self.config.meta.data_block_size;
+        // Install the blocks fetched for this write, now that the data is
+        // about to be applied in this same arm. Doing it here rather than
+        // when they were fetched means a flush cannot sweep an unmodified
+        // block into a segment, or drop it, in between.
+        let mut fetched = Vec::new();
+        fetched.append(&mut req.fetched);
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
+            // Another write, or a read populating the cache, landed on
+            // this block while we were fetching it. The resident copy is
+            // newer than what we just read out of staging, so drop the
+            // fetch: installing it would lose that write. `update_cache`
+            // below then edits the resident block, promoting it out of the
+            // clean tier if that is where it sits.
+            //
+            // Skipping is only safe because the block is resident. With
+            // nothing resident, `update_cache` would fabricate a
+            // zero-filled block, and the bytes this write does not cover
+            // would read back as zeroes instead of the staged data.
+            if self.cache.has(&blk_idx) {
+                debug!("absorb - block index {} already resident, dropping the fetched copy", blk_idx);
+                continue;
+            }
+            let None = self.cache.insert(blk_idx, block) else {
+                panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+            };
+        }
+
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         let mut next_slice = buf;
         for (blk_idx, off, len) in blk_iter {
@@ -596,32 +662,27 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(bytes_write)
     }
 
-    pub(crate) async fn absorb_write_zero(&mut self, req: FileReqWriteZero<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
-        // insert fetched block back to dirty list,
-        // for the case: block idx exists on dirty
-        // means some other writes success before this write, let's ignore feched data and go ahead
-        // to update the block data
-        for block in fetched.into_iter() {
-            let blk_idx = block.index();
-            // Another write, or a read populating the cache, landed on
-            // this block while we were fetching it. The resident copy is
-            // newer than what we just read out of staging, so drop the
-            // fetch: installing it would lose that write. `update_cache`
-            // below then edits the resident block, promoting it out of
-            // the clean tier if that is where it sits.
-            //
-            // Skipping is only safe because the block is resident. With
-            // nothing resident, `update_cache` would fabricate a
-            // zero-filled block, and the bytes this write does not cover
-            // would read back as zeroes instead of the staged data.
-            if self.cache.has(&blk_idx) {
-                debug!("absorb - block index {} already resident, dropping the fetched copy", blk_idx);
-                continue;
-            }
-            let None = self.cache.insert(blk_idx, block) else {
-                panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
-            };
-        }
+    pub(crate) async fn absorb_write_zero(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, fetched: Vec<DataBlock>) -> Result<usize> {
+        // Carry the fetched blocks on in the request rather than putting
+        // them in the cache here.
+        //
+        // Under WAL this arm ends by requeueing for the WAL write, which
+        // hands the handler task back, and a flush running in that gap
+        // would take a block that is in the dirty list but has not been
+        // modified yet — `clear_data_blocks_dirty` sweeps it into the
+        // segment, or drops it outright when the data cache is off. The
+        // write would then reach `update_cache` with nothing resident and
+        // rebuild the block from zeroes, keeping only the bytes it covers
+        // and losing the rest.
+        //
+        // Installing them in `absorb_write_bh` instead, immediately before
+        // the data is applied and in the same arm, leaves no such gap. A
+        // block that is not in the cache is not a block a flush can take,
+        // and a read that wants it in the meantime still finds the
+        // pre-write contents through the bmap, which is what it should
+        // see while this write is unfinished.
+        let mut fetched = fetched;
+        req.fetched.append(&mut fetched);
 
         #[cfg(feature = "wal")]
         if let Some(_) = &mut self.wal {
@@ -640,16 +701,56 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let len = req.len;
         let mut bytes_write = 0;
 
+        // See `absorb_write_bh`: a partial zero keeps the bytes it does not
+        // cover, so it needs the block, and a flush may have taken it
+        // since this request last ran. Checked before the permit is taken
+        // so the requeued request keeps holding it.
+        let data_block_size = self.config.meta.data_block_size;
+        let oldsize = self.inode.size();
+        let mut refetch = Vec::new();
+        for (blk_idx, start_off, data_len) in BlockIndexIter::new(off, len, data_block_size) {
+            if start_off == 0 && data_len == data_block_size {
+                continue;
+            }
+            if start_off == 0 && (blk_idx as usize * data_block_size) + start_off + data_len > oldsize {
+                // Becomes a hole outright, so its previous contents do not matter.
+                continue;
+            }
+            if self.cache.has(&blk_idx) || req.fetched.iter().any(|b| b.index() == blk_idx) {
+                continue;
+            }
+            refetch.push(blk_idx);
+        }
+        if !refetch.is_empty() {
+            debug!("absorb_write_zero_bh - {} block(s) went away under a flush, fetching again", refetch.len());
+            self.spawn_write_zero_refetch(req, resp, refetch).await?;
+            return Err(Error::new(ErrorKind::ResourceBusy, "refetch blocks taken by a flush"));
+        }
+
         // restore spawn_write permit
         let opt_permit = req.spawn_write_permit.take();
         assert!(opt_permit.is_some());
+
+        // Install the blocks fetched for this write, now that the data is
+        // about to be applied in this same arm. See `absorb_write_bh` for
+        // why this cannot happen at fetch time.
+        let mut fetched = Vec::new();
+        fetched.append(&mut req.fetched);
+        for block in fetched.into_iter() {
+            let blk_idx = block.index();
+            if self.cache.has(&blk_idx) {
+                debug!("absorb - block index {} already resident, dropping the fetched copy", blk_idx);
+                continue;
+            }
+            let None = self.cache.insert(blk_idx, block) else {
+                panic!("BlockIndex {} already on data_blocks_dirty list", blk_idx);
+            };
+        }
 
         // NOTE:
         // since we have update the dirty blocks cache,
         // if we failed in bmap operations, we have not way to rollback, so let's panic here
 
-        let data_block_size = self.config.meta.data_block_size;
-        let oldsize = self.inode.size();
         let blk_iter = BlockIndexIter::new(off, len, data_block_size);
         let mut new_blocks: usize = 0;
         for (blk_idx, start_off, data_len) in blk_iter {
@@ -766,6 +867,115 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let _ = actual_bytes;
             let fh = req.fh.clone();
             let ctx = FileContext::write_absorb(req, resp);
+            let _ = fh.send_cb(ctx);
+        });
+
+        Ok(())
+    }
+
+    /// Fetch blocks again for a write that has already been through the
+    /// WAL, and hand it straight back to `absorb_write_bh`.
+    ///
+    /// Needed because a WAL write's two halves can straddle a flush. Its
+    /// first half decides which blocks to fetch; a block already in the
+    /// dirty list needs none, so nothing is fetched for it. The WAL write
+    /// then hands the handler task back, a flush takes that block into a
+    /// segment, and the second half arrives to find it gone. Applying the
+    /// write at that point would rebuild the block from nothing and keep
+    /// only the bytes this write covers, losing the rest.
+    ///
+    /// The block is on staging, or in the segment still being uploaded, by
+    /// the time we get here, so fetching it again reads exactly what the
+    /// flush persisted. Unlike `spawn_write_retrieve` this returns to
+    /// `write_absorb_bh`: the WAL write has already happened and must not
+    /// be repeated.
+    async fn spawn_write_refetch(&mut self, mut req: FileReqWrite<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
+        let mut joins = Vec::new();
+        let mut fetched = Vec::new();
+        for blk_idx in list {
+            match self.bmap.lookup(&blk_idx).await {
+                Ok(blk_ptr) => {
+                    let block = self.cache.new_block(blk_idx);
+                    block.set_should_cache();
+                    if BlockPtrFormat::is_zero_block(&blk_ptr) {
+                        // A hole reads as zeroes, which a new block already is.
+                        fetched.push(block);
+                        continue;
+                    }
+                    let buf = block.as_mut_slice();
+                    let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
+                    joins.push(join);
+                    fetched.push(block);
+                },
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                    let block = self.cache.new_block(blk_idx);
+                    block.set_should_cache();
+                    fetched.push(block);
+                },
+            }
+        }
+
+        self.rt.as_ref().unwrap().spawn(async move {
+            while let Some(o) = joins.pop() {
+                match o {
+                    ImmOrJoinSize::ImmSize(_) => {},
+                    ImmOrJoinSize::JoinSize(j) => { let _ = j.await; },
+                }
+            }
+            req.fetched.append(&mut fetched);
+            let fh = req.fh.clone();
+            let ctx = FileContext::write_absorb_bh(req, resp);
+            let _ = fh.send_cb(ctx);
+        });
+
+        Ok(())
+    }
+
+    /// `spawn_write_refetch` for a zeroing write. Same reason: a partial
+    /// zero has to keep the bytes it does not cover, so it needs the
+    /// block's current contents, and a flush may have taken them since
+    /// this request last ran.
+    async fn spawn_write_zero_refetch(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp, list: Vec<BlockIndex>) -> Result<()> {
+        let mut joins = Vec::new();
+        let mut fetched = Vec::new();
+        for blk_idx in list {
+            match self.bmap.lookup(&blk_idx).await {
+                Ok(blk_ptr) => {
+                    let block = self.cache.new_block(blk_idx);
+                    block.set_should_cache();
+                    if BlockPtrFormat::is_zero_block(&blk_ptr) {
+                        fetched.push(block);
+                        continue;
+                    }
+                    let buf = block.as_mut_slice();
+                    let join = self.spawn_load_data_block_write_path(blk_idx, blk_ptr, 0, buf)?;
+                    joins.push(join);
+                    fetched.push(block);
+                },
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                    let block = self.cache.new_block(blk_idx);
+                    block.set_should_cache();
+                    fetched.push(block);
+                },
+            }
+        }
+
+        self.rt.as_ref().unwrap().spawn(async move {
+            while let Some(o) = joins.pop() {
+                match o {
+                    ImmOrJoinSize::ImmSize(_) => {},
+                    ImmOrJoinSize::JoinSize(j) => { let _ = j.await; },
+                }
+            }
+            req.fetched.append(&mut fetched);
+            let fh = req.fh.clone();
+            let ctx = FileContext::write_zero_absorb_bh(req, resp);
             let _ = fh.send_cb(ctx);
         });
 

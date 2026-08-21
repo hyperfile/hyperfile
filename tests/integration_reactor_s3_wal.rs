@@ -732,3 +732,105 @@ async fn reactor_wal_read_block_in_segment_still_uploading() {
     let _ = fh.fh_release().await.expect("release");
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// An unaligned write landing while a flush is in flight has to
+/// read-modify-write a block that lives in the segment being uploaded.
+///
+/// The block is not in the cache, and the bmap points at a segment that is
+/// not on staging yet, so the retrieve copies it out of the pinned buffer
+/// and the write modifies that copy. Getting the copy wrong is invisible
+/// to the write itself and shows up only in the bytes the write did not
+/// cover, which is what this checks.
+///
+/// It also covers the gap that made this unsafe: a WAL write is a
+/// multi-hop pipeline, and a flush interleaving between the hop that
+/// fetches a block and the hop that modifies it used to sweep that block
+/// away, leaving the write to rebuild it from zeroes. The marker survived
+/// and everything else in the block was lost.
+///
+/// Each round starts a flush without waiting for it, so the marker writes
+/// that follow are the first touch of a block that now lives only in the
+/// segment being uploaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn reactor_wal_write_during_flush_keeps_the_untouched_bytes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_uri = format!("{}/wal", tf.uri());
+    let wal_config = HyperFileWalConfig::new(&wal_uri);
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_blocks = 0;
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    const BLK: usize = 4096;
+    const NB: usize = 8;
+    const ROUNDS: u8 = 16;
+    const BASE: u8 = 0x50;
+    const MARK: u8 = 0xC7;
+    const MARK_OFF: usize = 1000;
+    const MARK_LEN: usize = 64;
+
+    let hyper = Hyper::create(
+        client.clone(),
+        config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+    ).await.expect("create hyper with wal");
+    let fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+
+    let mut markers = 0usize;
+    for round in 1..ROUNDS {
+        for b in 0..NB {
+            let mut w = fh.clone();
+            w.fh_write(b * BLK, &vec![BASE + round; BLK]).await.expect("bulk write");
+        }
+        let flush = {
+            let mut w = fh.clone();
+            tokio::spawn(async move { w.fh_flush().await })
+        };
+        for b in 0..NB {
+            let mut w = fh.clone();
+            w.fh_write(b * BLK + MARK_OFF, &vec![MARK; MARK_LEN]).await.expect("marker write");
+            markers += 1;
+        }
+        flush.await.expect("flush task").expect("flush");
+    }
+
+    let mut fh = fh;
+    fh.fh_flush().await.expect("final flush");
+    let _ = fh.fh_release().await.expect("release");
+    assert_eq!(markers, (ROUNDS as usize - 1) * NB, "every marker write should have completed");
+
+    let hyper = Hyper::open(client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdonly())).await.expect("reopen");
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn handler");
+    for b in 0..NB {
+        let got = fh.fh_read_owned(b * BLK, BLK).await.expect("read back");
+        assert_eq!(got.len(), BLK, "block {} short read", b);
+        let base = got[0];
+        assert!((BASE..BASE + ROUNDS).contains(&base),
+            "block {} starts with {:#x}, which no write produced — the block was \
+             rebuilt from nothing instead of from its previous contents", b, base);
+        for (i, &v) in got.iter().enumerate() {
+            let ok = if (MARK_OFF..MARK_OFF + MARK_LEN).contains(&i) {
+                v == MARK || v == base
+            } else {
+                v == base
+            };
+            assert!(ok,
+                "block {} byte {}: got {:#x} with base {:#x} — a write concurrent \
+                 with a flush lost the bytes it did not cover",
+                b, i, v, base);
+        }
+    }
+    let _ = fh.fh_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}

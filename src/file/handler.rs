@@ -1142,7 +1142,14 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let resp_write = _resp_write.clone();
                 let resp = FileResp::Write(_resp_write);
                 let res = self.inner.absorb_write_bh(req, resp).await;
-                let _ = resp_write.try_send(res);
+                match res {
+                    // Handed on to fetch blocks a flush took; the retry
+                    // answers the caller. The range lock and the permit
+                    // stay with the request, which is why nothing is
+                    // released here.
+                    Err(ref e) if e.kind() == ErrorKind::ResourceBusy => {},
+                    _ => { let _ = resp_write.try_send(res); },
+                }
             },
             FileReqOp::WriteZero => {
                 let md = unsafe { req.body.write_zero };
@@ -1220,7 +1227,11 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let resp_write = _resp_write.clone();
                 let resp = FileResp::WriteZero(_resp_write);
                 let res = self.inner.absorb_write_zero_bh(req, resp).await;
-                let _ = resp_write.try_send(res);
+                match res {
+                    // See the WriteAbsorbBh arm: handed on for a refetch.
+                    Err(ref e) if e.kind() == ErrorKind::ResourceBusy => {},
+                    _ => { let _ = resp_write.try_send(res); },
+                }
             },
             FileReqOp::WriteAlignedBatch => {
                 let md = unsafe { req.body.write_aligned_batch };
