@@ -9,6 +9,162 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.3] - 2026-08-21
+
+Read the first two entries before upgrading: both are silent data loss on
+the reactor surface, and one needs no optional feature.
+
+### Fixed
+
+- **A write concurrent with a flush zeroed the rest of its block, under
+  `wal`.** A 64-byte write into a 4 KiB block, issued while a flush ran in
+  another task, returned success and left those 64 bytes correct with the
+  other 4032 zero. The flush also returned success. Reproduces on 0.6.2,
+  so it has been there at least that long; without `wal` the same cases
+  are all correct.
+
+  A WAL write is a multi-hop pipeline and the handler task is free between
+  hops, so one write's two halves can straddle a flush. The first half
+  decides which blocks to fetch and the second applies the data, and
+  `update_cache` fabricates a zero-filled block when nothing is resident —
+  right for a write covering a whole block, silent loss for a partial one.
+  A block the write had fetched was sitting in the dirty list unmodified
+  and the flush swept it into its segment; a block that needed no fetch,
+  because it was already dirty, was swept the same way with nothing in
+  hand to replace it.
+
+  Fetched blocks now travel on in the request and are installed
+  immediately before the data is applied, in the same arm, where no flush
+  can interleave. A block taken anyway is recovered before the write is
+  applied — from the pinned segment with no object request where possible,
+  otherwise by going back for a staging read off the handler task.
+
+- **A write whose read-modify-write could not read the block reported
+  success and persisted zeroes.** Affects the default build; no feature
+  needed. A partial write needs the block's current contents, and that
+  spawned staging read had its result discarded, with the task reporting
+  the full byte count either way. A failed read left the block as the
+  zeroed buffer it was allocated as, the write applied its bytes to that
+  and marked it dirty, and the next flush persisted the result.
+
+  Demonstrated by deleting the segment object and writing 64 bytes into a
+  4 KiB block: `Ok(64)`, `Ok(())` from the flush, and the block reading
+  back with 1000 checked bytes zero. The spawned loads now carry a
+  `Result` and such a write fails instead. The direct API was never
+  affected — it propagates the error.
+
+- **One reactor handle used from several threads could stop answering,
+  permanently.** Reported from a FUSE filesystem reading through
+  `fh_read_owned` from spawned tasks while another thread wrote and
+  flushed; every thread parked, nothing outstanding on the caller's side,
+  two occurrences left running 13.5 and 19 minutes.
+
+  A writable handle without `range-lock` has a single per-file permit, and
+  a write carries it across a callback hop that only the handler task can
+  run. Anything that *waited* for that permit on the handler task
+  therefore waited on work only it could perform. `spawn_read`,
+  `block_mut`, `truncate` and the batch writes all did; each now takes the
+  permit without waiting and puts the request back on a miss. Verified by
+  reverting each in turn.
+
+- **Under `range-lock`, continuous readers could starve a flush
+  indefinitely.** The owning task sat in `fh_flush` and never returned;
+  six readers looping on one handle were enough. A flush waits for
+  in-flight ranges to drain, and reads hold ranges too, but nothing held
+  new ones back during the wait — so the range map was never observed
+  empty. A livelock rather than a deadlock, so it also burned CPU.
+
+  A deferring flush now sets a flush-pending flag and new operations defer
+  instead of taking a fresh range lock. Without it the case fails 3 runs
+  out of 3; with it, 5 out of 5, and the suite drops from ~50 s to ~19 s.
+
+- **A failed staging read was reported as a successful read.** The
+  reactor's spawned ranged GET discarded its result and reported the full
+  byte count, so an unreadable segment produced a successful read over a
+  buffer nothing had written into.
+
+- **The WAL read fast path never ran.** With `wal`, a flush pins its
+  segment in memory precisely so reads can be served from it, but the read
+  paths deferred on `state.is_flushing()` with no WAL exception — and for
+  a WAL flush that flag is set from the kick until the write-out
+  completes, which is also when the buffer is released. So no read was
+  ever planned against a pinned segment: a probe on the planner's
+  in-flight decision fired zero times across every WAL-enabled suite.
+
+  Worse than inert. A deferred read is requeued and retried, so reads spun
+  for the duration of every flush — 118,535 requeues to complete 168 reads
+  in one test. Reads now proceed, and the same test completes about 10,000
+  reads, all served without an object request.
+
+### Changed
+
+- **Writes may overlap a WAL flush too**, for the same reason reads may.
+  What this costs a concurrent reader depends on what a write holds while
+  it overlaps: without `range-lock` the per-file permit is a single permit
+  for the whole file and a write holds it across its WAL write, so a
+  reader on unrelated blocks still pays (720 reads to 152). With
+  `range-lock` the permit is unbounded and the range is what excludes, so
+  a reader elsewhere is unaffected (848 against 712, inside the spread)
+  while a reader on the blocks being written pays, as it should.
+
+  A workload that reads and writes heavily through one handle wants
+  `range-lock`, and wants its readers and writers not to chase the same
+  blocks.
+
+- A block a flush took out from under a write is recovered in place where
+  it can be — from the pinned segment, no object request and no extra
+  queue hop. 14 of 15 recoveries take that path in one test run; the
+  remaining case needs staging and keeps its object request off the
+  handler task.
+
+### Added
+
+- `ReadTimingSnapshot::inflight_reads` counts block reads answered from a
+  segment that is still being written out, which only happens with `wal`.
+  Throughput cannot distinguish that from a read that waited for the flush
+  and then read staging, so this is what a test can assert on.
+
+  Note this adds a field to a public struct that is not
+  `#[non_exhaustive]`. Code that constructs `ReadTimingSnapshot` with a
+  struct literal, or matches it exhaustively, needs updating; code that
+  reads it from `fh_read_timing` does not.
+
+### Documentation
+
+- New [docs/flush.md](docs/flush.md): what a flush does, why a non-WAL
+  flush stops the world and a WAL-protected one does not, what a write has
+  to do differently when its halves straddle one, the drain and its
+  admission control, and the measured cost to a concurrent reader. This
+  material was previously split between `concurrency.md` and `wal.md`;
+  both now keep a paragraph and a link rather than a copy.
+- `HyperFile::flushing_segments` documents the invariant the design rests
+  on: `wal_set_mem_segment` and `wal_flush_done` pair up, the latter
+  dropping the pinned buffer in the same arm as it advances
+  `last_ondisk_cno`.
+
+### Tests
+
+- New `integration_reactor_s3_contention`, five cases: the reported
+  deadlock shape, the same with `truncate`, several writers plus readers
+  with the resulting data checked block by block, every permit-taking
+  operation driven at once, and colliding unaligned writes checking the
+  bytes neither writer touched. Each carries a watchdog, because the
+  failures it covers are hangs rather than assertions. Run it under
+  `range-lock` as well as default features — the mechanisms differ — and
+  in debug, where one of the races only showed up.
+- `reactor_wal_read_block_in_segment_still_uploading` and
+  `reactor_wal_write_during_flush_keeps_the_untouched_bytes` cover reads
+  and writes against a segment still being written out.
+- `reactor_read_reports_a_failed_staging_load` and
+  `reactor_write_reports_a_failed_read_modify_write` cover the failure
+  cases, the latter also checking the handle still works afterwards, since
+  a failing request holds the permit and its range.
+
+### Internal
+
+- One write-retrieve function instead of two near-identical ones, told
+  where to send the request when its loads finish.
+
 ## [0.6.2] - 2026-08-21
 
 ### Fixed
