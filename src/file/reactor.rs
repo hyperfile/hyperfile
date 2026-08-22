@@ -291,8 +291,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
 
         // Same planning a read does: resident blocks are skipped, the rest
-        // coalesced.
-        let plan = self.plan_read(start, span).await?;
+        // coalesced. Hits are not counted — see `plan_read_with`.
+        let plan = self.plan_read_with(start, span, false).await?;
         // Recorded after planning, so anything that changes the file from
         // here on is seen as a change. See `State::mutation_gen`.
         let plan_gen = self.state.mutation_gen();

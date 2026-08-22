@@ -332,3 +332,55 @@ async fn read_ahead_warms_the_cache_and_reads_cost_nothing() {
     let _ = h.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// A read-ahead must not report cache hits.
+///
+/// It plans the same way a read does, and planning counts every block it
+/// finds resident. Counting a read-ahead's planning made `cache_hits`
+/// useless for the thing it exists for: warming a wide range that is
+/// already warm reported hits by the thousand and drowned out the reads.
+/// Measured over 16 MiB it inflated the number about ninefold.
+///
+/// A hit is a read this layer served. A read-ahead is not serving anybody.
+#[tokio::test]
+#[ignore]
+async fn read_ahead_does_not_report_cache_hits() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const N: usize = 64;
+    seed(&client, tf.uri(), N).await;
+
+    let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await.expect("reopen");
+    h.read_timing_reset();
+
+    // First warm: nothing is resident, so nothing could be a hit anyway.
+    let _ = h.fs_read_ahead(0, N * BLK).await.expect("warm");
+    let after_first = h.read_timing().snapshot();
+    assert_eq!(after_first.cache_hits, 0,
+        "a read-ahead should report no hits, got {}", after_first.cache_hits);
+
+    // Second warm over the now-resident range: every block is resident, so
+    // this is where the inflation used to come from.
+    let again = h.fs_read_ahead(0, N * BLK).await.expect("warm again");
+    assert_eq!(again, 0, "a warmed range installs nothing the second time");
+    let after_second = h.read_timing().snapshot();
+    assert_eq!(after_second.cache_hits, 0,
+        "warming an already-warm range should still report no hits, got {}",
+        after_second.cache_hits);
+
+    // A read over the same range does report them, which is the point of
+    // the counter.
+    let mut buf = vec![0u8; N * BLK];
+    let _ = h.fs_read(0, &mut buf).await.expect("read");
+    let after_read = h.read_timing().snapshot();
+    assert!(after_read.cache_hits > 0,
+        "a read served from the cache has to report hits");
+    assert!(after_read.cache_hits <= N as u64,
+        "{} blocks read once cannot be more than {} hits, got {}",
+        N, N, after_read.cache_hits);
+
+    let _ = h.fs_release().await;
+    tf.cleanup(&client).await;
+}

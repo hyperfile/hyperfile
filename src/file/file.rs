@@ -589,7 +589,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Ok(0);
         }
 
-        let plan = self.plan_read(start, span).await?;
+        let plan = self.plan_read_with(start, span, false).await?;
         debug!("READ AHEAD - planned {} ops for {} bytes at {}", plan.len(), span, start);
 
         // One buffer for the whole span: a coalesced request needs a
@@ -754,7 +754,20 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// capped at `runtime.read_get_max_bytes`. Cache hits, zero
     /// blocks, and in-flight WAL blocks each break the run and
     /// produce their own per-block op.
+    /// Plan a read, counting the blocks it finds resident.
     pub(crate) async fn plan_read(&mut self, off: usize, buf_len: usize) -> Result<Vec<ReadOp>> {
+        self.plan_read_with(off, buf_len, true).await
+    }
+
+    /// Plan a read of `[off, off + buf_len)`.
+    ///
+    /// `count_hits` decides whether a resident block is recorded in
+    /// `cache_hits`. A read counts them, because a hit is a read this layer
+    /// served. A read-ahead does not: it is not serving anybody, and
+    /// counting its planning made the number useless for the thing it is
+    /// there for — a wide read-ahead over already-warm blocks reported
+    /// hits by the thousand and drowned out the reads.
+    pub(crate) async fn plan_read_with(&mut self, off: usize, buf_len: usize, count_hits: bool) -> Result<Vec<ReadOp>> {
         let data_block_size = self.config.meta.data_block_size;
         let max_get = self.config.runtime.read_get_max_bytes;
 
@@ -785,7 +798,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // a clean block into the dirty tier.
             let cache_hit = self.cache.has(&blk_idx);
             if cache_hit {
-                self.staging.read_timing().add_cache_hit();
+                if count_hits {
+                    self.staging.read_timing().add_cache_hit();
+                }
                 flush_range(&mut ops, &mut current_range);
                 ops.push(ReadOp::Cache {
                     blk_idx,
