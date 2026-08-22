@@ -121,6 +121,8 @@ pub type FileRespTrunc = Result<()>;
 pub type FileRespWithBlock = Result<bool>;
 pub type FileRespTiming = Result<TimingValue>;
 pub type FileRespDirtyBlockCount = Result<usize>;
+/// How many blocks a read-ahead installed.
+pub type FileRespReadAhead = Result<usize>;
 /// The bytes read, truncated to what was actually available.
 pub type FileRespReadOwned = Result<Bytes>;
 pub type FileRespFlush = Result<SegmentId>;
@@ -152,6 +154,7 @@ pub enum FileResp {
     WithBlock(oneshot::Sender<FileRespWithBlock>),
     Timing(oneshot::Sender<FileRespTiming>),
     DirtyBlockCount(oneshot::Sender<FileRespDirtyBlockCount>),
+    ReadAhead(oneshot::Sender<FileRespReadAhead>),
     /// No response: the requester was answered before requeuing.
     BlockAbsorb,
     ReadOwned(oneshot::Sender<FileRespReadOwned>),
@@ -232,6 +235,13 @@ impl FileResp {
         match self {
             Self::ReadOwned(tx) => tx,
             _ => panic!("FileResp::to_read_owned called on wrong variant"),
+        }
+    }
+
+    pub fn to_read_ahead(self) -> oneshot::Sender<FileRespReadAhead> {
+        match self {
+            Self::ReadAhead(tx) => tx,
+            _ => panic!("FileResp::to_read_ahead called on wrong variant"),
         }
     }
 
@@ -472,6 +482,12 @@ pub struct FileReqTiming {
 
 pub struct FileReqDirtyBlockCount {}
 
+pub struct FileReqReadAhead<'a> {
+    pub offset: usize,
+    pub len: usize,
+    pub fh: ChannelGroup<FileContext<'a>>,
+}
+
 /// Hands a block loaded by a spawned task back for caching.
 ///
 /// A spawned read-only block fetch owns the block it filled, and
@@ -562,6 +578,7 @@ pub enum FileReqOp {
     WithBlock,
     Timing,
     DirtyBlockCount,
+    ReadAhead,
     BlockAbsorb,
     Flush,
     FlushData,
@@ -592,6 +609,7 @@ pub union FileReqBody<'a> {
     with_block: ManuallyDrop<FileReqWithBlock<'a>>,
     timing: ManuallyDrop<FileReqTiming>,
     dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
+    read_ahead: ManuallyDrop<FileReqReadAhead<'a>>,
     block_absorb: ManuallyDrop<FileReqBlockAbsorb>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
@@ -862,6 +880,16 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { block_absorb: ManuallyDrop::new(FileReqBlockAbsorb { blk_idx, block }), },
         };
         Self { req: Some(req), resp: Some(FileResp::BlockAbsorb) }
+    }
+
+    pub fn new_read_ahead(offset: usize, len: usize, fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespReadAhead>) {
+        let (tx, rx) = oneshot::channel::<FileRespReadAhead>();
+        let req = FileReq {
+            op: FileReqOp::ReadAhead,
+            body: FileReqBody { read_ahead: ManuallyDrop::new(FileReqReadAhead { offset, len, fh }), },
+        };
+        let resp = FileResp::ReadAhead(tx);
+        (Self { req: Some(req), resp: Some(resp) }, rx)
     }
 
     pub fn new_dirty_block_count() -> (Self, oneshot::Receiver<FileRespDirtyBlockCount>) {
@@ -1301,6 +1329,17 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let md = unsafe { req.body.block_absorb };
                 let r = ManuallyDrop::into_inner(md);
                 self.inner.absorb_block(r.blk_idx, r.block);
+            },
+            FileReqOp::ReadAhead => {
+                let md = unsafe { req.body.read_ahead };
+                let r = ManuallyDrop::into_inner(md);
+                let _resp_ra = resp.to_read_ahead();
+                let resp = FileResp::ReadAhead(_resp_ra);
+                // The response comes from the spawned fetch, so a failure
+                // to even plan is the only thing answered here.
+                if let Err(e) = self.inner.spawn_read_ahead(r, resp).await {
+                    log::warn!("read ahead failed to start: {:?}", e);
+                }
             },
             FileReqOp::DirtyBlockCount => {
                 let md = unsafe { req.body.dirty_block_count };

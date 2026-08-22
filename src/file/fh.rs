@@ -341,6 +341,39 @@ impl<'a: 'static> HyperFileHandler<'a> {
     ///
     /// The counterpart of `Hyper::dirty_block_count`. Zero means a
     /// flush would have no data to write, so a caller can skip one.
+    /// Fetch a range into the data block cache without returning it.
+    ///
+    /// For a caller that knows what will be asked for next and would
+    /// rather it were already here — a read-ahead. Nothing comes back but
+    /// a count: a later `fh_read` of those bytes asks the ordinary way and
+    /// finds them.
+    ///
+    /// This exists because a byte read queries the data cache and does not
+    /// fill it, so bytes fetched speculatively through `fh_read` have
+    /// nowhere to live and the next read fetches them again. Only blocks
+    /// brought in through here are cached, so a plain read still cannot
+    /// evict what the write path is holding.
+    ///
+    /// Costs one crossing for the whole range, and the requests are
+    /// coalesced the way a read of the same range would be — warming a
+    /// megabyte is a handful of requests, not one per block. The fetches
+    /// run off the handler task, so other operations are not held up for
+    /// their duration.
+    ///
+    /// The range is widened to whole blocks and clamped to the end of the
+    /// file. Blocks already cached are left alone, and holes are skipped:
+    /// they read as zeroes without a request, so caching them buys
+    /// nothing. Returns how many blocks were installed.
+    ///
+    /// A failure means nothing was installed; the reads that follow simply
+    /// pay for their own fetches.
+    pub async fn fh_read_ahead(&self, off: usize, len: usize) -> Result<usize>
+    {
+        let (ctx, rx) = FileContext::new_read_ahead(off, len, self.inner.clone());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
     pub async fn fh_dirty_block_count(&self) -> Result<usize>
     {
         let (ctx, rx) = FileContext::new_dirty_block_count();

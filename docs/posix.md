@@ -193,12 +193,13 @@ applies for an offset at or past `i_size`.
 
 ## Reads and the data cache
 
-Byte reads do not populate the data cache; block access does. Both
-read from it.
+Byte reads do not populate the data cache; block access does, and so
+does an explicit read-ahead. Every one of them reads from it.
 
 | entry point | populates the data cache |
 |---|---|
 | `fs_read` / `fh_read` | **no** |
+| `fs_read_ahead` / `fh_read_ahead` | **yes** |
 | `fs_block` / `fh_with_block` | **yes** |
 | `fs_block_mut` / `fh_with_block_mut` | **yes** |
 
@@ -206,6 +207,15 @@ Reading the same bytes twice through `fs_read` fetches them from
 staging twice. Borrowing the same block twice fetches it once. A byte
 read after a block borrow of the same data is served from memory; a
 block borrow after a byte read is not.
+
+`fs_read_ahead` exists for a caller that knows what will be asked for
+next. Fetching ahead through `fs_read` cannot work — the bytes have
+nowhere to live, so the read that wants them fetches them again, and the
+speculation is pure cost. Read-ahead through this entry point warms the
+cache instead, with its requests coalesced the way a read of the same
+range would be, so a wide window costs a handful of requests rather than
+one per block. Ordinary reads still do not fill the cache, so they cannot
+evict what the write path is holding.
 
 `read_timing` (or `fh_read_timing` on the reactor surface) reports
 this: `data_gets` counts fetches, `cache_hits` counts reads served from

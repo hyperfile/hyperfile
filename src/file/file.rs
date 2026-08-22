@@ -549,6 +549,111 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
     }
 
+    /// Fetch a range into the data block cache without returning it.
+    ///
+    /// For a caller that knows what will be asked for next and would
+    /// rather it were already here. Nothing comes back: a later `read` of
+    /// those bytes asks the ordinary way and finds them.
+    ///
+    /// This exists because a byte read queries the data cache but does not
+    /// fill it, so bytes fetched speculatively through `read` have nowhere
+    /// to live and the next read fetches them again. Only blocks brought
+    /// in through here are cached, which keeps a plain read from evicting
+    /// the blocks the write path is holding.
+    ///
+    /// The range is widened to whole blocks, since a block is what the
+    /// cache stores, and clamped to the end of the file. Blocks already
+    /// resident are left alone, and holes are skipped: they read as zeroes
+    /// without an object request, so caching them would buy nothing.
+    ///
+    /// Requests are coalesced exactly as a read of the same range would
+    /// be, because the planning is shared. A wide read-ahead therefore
+    /// costs a few requests rather than one per block.
+    ///
+    /// Returns how many blocks were installed.
+    pub async fn read_ahead(&mut self, off: usize, len: usize) -> Result<usize> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let i_size = self.inode().size() as usize;
+        if off >= i_size {
+            return Ok(0);
+        }
+        let bs = self.config.meta.data_block_size;
+        // Whole blocks only: a partial block cannot be cached, and a caller
+        // asking for part of one still wants the block it sits in.
+        let start = off / bs * bs;
+        let end = ((off + len).min(i_size) + bs - 1) / bs * bs;
+        let span = end - start;
+        if span == 0 {
+            return Ok(0);
+        }
+
+        let plan = self.plan_read(start, span).await?;
+        debug!("READ AHEAD - planned {} ops for {} bytes at {}", plan.len(), span, start);
+
+        // One buffer for the whole span: a coalesced request needs a
+        // contiguous destination and separate blocks are not contiguous, so
+        // bytes land here and are copied into blocks after.
+        let mut buf = vec![0u8; span];
+        let mut consumed = 0usize;
+        // Windows that came from staging. Only those become cached blocks —
+        // one already in the cache, or a hole, is not worth installing.
+        let mut fetched: Vec<(usize, usize)> = Vec::new();
+
+        for op in plan {
+            let dst_len = op.dst_len();
+            match op {
+                ReadOp::Cache { .. } | ReadOp::Zero { .. } => {},
+                #[cfg(feature = "wal")]
+                ReadOp::Inmem { segid, s3_off, dst_len: _ } => {
+                    let copied = {
+                        let lock = self.flushing_segments.read().await;
+                        match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                            Some(data) => {
+                                let e = s3_off + dst_len;
+                                buf[consumed..consumed + dst_len].copy_from_slice(&data[s3_off..e]);
+                                true
+                            },
+                            None => false,
+                        }
+                    };
+                    if !copied {
+                        // The flush landed, so the same bytes are on staging.
+                        self.staging.load_range(segid, s3_off, &mut buf[consumed..consumed + dst_len]).await?;
+                    }
+                    fetched.push((consumed, dst_len));
+                },
+                ReadOp::Range { segid, s3_off, dst_len: _ } => {
+                    self.staging.load_range(segid, s3_off, &mut buf[consumed..consumed + dst_len]).await?;
+                    fetched.push((consumed, dst_len));
+                },
+            }
+            consumed += dst_len;
+        }
+
+        // Install what was fetched, a block at a time.
+        let mut cached = 0usize;
+        for (win_off, win_len) in fetched {
+            let mut pos = win_off;
+            while pos + bs <= win_off + win_len {
+                let blk_idx = ((start + pos) / bs) as BlockIndex;
+                let block = self.cache.new_block(blk_idx);
+                block.set_should_cache();
+                block.as_mut_slice().copy_from_slice(&buf[pos..pos + bs]);
+                self.absorb_block(blk_idx, block);
+                cached += 1;
+                pos += bs;
+            }
+        }
+
+        if !self.flags.is_noatime() {
+            self.inode.update_atime();
+        }
+        debug!("READ AHEAD - cached {} blocks", cached);
+        Ok(cached)
+    }
+
     pub async fn read(&mut self, off: usize, mut buf: &mut [u8]) -> Result<usize> {
         // POSIX read(): "[EBADF] The fildes argument is not a valid
         // file descriptor open for reading." Unlike the write path
@@ -1185,7 +1290,6 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// spawn and here would have made it dirty, and that copy is the
     /// current one. Two concurrent misses on the same index also arrive
     /// here twice; the second is redundant but harmless.
-    #[cfg(feature = "reactor")]
     pub(crate) fn absorb_block(&mut self, blk_idx: BlockIndex, block: DataBlock) {
         if self.cache.has(&blk_idx) {
             debug!("absorb_block - block index {} already resident, dropping the loaded copy", blk_idx);

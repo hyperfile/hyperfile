@@ -183,8 +183,9 @@ impl<'a: 'static> Hyper<'a> {
     /// **Does not populate the data cache.** Reading the same bytes
     /// twice fetches them twice. A read does consult the cache, so it
     /// is served from there when the blocks happen to be resident —
-    /// for instance after [`Self::fs_block`], or after a write that
-    /// has since been flushed.
+    /// for instance after [`Self::fs_block`], after
+    /// [`Self::fs_read_ahead`], or after a write that has since been
+    /// flushed.
     ///
     /// `docs/block-api.md` has the full table of which entry points
     /// populate the cache.
@@ -192,6 +193,37 @@ impl<'a: 'static> Hyper<'a> {
     {
         debug!("fs_read - offset: {}, size: {}", off, buf.len());
         self.inner.read(off, buf).await
+    }
+
+    /// Fetch a range into the data block cache without returning it.
+    ///
+    /// For a caller that knows what will be asked for next — a
+    /// read-ahead. Nothing comes back but a count of the blocks
+    /// installed; a later [`Self::fs_read`] of those bytes asks the
+    /// ordinary way and finds them.
+    ///
+    /// This is the entry point that fills the cache for the byte path.
+    /// `fs_read` consults the cache but does not fill it, so bytes
+    /// fetched speculatively through `fs_read` have nowhere to live and
+    /// the next read fetches them again. Only blocks brought in through
+    /// here are cached, so ordinary reads still cannot evict what the
+    /// write path is holding.
+    ///
+    /// Requests are coalesced the way a read of the same range would be,
+    /// so warming a megabyte costs a handful of requests rather than one
+    /// per block.
+    ///
+    /// The range is widened to whole blocks, since a block is what the
+    /// cache stores, and clamped to `i_size`. Blocks already cached are
+    /// left alone, and holes are skipped: they read as zeroes without a
+    /// request, so caching them buys nothing.
+    ///
+    /// On failure nothing is installed and the reads that follow simply
+    /// pay for their own fetches.
+    pub async fn fs_read_ahead(&mut self, off: usize, len: usize) -> Result<usize>
+    {
+        debug!("fs_read_ahead - offset: {}, len: {}", off, len);
+        self.inner.read_ahead(off, len).await
     }
 
     /// `lseek(SEEK_DATA)`: smallest offset >= `off` holding data, or `None`

@@ -730,3 +730,59 @@ async fn reactor_write_reports_a_failed_read_modify_write() {
     let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
+
+/// `fh_read_ahead` warms a range so the reads that follow find it.
+///
+/// The byte read path queries the data cache and does not fill it, so
+/// read-ahead through `fh_read` costs requests and buys nothing — the
+/// reporter measured object requests doubling with cache hits unchanged.
+/// This checks what the entry point is for: the range is warmed in one
+/// crossing with the requests coalesced, and the reads after it reach
+/// staging not at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_read_ahead_warms_the_cache() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const BLK: usize = 4096;
+    const NB: usize = 64;
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file()).await.unwrap();
+        for b in 0..NB {
+            fh.fh_write(b * BLK, &vec![(b % 251) as u8; BLK]).await.expect("write");
+        }
+        fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly()).await.unwrap();
+
+    let before = fh.fh_read_timing().await.expect("timing");
+    let cached = fh.fh_read_ahead(0, NB * BLK).await.expect("read_ahead");
+    let after_warm = fh.fh_read_timing().await.expect("timing");
+    assert_eq!(cached, NB, "every block in the range should have been installed");
+
+    let warm_gets = after_warm.data_gets - before.data_gets;
+    assert!(warm_gets < NB as u64,
+        "warming {} blocks took {} requests, so nothing was coalesced", NB, warm_gets);
+
+    for b in 0..NB {
+        let got = fh.fh_read_owned(b * BLK, BLK).await.expect("read");
+        assert!(got.iter().all(|&v| v == (b % 251) as u8),
+            "block {} came back wrong after read_ahead", b);
+    }
+    let after_reads = fh.fh_read_timing().await.expect("timing");
+    assert_eq!(after_reads.data_gets, after_warm.data_gets,
+        "reads over a warmed range must not issue object requests");
+
+    eprintln!("warmed {} blocks with {} requests; {} following reads cost 0",
+        cached, warm_gets, NB);
+
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}

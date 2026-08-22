@@ -368,3 +368,83 @@ async fn block_ptr_format_comes_from_the_config() {
         }
     }
 }
+
+/// `read_ahead` puts a range in the data cache so a later read finds it.
+///
+/// A byte read queries the cache but does not fill it, so bytes fetched
+/// speculatively through `read` have nowhere to live and the next read
+/// fetches them again — which makes read-ahead through the byte path a
+/// pure loss. This checks the two things a caller needs: the reads that
+/// follow cost no object requests, and warming a wide range costs far
+/// fewer requests than one per block.
+#[tokio::test]
+async fn read_ahead_warms_the_cache_for_later_reads() {
+    let _ = env_logger::try_init();
+    let (staging, mut file) = create("read-ahead").await;
+
+    const NB: usize = 64;
+    for b in 0..NB {
+        let _ = file.write(b * BLK, &vec![(b % 251) as u8; BLK]).await.expect("write");
+    }
+    let _ = file.flush().await.expect("flush");
+    drop(file);
+
+    let mut file = reopen(&staging, FileFlags::rdonly()).await;
+
+    // Warm the whole file in one call.
+    let before = staging.read_timing().snapshot();
+    let cached = file.read_ahead(0, NB * BLK).await.expect("read_ahead");
+    let after_warm = staging.read_timing().snapshot();
+    assert_eq!(cached, NB, "every block in the range should have been installed");
+
+    let warm_gets = after_warm.data_gets - before.data_gets;
+    assert!(warm_gets < NB as u64,
+        "warming {} blocks took {} requests, so nothing was coalesced", NB, warm_gets);
+
+    // The reads that follow must not reach staging at all.
+    for b in 0..NB {
+        let got = read_at(&mut file, b * BLK, BLK).await;
+        assert!(got.iter().all(|&v| v == (b % 251) as u8),
+            "block {} came back wrong after read_ahead", b);
+    }
+    let after_reads = staging.read_timing().snapshot();
+    assert_eq!(after_reads.data_gets, after_warm.data_gets,
+        "reads over a warmed range must not issue object requests");
+
+    eprintln!("warmed {} blocks with {} requests; {} following reads cost 0",
+        cached, warm_gets, NB);
+}
+
+/// Read-ahead skips what it does not need: blocks already cached, and
+/// holes, which read as zeroes without an object request.
+#[tokio::test]
+async fn read_ahead_skips_resident_blocks_and_holes() {
+    let _ = env_logger::try_init();
+    let (staging, mut file) = create("read-ahead-skips").await;
+
+    // Blocks 0..4 written, 4..8 left as a hole, 8..12 written.
+    let _ = file.write(0, &vec![0x11; 4 * BLK]).await.expect("write low");
+    let _ = file.write(8 * BLK, &vec![0x22; 4 * BLK]).await.expect("write high");
+    let _ = file.flush().await.expect("flush");
+    drop(file);
+
+    let mut file = reopen(&staging, FileFlags::rdonly()).await;
+
+    // Holes are not installed, so only the eight backed blocks are.
+    let cached = file.read_ahead(0, 12 * BLK).await.expect("read_ahead");
+    assert_eq!(cached, 8, "only blocks backed by data should be installed");
+
+    // A second warm of the same range finds everything resident and
+    // fetches nothing.
+    let before = staging.read_timing().snapshot();
+    let again = file.read_ahead(0, 12 * BLK).await.expect("read_ahead again");
+    let after = staging.read_timing().snapshot();
+    assert_eq!(again, 0, "a warmed range should install nothing the second time");
+    assert_eq!(after.data_gets, before.data_gets,
+        "a warmed range should not be fetched again");
+
+    // And the data still reads correctly, holes included.
+    assert!(read_at(&mut file, 0, 4 * BLK).await.iter().all(|&v| v == 0x11));
+    assert!(read_at(&mut file, 4 * BLK, 4 * BLK).await.iter().all(|&v| v == 0));
+    assert!(read_at(&mut file, 8 * BLK, 4 * BLK).await.iter().all(|&v| v == 0x22));
+}

@@ -228,12 +228,13 @@ Both borrows honor the open access mode, like the byte API:
 
 ## Interaction with the data cache
 
-The block API populates the data cache; the byte API does not. Both
-read from it.
+The block API populates the data cache; the byte API does not, unless
+asked to warm a range explicitly. Everything reads from it.
 
 | entry point | reads the cache | populates the cache |
 |---|---|---|
 | `fs_read` / `fh_read` | yes | **no** |
+| `fs_read_ahead` / `fh_read_ahead` | yes | **yes** |
 | `fs_block` / `fh_with_block` | yes | **yes** |
 | `fs_block_mut` / `fh_with_block_mut` | yes | **yes** |
 | `fs_write` / `fh_write` | yes | while dirty, and kept after the flush only for a partially-written block |
@@ -242,6 +243,14 @@ So reading the same bytes twice through `fs_read` fetches them twice,
 while borrowing the same block twice fetches it once. A byte read after
 a block borrow of the same data is served from memory; a block borrow
 after a byte read is not.
+
+`fs_read_ahead` is the byte path's way into the cache, for a caller that
+knows what comes next. It is worth having as its own entry point rather
+than warming through the block API: a block borrow costs one channel
+crossing each on the reactor surface, so warming a megabyte that way is
+hundreds of crossings, while `fh_read_ahead` takes one for the whole
+range and coalesces the requests underneath it. Nothing is returned —
+the read that wants the bytes asks normally and finds them.
 
 `read_timing` reports this directly: `data_gets` counts fetches and
 `cache_hits` counts reads served from the cache. On the reactor surface

@@ -288,3 +288,47 @@ async fn reset_zeroes_every_counter() {
     let _ = h.fs_release().await.expect("release");
     tf.cleanup(&client).await;
 }
+
+/// `fs_read_ahead` is the byte path's way into the data cache: a read of
+/// a warmed range must cost nothing, where a read of the same range
+/// warmed through `fs_read` would cost the same again.
+///
+/// This is the property the entry point exists for, and it is only
+/// visible in the counters — the reporter measured read-ahead through the
+/// byte path doubling requests with cache hits unchanged, because the
+/// bytes had nowhere to live.
+#[tokio::test]
+#[ignore]
+async fn read_ahead_warms_the_cache_and_reads_cost_nothing() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    const N: usize = 64;
+    seed(&client, tf.uri(), N).await;
+
+    let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await.expect("reopen");
+    h.read_timing_reset();
+
+    let cached = h.fs_read_ahead(0, N * BLK).await.expect("read_ahead");
+    assert_eq!(cached, N, "every block in the range should have been installed");
+    let warm = h.read_timing().snapshot();
+    assert_eq!(warm.data_gets, 1,
+        "{N} contiguous blocks should warm in 1 request, got {}", warm.data_gets);
+
+    // Now read it. Nothing should reach staging.
+    let mut buf = vec![0u8; N * BLK];
+    let n = h.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(n, N * BLK);
+    assert!(buf.iter().all(|b| *b == 0x5A), "warmed data came back wrong");
+
+    let after = h.read_timing().snapshot();
+    assert_eq!(after.data_gets, warm.data_gets,
+        "a read over a warmed range must not fetch, but data_gets went {} -> {}",
+        warm.data_gets, after.data_gets);
+    assert!(after.cache_hits > warm.cache_hits,
+        "and the read should be counted as cache hits");
+
+    let _ = h.fs_release().await;
+    tf.cleanup(&client).await;
+}

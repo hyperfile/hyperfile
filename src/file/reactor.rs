@@ -5,14 +5,14 @@ use log::{debug, warn};
 use btree_ondisk::{BlockLoader, NodeCache};
 use tokio::task::JoinHandle;
 use tokio::sync::Semaphore;
-use crate::{BlockIndex, BlockPtr, BlockIndexIter};
+use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId};
 use crate::staging::Staging;
 use crate::segment::SegmentReadWrite;
 use crate::file::HyperTrait;
 use crate::meta_format::BlockPtrFormat;
 use crate::buffer::DataBlock;
 use super::file::{HyperFile, ReadOp};
-use super::handler::{FileReqRead, FileReqWrite, FileReqWriteZero, FileResp, FileContext, ChannelGroup, BlockAction};
+use super::handler::{FileReqRead, FileReqReadAhead, FileReqWrite, FileReqWriteZero, FileResp, FileContext, ChannelGroup, BlockAction};
 
 /// Where a write retrieve sends the request once its loads finish.
 pub(crate) enum AfterRetrieve {
@@ -264,6 +264,117 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return false;
         }
         true
+    }
+
+    /// Warm a range into the data cache, keeping the object requests off
+    /// the handler task.
+    ///
+    /// Planning happens here, costing the same bmap walk a read of the
+    /// range would. The fetches and the copying into blocks happen in a
+    /// spawned task, which hands each block back through `block_absorb` to
+    /// be installed and answers the caller when it is done — so a wide
+    /// read-ahead does not stall everything else for the length of its
+    /// requests.
+    pub async fn spawn_read_ahead(&mut self, req: FileReqReadAhead<'a>, resp: FileResp) -> Result<()> {
+        let bs = self.config.meta.data_block_size;
+        let i_size = self.inode().size() as usize;
+        if req.len == 0 || req.offset >= i_size {
+            let _ = resp.to_read_ahead().send(Ok(0));
+            return Ok(());
+        }
+        let start = req.offset / bs * bs;
+        let end = ((req.offset + req.len).min(i_size) + bs - 1) / bs * bs;
+        let span = end - start;
+        if span == 0 {
+            let _ = resp.to_read_ahead().send(Ok(0));
+            return Ok(());
+        }
+
+        // Same planning a read does: resident blocks are skipped, the rest
+        // coalesced.
+        let plan = self.plan_read(start, span).await?;
+
+        // Only ops that need staging are worth carrying over; a hole or a
+        // cache hit has nothing to install.
+        let mut work: Vec<(SegmentId, usize, usize, usize)> = Vec::new();
+        let mut consumed = 0usize;
+        for op in plan {
+            let dst_len = op.dst_len();
+            match op {
+                ReadOp::Cache { .. } | ReadOp::Zero { .. } => {},
+                #[cfg(feature = "wal")]
+                ReadOp::Inmem { segid, s3_off, dst_len: _ } => work.push((segid, s3_off, consumed, dst_len)),
+                ReadOp::Range { segid, s3_off, dst_len: _ } => work.push((segid, s3_off, consumed, dst_len)),
+            }
+            consumed += dst_len;
+        }
+        if work.is_empty() {
+            let _ = resp.to_read_ahead().send(Ok(0));
+            return Ok(());
+        }
+
+        let staging = self.staging.clone();
+        let data_block_size = bs;
+        let fh = req.fh.clone();
+        #[cfg(feature = "wal")]
+        let flushing_segments = self.flushing_segments.clone();
+
+        self.rt.as_ref().unwrap().spawn(async move {
+            let mut buf = vec![0u8; span];
+            let mut failed = None;
+            for (segid, src_off, dst_off, len) in work.iter().copied() {
+                #[cfg(feature = "wal")]
+                {
+                    // A segment still being written out is in memory.
+                    let copied = {
+                        let lock = flushing_segments.read().await;
+                        match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                            Some(data) => {
+                                buf[dst_off..dst_off + len]
+                                    .copy_from_slice(&data[src_off..src_off + len]);
+                                true
+                            },
+                            None => false,
+                        }
+                    };
+                    if copied {
+                        continue;
+                    }
+                }
+                if let Err(e) = staging.load_range(segid, src_off, &mut buf[dst_off..dst_off + len]).await {
+                    warn!("read ahead load failed: {:?}", e);
+                    failed = Some(e);
+                    break;
+                }
+            }
+
+            if let Some(e) = failed {
+                // Nothing is installed. A read of the range still works, it
+                // just pays for its own fetch.
+                let _ = resp.to_read_ahead().send(Err(e));
+                return;
+            }
+
+            let mut cached = 0usize;
+            for (_, _, dst_off, len) in work.iter().copied() {
+                let mut pos = dst_off;
+                while pos + data_block_size <= dst_off + len {
+                    let blk_idx = ((start + pos) / data_block_size) as BlockIndex;
+                    let block = DataBlock::new(blk_idx, data_block_size);
+                    block.set_should_cache();
+                    block.as_mut_slice().copy_from_slice(&buf[pos..pos + data_block_size]);
+                    let ctx = FileContext::block_absorb(blk_idx, block);
+                    if fh.send_cb(ctx).is_err() {
+                        break;
+                    }
+                    cached += 1;
+                    pos += data_block_size;
+                }
+            }
+            let _ = resp.to_read_ahead().send(Ok(cached));
+        });
+
+        Ok(())
     }
 
     pub async fn spawn_read(&mut self, mut req: FileReqRead<'a>, resp: FileResp) -> Result<usize> {
