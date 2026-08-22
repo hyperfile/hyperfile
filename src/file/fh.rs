@@ -476,6 +476,58 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// caller must not free what `f` still points at. The block is
     /// short — one closure body, no I/O, since the block is already in
     /// hand by then — and the ordinary path never blocks at all.
+    /// Visit many blocks in one crossing.
+    ///
+    /// `f` runs once per index, inside the reactor: `Some(bytes)` for a
+    /// block resident in the data cache, `None` for one that is not.
+    /// Returns how many were resident.
+    ///
+    /// This exists because the cost of block access on this surface is the
+    /// channel crossing, not the copy. A crossing is tens of microseconds
+    /// against a fraction of one to copy a block, so a caller touching
+    /// hundreds of blocks — a directory listing reading inode records, say
+    /// — spends nearly all its time in the channel. One message for the
+    /// whole batch removes that, and needs no sharing of memory with the
+    /// reactor to do it.
+    ///
+    /// Nothing here reaches staging, which is what keeps a batch cheap: an
+    /// index that is not cached is reported absent rather than fetched, so
+    /// the whole batch is answered without the handler task awaiting
+    /// anything. The pairing is [`Self::fh_read_ahead`] first, which warms
+    /// a range with its requests coalesced, then this — two crossings for
+    /// a region however many blocks it holds.
+    ///
+    /// `f` may borrow from its environment. It has run to completion by
+    /// the time this returns, and cannot run afterwards.
+    pub async fn fh_with_blocks<F>(&mut self, indices: &[BlockIndex], f: F) -> Result<usize>
+    where
+        F: FnMut(BlockIndex, Option<&[u8]>) + Send,
+    {
+        if indices.is_empty() {
+            return Ok(0);
+        }
+        // Shared with the request: dropping the guard closes the gate, so
+        // the borrowed closure cannot run once the caller is gone. Same
+        // reasoning as `fh_with_block`.
+        let gate: crate::file::handler::BlockActionGate =
+            std::sync::Arc::new(std::sync::Mutex::new(false));
+        let guard = BorrowGuard { gate: gate.clone() };
+
+        let action: Box<dyn FnMut(BlockIndex, Option<&[u8]>) + Send + '_> = Box::new(f);
+        // SAFETY: as in `fh_with_block` — erases the closure's lifetime so
+        // it can travel to the reactor, whose request type is `'static`.
+        // The reactor runs it before answering, and the guard above closes
+        // the gate on every path out of this function.
+        let action: crate::file::handler::BatchBlockAction = unsafe { std::mem::transmute(action) };
+
+        let (ctx, rx) = FileContext::new_with_blocks(indices.to_vec(), action, gate);
+        self.inner.send(ctx)?;
+        let resident = rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
+        drop(guard);
+        resident
+    }
+
     pub async fn fh_with_block<R, F>(&mut self, idx: BlockIndex, f: F) -> Result<Option<R>>
     where
         F: FnOnce(&[u8]) -> R + Send,

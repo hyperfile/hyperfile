@@ -123,6 +123,8 @@ pub type FileRespTiming = Result<TimingValue>;
 pub type FileRespDirtyBlockCount = Result<usize>;
 /// How many blocks a read-ahead installed.
 pub type FileRespReadAhead = Result<usize>;
+/// How many of the requested blocks were resident.
+pub type FileRespWithBlocks = Result<usize>;
 /// The bytes read, truncated to what was actually available.
 pub type FileRespReadOwned = Result<Bytes>;
 pub type FileRespFlush = Result<SegmentId>;
@@ -155,6 +157,7 @@ pub enum FileResp {
     Timing(oneshot::Sender<FileRespTiming>),
     DirtyBlockCount(oneshot::Sender<FileRespDirtyBlockCount>),
     ReadAhead(oneshot::Sender<FileRespReadAhead>),
+    WithBlocks(oneshot::Sender<FileRespWithBlocks>),
     /// No response: the requester was answered before requeuing.
     BlockAbsorb,
     ReadOwned(oneshot::Sender<FileRespReadOwned>),
@@ -235,6 +238,13 @@ impl FileResp {
         match self {
             Self::ReadOwned(tx) => tx,
             _ => panic!("FileResp::to_read_owned called on wrong variant"),
+        }
+    }
+
+    pub fn to_with_blocks(self) -> oneshot::Sender<FileRespWithBlocks> {
+        match self {
+            Self::WithBlocks(tx) => tx,
+            _ => panic!("FileResp::to_with_blocks called on wrong variant"),
         }
     }
 
@@ -467,6 +477,10 @@ pub enum BlockAction {
 /// deadlock.
 pub type BlockActionGate = Arc<std::sync::Mutex<bool>>;
 
+/// Run once per index in a batch: `Some` for a block resident in the
+/// cache, `None` for one that is not.
+pub type BatchBlockAction = Box<dyn FnMut(BlockIndex, Option<&[u8]>) + Send>;
+
 /// Which counters a timing request is about.
 #[derive(Clone, Copy, Debug)]
 pub enum TimingOp {
@@ -481,6 +495,14 @@ pub struct FileReqTiming {
 }
 
 pub struct FileReqDirtyBlockCount {}
+
+pub struct FileReqWithBlocks {
+    pub indices: Vec<BlockIndex>,
+    pub action: BatchBlockAction,
+    /// Guards `action` against running after the caller is gone, as for
+    /// a single block. See [`BlockActionGate`].
+    pub gate: BlockActionGate,
+}
 
 pub struct FileReqReadAhead<'a> {
     pub offset: usize,
@@ -579,6 +601,7 @@ pub enum FileReqOp {
     Timing,
     DirtyBlockCount,
     ReadAhead,
+    WithBlocks,
     BlockAbsorb,
     Flush,
     FlushData,
@@ -610,6 +633,7 @@ pub union FileReqBody<'a> {
     timing: ManuallyDrop<FileReqTiming>,
     dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
     read_ahead: ManuallyDrop<FileReqReadAhead<'a>>,
+    with_blocks: ManuallyDrop<FileReqWithBlocks>,
     block_absorb: ManuallyDrop<FileReqBlockAbsorb>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
@@ -880,6 +904,16 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { block_absorb: ManuallyDrop::new(FileReqBlockAbsorb { blk_idx, block }), },
         };
         Self { req: Some(req), resp: Some(FileResp::BlockAbsorb) }
+    }
+
+    pub fn new_with_blocks(indices: Vec<BlockIndex>, action: BatchBlockAction, gate: BlockActionGate) -> (Self, oneshot::Receiver<FileRespWithBlocks>) {
+        let (tx, rx) = oneshot::channel::<FileRespWithBlocks>();
+        let req = FileReq {
+            op: FileReqOp::WithBlocks,
+            body: FileReqBody { with_blocks: ManuallyDrop::new(FileReqWithBlocks { indices, action, gate }), },
+        };
+        let resp = FileResp::WithBlocks(tx);
+        (Self { req: Some(req), resp: Some(resp) }, rx)
     }
 
     pub fn new_read_ahead(offset: usize, len: usize, fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespReadAhead>) {
@@ -1329,6 +1363,32 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let md = unsafe { req.body.block_absorb };
                 let r = ManuallyDrop::into_inner(md);
                 self.inner.absorb_block(r.blk_idx, r.block);
+            },
+            FileReqOp::WithBlocks => {
+                let md = unsafe { req.body.with_blocks };
+                let mut r = ManuallyDrop::into_inner(md);
+                // Purely in-memory: every index is answered from the cache
+                // or reported absent. Nothing here awaits, so one message
+                // serves the whole batch without holding up the queue for
+                // an object request. A caller that wants the blocks there
+                // first warms them with `fh_read_ahead`.
+                let mut resident = 0usize;
+                {
+                    let closed = *r.gate.lock().unwrap();
+                    if !closed {
+                        for blk_idx in r.indices.iter().copied() {
+                            match self.inner.cached_block(blk_idx) {
+                                Some(block) => {
+                                    (r.action)(blk_idx, Some(block.as_slice()));
+                                    block.unlock();
+                                    resident += 1;
+                                },
+                                None => (r.action)(blk_idx, None),
+                            }
+                        }
+                    }
+                }
+                let _ = resp.to_with_blocks().send(Ok(resident));
             },
             FileReqOp::ReadAhead => {
                 let md = unsafe { req.body.read_ahead };

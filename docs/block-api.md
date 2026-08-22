@@ -237,6 +237,7 @@ asked to warm a range explicitly. Everything reads from it.
 | `fs_read_ahead` / `fh_read_ahead` | yes | **yes** |
 | `fs_block` / `fh_with_block` | yes | **yes** |
 | `fs_block_mut` / `fh_with_block_mut` | yes | **yes** |
+| `fh_with_blocks` | yes | no — reports what is not cached |
 | `fs_write` / `fh_write` | yes | while dirty, and kept after the flush only for a partially-written block |
 
 So reading the same bytes twice through `fs_read` fetches them twice,
@@ -268,6 +269,33 @@ Two configurations behave differently:
   file. Nothing about the block API differs, but this tier keeps a
   fixed pool of block slots, so a working set larger than the pool
   falls back to heap allocations.
+
+## Visiting many blocks at once
+
+On the reactor surface the cost of block access is the channel crossing,
+not the copy. A crossing is around 16 µs when the queue is empty; copying
+a 4 KiB block is a fraction of one. So a caller touching hundreds of
+blocks — a directory listing reading inode records, say — spends nearly
+all its time in the channel, and zero-copy would not help it.
+
+`fh_with_blocks(&[BlockIndex], f)` takes one crossing for the whole batch,
+calling `f(blk_idx, Some(bytes))` for each resident block and
+`f(blk_idx, None)` for one that is not. Measured on 300 warm blocks:
+
+| | time | per block |
+|---|---|---|
+| `fh_with_block` in a loop | 4.87 ms | 16.2 µs |
+| `fh_with_blocks` once | **23.9 µs** | 0.08 µs |
+
+Nothing in a batch reaches staging, which is what keeps it cheap: an index
+that is not cached is reported absent rather than fetched, so the handler
+task answers the whole batch without awaiting anything. The pairing is
+`fh_read_ahead` first, which warms a range with its object requests
+coalesced, and then `fh_with_blocks` — two crossings for a region however
+many blocks it holds.
+
+There is no direct-API equivalent, and there is no point in one: `fs_block`
+costs 0.02 µs, so a loop over it is already what a batch would be.
 
 ## Relationship to the byte API
 

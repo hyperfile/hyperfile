@@ -1041,3 +1041,74 @@ async fn concurrent_block_reads_overlap() {
 
     tf.cleanup(&client).await;
 }
+
+/// `fh_with_blocks` visits many blocks in one crossing.
+///
+/// The cost of block access on this surface is the channel crossing, not
+/// the copy — tens of microseconds against a fraction of one — so a caller
+/// touching hundreds of blocks spends nearly all its time in the channel.
+/// A directory listing reading inode records is exactly that shape.
+///
+/// Paired with `fh_read_ahead`, a whole region costs two crossings however
+/// many blocks it holds: warm it, then visit it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_with_blocks_visits_a_batch_in_one_crossing() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const NB: usize = 64;
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file()).await.unwrap();
+        for b in 0..NB {
+            fh.fh_write(b * BLK, &vec![(b % 251) as u8; BLK]).await.expect("write");
+        }
+        fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await.expect("release");
+    }
+
+    let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly()).await.unwrap();
+
+    // Warm the region, then visit all of it in one message.
+    let warmed = fh.fh_read_ahead(0, NB * BLK).await.expect("read_ahead");
+    assert_eq!(warmed, NB);
+
+    let indices: Vec<u64> = (0..NB as u64).collect();
+    let mut seen = Vec::new();
+    let mut absent = 0usize;
+    let resident = fh.fh_with_blocks(&indices, |idx, bytes| {
+        match bytes {
+            Some(b) => seen.push((idx, b[0])),
+            None => absent += 1,
+        }
+    }).await.expect("with_blocks");
+
+    assert_eq!(resident, NB, "every warmed block should have been resident");
+    assert_eq!(absent, 0, "nothing should have been reported absent");
+    assert_eq!(seen.len(), NB, "the closure should have run once per index");
+    for (idx, first) in seen {
+        assert_eq!(first, (idx as usize % 251) as u8,
+            "block {} handed the closure the wrong bytes", idx);
+    }
+
+    // A block that was never warmed is reported absent rather than fetched,
+    // which is what keeps the batch free of object requests.
+    let before = fh.fh_read_timing().await.expect("timing");
+    let far: Vec<u64> = vec![100_000, 100_001];
+    let mut nones = 0usize;
+    let resident = fh.fh_with_blocks(&far, |_, bytes| {
+        if bytes.is_none() { nones += 1; }
+    }).await.expect("with_blocks far");
+    let after = fh.fh_read_timing().await.expect("timing");
+    assert_eq!(resident, 0);
+    assert_eq!(nones, 2, "both uncached indices should be reported absent");
+    assert_eq!(after.data_gets, before.data_gets,
+        "a batch must not fetch; it reports what is not cached");
+
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}

@@ -1290,6 +1290,20 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// spawn and here would have made it dirty, and that copy is the
     /// current one. Two concurrent misses on the same index also arrive
     /// here twice; the second is redundant but harmless.
+    /// The cached block for `blk_idx`, if it is resident.
+    ///
+    /// A borrow of what the cache holds, so the caller must `unlock` it
+    /// when done — the local-disk tier locks on `get` and asserts on the
+    /// next `get` that it was not already locked.
+    ///
+    /// Nothing here reaches staging: an index that is not cached is simply
+    /// absent, which is what makes a batch of these cheap enough to answer
+    /// in one message.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn cached_block(&mut self, blk_idx: BlockIndex) -> Option<&DataBlock> {
+        self.cache.get(&blk_idx)
+    }
+
     pub(crate) fn absorb_block(&mut self, blk_idx: BlockIndex, block: DataBlock) {
         if self.cache.has(&blk_idx) {
             debug!("absorb_block - block index {} already resident, dropping the loaded copy", blk_idx);
