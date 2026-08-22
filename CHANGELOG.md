@@ -9,6 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.5] - 2026-08-22
+
+Both additions came from one report about reads: bytes fetched ahead had
+nowhere to live, and block access cost a channel crossing each.
+
+### Added
+
+- **Read-ahead** — `fs_read_ahead` / `fh_read_ahead` fetch a range into
+  the data block cache and return nothing but a count. A later read of
+  those bytes asks the ordinary way and finds them.
+
+  A byte read consults the cache and does not fill it, which is a
+  reasonable default — repeated reads mostly do not reach this layer, and
+  caching every read would evict what the write path is holding — but it
+  left read-ahead with nowhere to put anything. Bytes fetched
+  speculatively through a read were dropped and fetched again, so the
+  speculation was pure cost: a consumer measured object requests going
+  from 519 to 999 with cache hits unchanged at 692, for no throughput.
+
+  Only blocks brought in this way are cached, so a plain read still
+  cannot evict the write path's blocks. Planning is shared with `read`,
+  so requests are coalesced the same way: 64 contiguous blocks warm in
+  one request, and the 64 reads after it cost none. On the reactor
+  surface the fetches run off the handler task and each block returns
+  through the existing absorb hop, so a wide read-ahead does not hold up
+  other operations for the length of its requests. The range widens to
+  whole blocks and clamps to `i_size`; blocks already cached are left
+  alone and holes are skipped, since they read as zeroes without a
+  request.
+
+- **Batch block access** — `fh_with_blocks(&[BlockIndex], f)` visits many
+  blocks in one crossing, calling `f(blk_idx, Some(bytes))` for a
+  resident block and `f(blk_idx, None)` for one that is not.
+
+  The cost of block access on the reactor surface is the crossing, not
+  the copy: a crossing is 16.2 µs measured here against a fraction of a
+  microsecond to copy a 4 KiB block. A caller touching hundreds of
+  blocks therefore spends nearly all its time in the channel. Over 300
+  warm blocks, a loop over `fh_with_block` takes 4.87 ms where one
+  `fh_with_blocks` takes 23.9 µs — 204x.
+
+  Nothing in a batch reaches staging, which is what keeps it cheap: an
+  uncached index is reported absent rather than fetched, so the handler
+  answers the whole batch without awaiting. Pair it with `fh_read_ahead`
+  and a region costs two crossings however many blocks it holds. The
+  closure may borrow from its environment, guarded as `fh_with_block`'s
+  is.
+
+  No direct-API equivalent: `fs_block` costs 0.02 µs, so a loop over it
+  already is what a batch would be.
+
+### Changed
+
+- `absorb_block` is no longer gated on `reactor`, so the direct API's
+  read-ahead can install blocks the same way the block path does.
+
+### Documentation
+
+- The data-cache tables in [docs/posix.md](docs/posix.md) and
+  [docs/block-api.md](docs/block-api.md) list the new entry points, with
+  why read-ahead has to be its own rather than something a plain read
+  does.
+- [docs/block-api.md](docs/block-api.md) gains "Visiting many blocks at
+  once", including the measurement above and why a refcounted zero-copy
+  handle was not the answer to it.
+
+### Tests
+
+- Read-ahead is covered on the reactor surface, on the direct API, and on
+  memory staging where it needs no bucket. The assertions are on the
+  counters, since the property is invisible to timing: warming costs one
+  request and the reads after it cost none.
+- `fh_with_blocks` is covered for a warmed batch and for uncached indices,
+  including that a batch issues no object requests.
+
 ## [0.6.4] - 2026-08-22
 
 ### Fixed
