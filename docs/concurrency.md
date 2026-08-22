@@ -142,6 +142,30 @@ issued one block at a time — either drive it concurrently or use the
 direct API for it. The mode is a property of how you call, not only of
 what you call.
 
+### What coalescing does, and how much it depends on the ask
+
+A read plans block by block and extends one request while the next block's
+location is **strictly adjacent** in the same segment and the request stays
+under `read_get_max_bytes`. It never jumps a gap: a block whose location is
+not adjacent starts a new request. So a read fetches nothing the caller did
+not ask for, and a layout where consecutive file blocks landed in
+consecutive segment positions costs one request however many blocks it
+spans.
+
+The consequence worth knowing is that **how fragmented a file looks depends
+entirely on how much is asked for at a time.** A caller reading 4 MiB in one
+call gives the planner 1024 blocks to walk and one budget to spend, and a
+file with 64 runs in that range can come out as two requests. The same file
+read 128 KiB at a time gives the planner 32 blocks per call, and each call
+pays for the runs it happens to straddle. A consumer measured the same file
+as effectively unfragmented at the library layer and ten times slower
+through a filesystem, where the kernel asks 128 KiB at a time, for exactly
+this reason.
+
+Every measurement in this document is a library-layer one, asking in units
+that suit the planner. Read them as an upper bound on what coalescing can
+do, not as what a caller asking in small pieces will see.
+
 ## S3 optimistic concurrency control (OCC)
 
 On flush, Hyperfile persists two kinds of objects:
