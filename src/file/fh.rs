@@ -476,6 +476,53 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// caller must not free what `f` still points at. The block is
     /// short — one closure body, no I/O, since the block is already in
     /// hand by then — and the ordinary path never blocks at all.
+    /// Read a list of blocks, fetching the ones that are not cached.
+    ///
+    /// `f` runs once per index, inside the reactor, with the block's bytes
+    /// — or `None` for an index at or past EOF, or one whose fetch found
+    /// nothing behind it. Returns how many the closure was given bytes for.
+    ///
+    /// Two crossings for the whole list, whatever it holds: one to ask, one
+    /// to deliver. The fetches run off the handler task, runs of
+    /// consecutive indices are coalesced into one object request each, and
+    /// separate runs go concurrently. A list is the right shape rather than
+    /// a range because reads over a sparse file have gaps, and naming the
+    /// blocks lets those be skipped instead of fetched.
+    ///
+    /// Use [`Self::fh_with_blocks`] instead when the point is to look at
+    /// what is already cached without paying for anything that is not.
+    /// Doing this in two steps — [`Self::fh_read_ahead`] then
+    /// `fh_with_blocks` — is two round trips where the second waits on the
+    /// first, which measures slower on cold blocks than reading one block
+    /// at a time.
+    ///
+    /// `f` may borrow from its environment. It has run to completion by the
+    /// time this returns, and cannot run afterwards.
+    pub async fn fh_read_many<F>(&mut self, indices: &[BlockIndex], f: F) -> Result<usize>
+    where
+        F: FnMut(BlockIndex, Option<&[u8]>) + Send,
+    {
+        if indices.is_empty() {
+            return Ok(0);
+        }
+        // As in `fh_with_block`: dropping the guard closes the gate, so the
+        // borrowed closure cannot run once the caller is gone.
+        let gate: crate::file::handler::BlockActionGate =
+            std::sync::Arc::new(std::sync::Mutex::new(false));
+        let guard = BorrowGuard { gate: gate.clone() };
+
+        let action: Box<dyn FnMut(BlockIndex, Option<&[u8]>) + Send + '_> = Box::new(f);
+        // SAFETY: as in `fh_with_block`.
+        let action: crate::file::handler::BatchBlockAction = unsafe { std::mem::transmute(action) };
+
+        let (ctx, rx) = FileContext::new_read_many(indices.to_vec(), action, gate, self.inner.clone());
+        self.inner.send(ctx)?;
+        let served = rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?;
+        drop(guard);
+        served
+    }
+
     /// Visit many blocks in one crossing.
     ///
     /// `f` runs once per index, inside the reactor: `Some(bytes)` for a

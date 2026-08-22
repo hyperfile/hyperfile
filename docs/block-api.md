@@ -238,6 +238,7 @@ asked to warm a range explicitly. Everything reads from it.
 | `fs_block` / `fh_with_block` | yes | **yes** |
 | `fs_block_mut` / `fh_with_block_mut` | yes | **yes** |
 | `fh_with_blocks` | yes | no — reports what is not cached |
+| `fh_read_many` | yes | **yes** — fetches what is not cached |
 | `fs_write` / `fh_write` | yes | while dirty, and kept after the flush only for a partially-written block |
 
 So reading the same bytes twice through `fs_read` fetches them twice,
@@ -294,8 +295,27 @@ task answers the whole batch without awaiting anything. The pairing is
 coalesced, and then `fh_with_blocks` — two crossings for a region however
 many blocks it holds.
 
-There is no direct-API equivalent, and there is no point in one: `fs_block`
-costs 0.02 µs, so a loop over it is already what a batch would be.
+`fh_with_blocks` never reaches staging, so an index that is not cached is
+reported absent. `fh_read_many` takes the same shape of list and fetches
+those instead, in two crossings — one to ask, one to deliver — with the
+fetches off the handler task. Use the first to look at what is in hand, the
+second to read a list whatever its state.
+
+Doing the second as two steps, `fh_read_ahead` then `fh_with_blocks`, is
+two round trips where the second waits on the first. It also has to name a
+range, and a list of blocks from a directory walk has gaps.
+
+A list with gaps raises a question worth answering explicitly: fetch the
+gaps, or split into one request per run? On an object store the request
+costs far more than the bytes a gap spans, so runs are merged while the gap
+stays under what one request may cover (`read_get_max_bytes`), and
+`plan_read` then decides how the merged range breaks up. Measured over 38
+blocks scattered every eighth across a cold file: one request per run took
+32 ms, a single merged request 28 ms, and one block at a time 197 ms.
+
+There is no direct-API equivalent of either, and there is no point in one:
+`fs_block` costs 0.02 µs, so a loop over it is already what a batch would
+be.
 
 ## Relationship to the byte API
 

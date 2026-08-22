@@ -125,6 +125,8 @@ pub type FileRespDirtyBlockCount = Result<usize>;
 pub type FileRespReadAhead = Result<usize>;
 /// How many of the requested blocks were resident.
 pub type FileRespWithBlocks = Result<usize>;
+/// How many of the requested blocks the closure was given bytes for.
+pub type FileRespReadMany = Result<usize>;
 /// The bytes read, truncated to what was actually available.
 pub type FileRespReadOwned = Result<Bytes>;
 pub type FileRespFlush = Result<SegmentId>;
@@ -158,6 +160,7 @@ pub enum FileResp {
     DirtyBlockCount(oneshot::Sender<FileRespDirtyBlockCount>),
     ReadAhead(oneshot::Sender<FileRespReadAhead>),
     WithBlocks(oneshot::Sender<FileRespWithBlocks>),
+    ReadMany(oneshot::Sender<FileRespReadMany>),
     /// No response: the requester was answered before requeuing.
     BlockAbsorb,
     ReadOwned(oneshot::Sender<FileRespReadOwned>),
@@ -238,6 +241,13 @@ impl FileResp {
         match self {
             Self::ReadOwned(tx) => tx,
             _ => panic!("FileResp::to_read_owned called on wrong variant"),
+        }
+    }
+
+    pub fn to_read_many(self) -> oneshot::Sender<FileRespReadMany> {
+        match self {
+            Self::ReadMany(tx) => tx,
+            _ => panic!("FileResp::to_read_many called on wrong variant"),
         }
     }
 
@@ -504,6 +514,18 @@ pub struct FileReqWithBlocks {
     pub gate: BlockActionGate,
 }
 
+pub struct FileReqReadMany<'a> {
+    pub indices: Vec<BlockIndex>,
+    pub action: BatchBlockAction,
+    /// Guards `action`, as for a single block. See [`BlockActionGate`].
+    pub gate: BlockActionGate,
+    /// Blocks fetched for the indices that were not cached, filled in by
+    /// the spawned fetch before it hands the request back.
+    pub fetched: Vec<(BlockIndex, DataBlock)>,
+    /// Needed to requeue for the second hop.
+    pub fh: ChannelGroup<FileContext<'a>>,
+}
+
 pub struct FileReqReadAhead<'a> {
     pub offset: usize,
     pub len: usize,
@@ -602,6 +624,8 @@ pub enum FileReqOp {
     DirtyBlockCount,
     ReadAhead,
     WithBlocks,
+    ReadMany,
+    ReadManyDone,
     BlockAbsorb,
     Flush,
     FlushData,
@@ -634,6 +658,7 @@ pub union FileReqBody<'a> {
     dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
     read_ahead: ManuallyDrop<FileReqReadAhead<'a>>,
     with_blocks: ManuallyDrop<FileReqWithBlocks>,
+    read_many: ManuallyDrop<FileReqReadMany<'a>>,
     block_absorb: ManuallyDrop<FileReqBlockAbsorb>,
     #[cfg(feature = "wal")]
     wal_flush: ManuallyDrop<FileReqWalFlush<'a>>,
@@ -904,6 +929,28 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { block_absorb: ManuallyDrop::new(FileReqBlockAbsorb { blk_idx, block }), },
         };
         Self { req: Some(req), resp: Some(FileResp::BlockAbsorb) }
+    }
+
+    pub fn new_read_many(indices: Vec<BlockIndex>, action: BatchBlockAction, gate: BlockActionGate,
+        fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespReadMany>) {
+        let (tx, rx) = oneshot::channel::<FileRespReadMany>();
+        let req = FileReq {
+            op: FileReqOp::ReadMany,
+            body: FileReqBody { read_many: ManuallyDrop::new(FileReqReadMany {
+                indices, action, gate, fetched: Vec::new(), fh }), },
+        };
+        let resp = FileResp::ReadMany(tx);
+        (Self { req: Some(req), resp: Some(resp) }, rx)
+    }
+
+    /// Hand a read-many back after its fetch, for the hop that runs the
+    /// closure.
+    pub fn read_many_done(req: FileReqReadMany<'a>, resp: FileResp) -> Self {
+        let new_req = FileReq {
+            op: FileReqOp::ReadManyDone,
+            body: FileReqBody { read_many: ManuallyDrop::new(req), },
+        };
+        Self { req: Some(new_req), resp: Some(resp) }
     }
 
     pub fn new_with_blocks(indices: Vec<BlockIndex>, action: BatchBlockAction, gate: BlockActionGate) -> (Self, oneshot::Receiver<FileRespWithBlocks>) {
@@ -1363,6 +1410,52 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let md = unsafe { req.body.block_absorb };
                 let r = ManuallyDrop::into_inner(md);
                 self.inner.absorb_block(r.blk_idx, r.block);
+            },
+            FileReqOp::ReadMany => {
+                let md = unsafe { req.body.read_many };
+                let r = ManuallyDrop::into_inner(md);
+                let _resp_rm = resp.to_read_many();
+                let resp = FileResp::ReadMany(_resp_rm);
+                if let Err(e) = self.inner.spawn_read_many(r, resp).await {
+                    log::warn!("read many failed to start: {:?}", e);
+                }
+            },
+            FileReqOp::ReadManyDone => {
+                let md = unsafe { req.body.read_many };
+                let mut r = ManuallyDrop::into_inner(md);
+                // Everything needed is in hand: the cache for what was
+                // resident, `fetched` for what was not. Nothing here awaits.
+                let mut served = 0usize;
+                {
+                    let closed = *r.gate.lock().unwrap();
+                    if !closed {
+                        let mut fetched = Vec::new();
+                        fetched.append(&mut r.fetched);
+                        for blk_idx in r.indices.clone() {
+                            if let Some(pos) = fetched.iter().position(|(i, _)| *i == blk_idx) {
+                                (r.action)(blk_idx, Some(fetched[pos].1.as_slice()));
+                                served += 1;
+                                continue;
+                            }
+                            match self.inner.cached_block(blk_idx) {
+                                Some(block) => {
+                                    (r.action)(blk_idx, Some(block.as_slice()));
+                                    block.unlock();
+                                    served += 1;
+                                },
+                                None => (r.action)(blk_idx, None),
+                            }
+                        }
+                        // Keep what was fetched, so a later read of the same
+                        // block does not fetch it again. Same staleness rule
+                        // as a read-ahead applies to what is kept, not to
+                        // what the closure was already given.
+                        for (blk_idx, block) in fetched {
+                            self.inner.absorb_block(blk_idx, block);
+                        }
+                    }
+                }
+                let _ = resp.to_read_many().send(Ok(served));
             },
             FileReqOp::WithBlocks => {
                 let md = unsafe { req.body.with_blocks };
