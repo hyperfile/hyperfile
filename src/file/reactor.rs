@@ -293,6 +293,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // Same planning a read does: resident blocks are skipped, the rest
         // coalesced.
         let plan = self.plan_read(start, span).await?;
+        // Recorded after planning, so anything that changes the file from
+        // here on is seen as a change. See `State::mutation_gen`.
+        let plan_gen = self.state.mutation_gen();
 
         // Only ops that need staging are worth carrying over; a hole or a
         // cache hit has nothing to install.
@@ -316,6 +319,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let staging = self.staging.clone();
         let data_block_size = bs;
         let fh = req.fh.clone();
+        let gen_now = self.state.clone_mutation_gen_handle();
         #[cfg(feature = "wal")]
         let flushing_segments = self.flushing_segments.clone();
 
@@ -352,6 +356,17 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 // Nothing is installed. A read of the range still works, it
                 // just pays for its own fetch.
                 let _ = resp.to_read_ahead().send(Err(e));
+                return;
+            }
+
+            // Anything that changed the file since planning makes these
+            // bytes suspect: the block they belong to may have been
+            // truncated away, rewritten, or zeroed, and it may have left
+            // the cache in the process — so "install unless resident"
+            // cannot keep a stale copy out. Discard the whole fetch.
+            if gen_now.load(std::sync::atomic::Ordering::SeqCst) != plan_gen {
+                debug!("read ahead - file changed while fetching, discarding {} windows", work.len());
+                let _ = resp.to_read_ahead().send(Ok(0));
                 return;
             }
 
@@ -686,6 +701,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub(crate) async fn absorb_write_bh(&mut self, mut req: FileReqWrite<'a>, resp: FileResp) -> Result<usize> {
+        // What this write is about to change invalidates any read-ahead
+        // fetched against the old contents. See `State::mutation_gen`.
+        self.state.bump_mutation_gen();
         // A block this write needs could not be read. Applying the write
         // now would put its bytes into a block that was never filled and
         // mark it dirty, so the next flush would persist zeroes over
@@ -870,6 +888,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub(crate) async fn absorb_write_zero_bh(&mut self, mut req: FileReqWriteZero<'a>, resp: FileResp) -> Result<usize> {
+        // What this write is about to change invalidates any read-ahead
+        // fetched against the old contents. See `State::mutation_gen`.
+        self.state.bump_mutation_gen();
         // A block this write needs could not be read. Applying the write
         // now would put its bytes into a block that was never filled and
         // mark it dirty, so the next flush would persist zeroes over

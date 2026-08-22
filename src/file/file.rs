@@ -1790,6 +1790,11 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn truncate_locked(&mut self, new_size: usize, permit: OwnedSemaphorePermit) -> Result<()> {
+        // A truncate drops cached blocks above the new size, which is what
+        // makes an in-flight read-ahead's copies stale. See
+        // `State::mutation_gen`.
+        #[cfg(feature = "reactor")]
+        self.state.bump_mutation_gen();
         // POSIX ftruncate: "If fildes is not a valid file descriptor
         // open for writing, the ftruncate() function shall fail."
         // The spec allows EBADF or EINVAL here; we use EBADF to match

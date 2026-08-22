@@ -786,3 +786,68 @@ async fn reactor_read_ahead_warms_the_cache() {
     let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
+
+/// A read-ahead whose fetch is still in flight when the file changes must
+/// not install what it fetched.
+///
+/// The fetch is planned against the bmap as it was, and the blocks are
+/// installed later. In between, the file can change and the block can leave
+/// the cache — a truncate drops every cached entry above the new size — so
+/// "install unless the block is already resident" does not keep a stale
+/// copy out. Replaying a consumer's fsx log showed that window opening 29
+/// times and installing a stale block 3 times.
+///
+/// The whole fetch is now discarded if anything changed the file since it
+/// planned. Read-ahead is speculative, so that costs a missed optimization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn reactor_read_ahead_discards_a_fetch_the_file_outran() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const BLK: usize = 4096;
+    const NB: usize = 64;
+    let full = NB * BLK;
+    let small = 16 * BLK;
+
+    let fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file()).await.unwrap();
+    {
+        let mut w = fh.clone();
+        w.fh_write(0, &vec![0xEEu8; full]).await.expect("seed");
+        w.fh_flush().await.expect("flush");
+    }
+
+    // Fire the read-ahead without waiting, so its fetch is in flight while
+    // the truncate below removes the blocks it is fetching.
+    {
+        let ra = fh.clone();
+        tokio::spawn(async move { let _ = ra.fh_read_ahead(0, full).await; });
+    }
+
+    let mut w = fh.clone();
+    w.fh_truncate(small).await.expect("shrink");
+    w.fh_truncate(full).await.expect("grow");
+
+    // Let anything in flight land before checking.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The grown region is a hole: it has to read as zeroes, not as the
+    // bytes that were there before the shrink.
+    let got = w.fh_read_owned(small, full - small).await.expect("read grown region");
+    if let Some(i) = got.iter().position(|&v| v != 0) {
+        panic!("byte {:#x} of the grown region is {:#x}, want 0 — a read-ahead \
+                fetched before the truncate was installed after it",
+            small + i, got[i]);
+    }
+
+    // And the surviving region still reads correctly.
+    let kept = w.fh_read_owned(0, small).await.expect("read kept region");
+    assert!(kept.iter().all(|&v| v == 0xEE), "the retained region should be unchanged");
+
+    let mut fh = fh;
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}
