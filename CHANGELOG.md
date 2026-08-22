@@ -9,6 +9,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.7] - 2026-08-22
+
+### Added
+
+- **`fh_read_many`** reads a list of block indices, fetching the ones that
+  are not cached, and calls a closure once per index. One crossing for the
+  whole list.
+
+  `fh_with_blocks` from 0.6.5 answers from the cache and reports the rest
+  absent, which leaves a caller that wants the blocks doing it in two steps
+  — warm a range, then visit it — where the second waits on the first, and
+  where a range has to be named although what the caller holds is a list. A
+  directory walk reads records scattered across an inode table.
+
+  Where the closure runs depends on whether anything has to be fetched:
+
+  - **Nothing missing** — it runs on the handler task, borrowing out of the
+    cache. No copies.
+  - **Something missing** — the fetch leaves the handler task and the
+    closure goes with it, running where the fetched bytes are. Blocks that
+    were resident are copied first, since a spawned task cannot borrow the
+    cache. About 0.4 µs a block, reached only when an object request is
+    already being waited on, so it never decides anything.
+
+  The second case also stops an expensive closure from stalling everything
+  else. The first does not, so a batch closure should stay cheap and carry
+  its work out rather than doing it inside.
+
+  What was fetched is kept, and queued to be cached before the answer, so a
+  caller that reads the same list again finds it there rather than
+  eventually.
+
+  A list with gaps raises a question the range-based paths never had to
+  answer: fetch the gaps, or split into one request per run? On an object
+  store a request costs far more than the bytes a gap spans, so runs are
+  merged while the gap stays under `read_get_max_bytes` and `plan_read`
+  decides how the merged range breaks up. Measured over 38 blocks scattered
+  every eighth across a cold file: one request per run took 32 ms, a single
+  merged request 28 ms, one block at a time 197 ms. Worth stating because
+  the request that prompted this assumed the opposite — that spanning gaps
+  would be the expensive part.
+
+  No direct-API equivalent: `fs_block` costs 0.02 µs, so a loop over it
+  already is what a batch would be.
+
+### Notes on when a batch helps
+
+A batch is not always cheaper, and the way it fails is not obvious. What
+these measurements established, over 300 cold blocks asked for as 100 lists
+of three — a listing's shape, where the kernel asks for a window at a time:
+
+| | time | object requests |
+|---|---|---|
+| one block at a time, dispatched concurrently | 488 ms | 300 |
+| `fh_read_many` per list | **445 ms** | **100** |
+
+Requests fall threefold; wall clock barely moves. Both follow from the same
+thing: a caller that dispatches concurrently has already overlapped the
+latency, so what remains for a batch to save is requests, not time. A
+consumer measured a 1.65× gain on cold blocks purely by dispatching
+concurrently instead of awaiting one at a time — see
+[docs/concurrency.md](docs/concurrency.md), where the cold row of the cost
+table is the larger of the two effects.
+
+And a batch that costs more crossings than the list has blocks loses. An
+earlier two-crossing version of `fh_read_many` did exactly that on lists of
+two or three, which is how the one-crossing shape above came about.
+
 ## [0.6.6] - 2026-08-22
 
 **Upgrade from 0.6.5 if you use read-ahead.** `fs_read_ahead` /
