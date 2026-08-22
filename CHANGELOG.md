@@ -9,7 +9,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.6] - 2026-08-22
+
+**Upgrade from 0.6.5 if you use read-ahead.** `fs_read_ahead` /
+`fh_read_ahead` as shipped in 0.6.5 could install a stale block and serve
+it to a later read. It is silent — no error, no panic, wrong bytes. Do not
+use 0.6.5's read-ahead.
+
+### Fixed
+
+- **A read-ahead whose fetch the file outran installed what it fetched.**
+  Read-ahead plans against the bmap as it is, fetches, and installs the
+  blocks afterwards. The only guard was `absorb_block`'s "drop it if the
+  block is already resident", which rests on an assumption that does not
+  hold: that a block which changed is still in the cache. `truncate` drops
+  every cached entry above the new size, so a block can be both changed
+  and absent — and then a copy fetched before the truncate is installed
+  after it.
+
+  Reported as silent bad data: fsx failed within a thousand operations,
+  deterministically at one offset, and an A/B on a single switch in one
+  binary put it on read-ahead. It was hard to see from this side because
+  fsx runs through a filesystem — the read it flagged was answered by the
+  kernel page cache and never reached hyperfile, so the read that actually
+  returned stale bytes was three operations earlier. Seven tests written
+  against the flagged read all passed.
+
+  Replaying the reporter's operation log directly, with no page cache in
+  the way and the read-ahead fired without waiting as a real one is, showed
+  the window opening 29 times and installing a stale block 3 times.
+
+  `State` now carries a mutation counter, bumped by everything that changes
+  what a block should contain. A read-ahead records it after planning and
+  the spawned fetch compares before handing anything back, discarding the
+  whole fetch if it moved. Replaying the same log then discards 9 fetches
+  and installs nothing stale. Coarse on purpose: any change invalidates
+  every read-ahead in flight, which costs a missed optimization rather than
+  correctness, and a counter cannot be wrong about blocks it does not know
+  about. The reporter has since verified this against their own fsx runs.
+
+- **Read-ahead no longer reports cache hits.** `plan_read` records every
+  block it finds resident in `cache_hits`, and read-ahead plans the same
+  way a read does, so warming an already-warm range reported hits by the
+  thousand. Over a 16 MiB pass the number came out at 37187 where 4096
+  block accesses were the most possible — inflated about ninefold, which
+  made the counter unable to answer the question it exists for.
+
+  A hit is a read this layer served; a read-ahead is not serving anybody.
+  The numbers are now usable rather than merely smaller, and they show
+  something the inflated ones hid: a 1 MiB read-ahead window has fewer hits
+  than a 4 MiB one and still reads faster, because the gain here comes from
+  overlapping the fetch rather than from the hit rate.
+
+### Tests
+
+- `replay_fsx_log` replays an `fsx -d` operation log against hyperfile,
+  checking every read against an in-memory model. Optional — with no log it
+  says where it looked and passes; `HYPERFILE_FSX_LOG` points it at one.
+
+  Worth having because running fsx through a filesystem puts the kernel
+  page cache between it and hyperfile, which is how the bug above hid.
+  Replaying the operations directly catches a bad read where it happens.
+  Reads are preceded by a read-ahead fired without waiting, which is the
+  shape that found it.
+
+### Notes on tuning read-ahead
+
+Not a change, but what the reporter and these measurements established,
+since the window size decides whether read-ahead helps at all:
+
+- The window is a **pipeline depth**, not a cache-capacity figure. A wide
+  read-ahead is one coalesced request, and none of it is available until
+  all of it arrives, so too large delays the first usable byte. Too small
+  coalesces badly and costs more requests than no read-ahead at all.
+- There is an optimum in between, and it moves with how fast the caller
+  consumes. Measured here at about 1 MiB reading in a tight loop; the
+  reporter measured 2 MiB through a filesystem, where each read costs a
+  round trip and the pipeline can be deeper.
+- Do not derive it from `data_cache_blocks`, and do not reuse the value
+  used to widen the kernel's own read-ahead. Setting the window equal to
+  the cache is a bad point specifically: warming the next window evicts the
+  one being read.
+
 ## [0.6.5] - 2026-08-22
+
+> **The read-ahead added here is defective — use 0.6.6.** It could install
+> a stale block and serve it to a later read, silently. See 0.6.6.
 
 Both additions came from one report about reads: bytes fetched ahead had
 nowhere to live, and block access cost a channel crossing each.
