@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.4] - 2026-08-22
+
+### Fixed
+
+- **`HyperFileMetaConfig::block_ptr_format` now decides the format a new
+  file uses.** It is presented as that setting, carried through the config
+  builder, serialized and printed — and `HyperFile::new` ignored it,
+  writing `BlockPtrFormat::MicroGroup` regardless. `Flat` was unreachable
+  however it was configured, and nothing noticed because `open` reads the
+  format back from the bmap's user data.
+
+  The default moves from `Flat` to `MicroGroup` along with it. That is the
+  necessary half: `MicroGroup` is what every file created so far actually
+  got, so making the setting authoritative while leaving the default at
+  `Flat` would silently switch new files to a different on-disk encoding.
+  Aligning the default keeps what callers get exactly as it was.
+
+  Note for anyone reading `HyperFileMetaConfig::default()`: the value of
+  `block_ptr_format` has changed, even though the format files receive has
+  not. The `Flat` path had never run end to end before, since nothing
+  could select it.
+
+### Added
+
+- **In-memory staging** — `staging::memory::MemoryStaging` keeps segments
+  and the inode in a map instead of an object store, so the core can be
+  tested with no bucket, no credentials and no network. Only where the
+  bytes land changes: everything below `Hyper` is generic over the staging
+  backend, so the segment format, the bmap, block pointers, the caches,
+  flush and reopen all behave as they do against a bucket. `open` parses
+  through the shared `SegmentSum::from_slice` and `build_block_map` derives
+  its geometry the same way the S3 path does, so neither can drift.
+
+  Meta nodes are served by `btree_ondisk`'s `MemoryBlockLoader`. A
+  `BlockPtr` is already a single encoded value, so it is used as the flat
+  map's key directly and nothing decodes it on the way back; the map is
+  filled in `done`, where the key each node needs is recoverable from the
+  segment header.
+
+  Not available under `blocking`, which turns on `btree-ondisk/rc` where
+  that loader holds an `Rc` and is not `Sync`.
+
+  What it does not cover, because it belongs to S3 rather than to
+  hyperfile: conditional writes and the OCC built on them, multipart
+  upload, and the error kinds a real service returns. It also does not
+  reach the reactor or the `fs_*` wrappers, which are bound to S3 staging
+  through `Hyper`.
+
+- `StagingType::Memory` and `StagingConfig::new_memory`.
+
+### Tests
+
+- New `functional_memory_staging`, eleven cases and the only suite that
+  needs nothing — no environment, no `--ignored`, about 0.1 s. Covers
+  round trips, several flushes across segments, an unaligned write
+  preserving the bytes around it, holes reading as zeroes, truncate both
+  ways, `write_zero`, a 600-block file whose bmap outgrows one meta node,
+  the read counters, `unlink`, storage isolation between handles, and a
+  full round trip on each block pointer format.
+
 ## [0.6.3] - 2026-08-21
 
 Read the first two entries before upgrading: both are silent data loss on
