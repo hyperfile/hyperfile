@@ -170,7 +170,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let meta_config = config.meta.clone();
 
         let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader, node_cache)?;
-        let bmap_ud = BMapUserData::new(BlockPtrFormat::MicroGroup);
+        let bmap_ud = BMapUserData::new(meta_config.block_ptr_format);
         bmap.set_userdata(bmap_ud.as_u32());
         bmap.set_cache_limit(config.runtime.node_cache_blocks);
 

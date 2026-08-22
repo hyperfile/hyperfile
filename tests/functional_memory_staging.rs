@@ -317,3 +317,54 @@ async fn separate_storage_does_not_leak_between_handles() {
     assert_eq!(staging_b.segment_count(), 0,
         "a separately constructed MemoryStaging must not see another's segments");
 }
+/// `HyperFileMetaConfig::block_ptr_format` decides the format a new file
+/// uses. It used to be ignored — `HyperFile::new` hardcoded `MicroGroup` —
+/// so this pins that the config is what is honoured, and that its default
+/// still names the format files were already getting.
+#[tokio::test]
+async fn block_ptr_format_comes_from_the_config() {
+    use hyperfile::meta_format::BlockPtrFormat;
+
+    let _ = env_logger::try_init();
+    assert_eq!(hyperfile::config::HyperFileMetaConfig::default().block_ptr_format,
+        BlockPtrFormat::MicroGroup,
+        "the default has to stay the format created files already used");
+
+    // Ask for Flat explicitly and check a round trip works on it, which it
+    // cannot if the setting is being ignored.
+    for fmt in [BlockPtrFormat::Flat, BlockPtrFormat::MicroGroup] {
+        let staging_config = StagingConfig::new_memory(&format!("fmt-{:?}", fmt));
+        let mut meta = hyperfile::config::HyperFileMetaConfig::default();
+        meta.block_ptr_format = fmt;
+        let config = HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_meta_config(&meta)
+            .build();
+        let staging = MemoryStaging::new(staging_config, HyperFileRuntimeConfig::default())
+            .with_block_ptr_format(fmt);
+
+        let mut file = MemFile::new(
+            staging.clone(), staging.to_block_loader(), NullNodeCache, config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+
+        // Enough blocks that reopening has to resolve pointers through the
+        // loader, which only works if both sides agree on the format.
+        for b in 0..300usize {
+            let _ = file.write(b * BLK, &vec![(b % 251) as u8; BLK]).await.expect("write");
+        }
+        let _ = file.flush().await.expect("flush");
+        drop(file);
+
+        let mut file = MemFile::open(
+            staging.clone(), staging.to_block_loader(), NullNodeCache, config,
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("reopen");
+        for b in (0..300usize).step_by(29) {
+            let got = read_at(&mut file, b * BLK, BLK).await;
+            assert!(got.iter().all(|&v| v == (b % 251) as u8),
+                "{:?}: block {} came back wrong", fmt, b);
+        }
+    }
+}

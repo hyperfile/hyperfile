@@ -17,7 +17,11 @@ const MIN_DATA_BLOCK_SIZE: usize = 4096;
 pub(crate) const DEFAULT_ROOT_SIZE: usize = MIN_ROOT_SIZE;
 const DEFAULT_META_BLOCK_SIZE: usize = MIN_META_BLOCK_SIZE;
 const DEFAULT_DATA_BLOCK_SIZE: usize = MIN_DATA_BLOCK_SIZE;
-const DEFAULT_BLOCK_PTR_FORMAT: BlockPtrFormat = BlockPtrFormat::Flat;
+// `MicroGroup`, because that is what every file created so far actually
+// got: `HyperFile::new` hardcoded it and ignored this config. Now that it
+// honours the config, the default has to name the same format or existing
+// callers would silently start writing a different one.
+const DEFAULT_BLOCK_PTR_FORMAT: BlockPtrFormat = BlockPtrFormat::MicroGroup;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct HyperFileMetaConfig {
