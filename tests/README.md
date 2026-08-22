@@ -12,6 +12,7 @@ tests/
 │   └── mod.rs                               ← direct-API fixtures, interceptors
 ├── common_reactor/
 │   └── mod.rs                               ← reactor spawner helper
+├── functional_memory_staging.rs             ← core on in-memory staging, no S3
 ├── integration_s3_smoke.rs                  ← happy-path create/write/read/truncate
 ├── integration_s3_rollback.rs               ← rollback (exposure + correctness)
 ├── integration_s3_contract.rs               ← flush contract (invariant) tests
@@ -153,6 +154,35 @@ cargo test --release --test integration_s3_concurrent <name> \
 ```
 
 ## Integration test suites
+
+### `functional_memory_staging`
+
+The only suite that needs nothing: no bucket, no credentials, no network,
+and not `--ignored`. It runs the core against
+[`staging::memory::MemoryStaging`](../src/staging/memory.rs), which keeps
+segments and the inode in a map instead of an object store.
+
+Everything below `Hyper` is generic over the staging backend, so the
+segment format, the bmap, block pointers, the caches, flush and reopen all
+run exactly as they do against a bucket — only where the bytes land
+changes. Covers round trips, several flushes across segments, an unaligned
+write preserving the bytes around it, holes reading as zeroes, truncate
+both ways, `write_zero`, a 600-block file whose bmap outgrows one meta
+node, the read counters, `unlink`, and that two separately constructed
+handles do not share storage.
+
+What it deliberately does not cover, because these belong to S3 rather
+than to hyperfile: conditional writes and the OCC built on them, multipart
+upload, and the error kinds a real service returns. Nor the reactor or the
+`fs_*` wrappers — `Hyper` is bound to S3 staging and takes a client in
+every constructor, so these tests drive `HyperFile` directly.
+
+```bash
+cargo test --test functional_memory_staging
+```
+
+Runs in about 0.1 s, under every feature combination including
+`--no-default-features --features blocking`.
 
 ### `integration_s3_smoke`
 

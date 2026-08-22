@@ -5,6 +5,8 @@ const DEFAULT_INODE_FILE_NAME: &str = "inode";
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub enum StagingType {
     S3,
+    /// In-process storage, for tests. See `staging::mem`.
+    Memory,
     #[default]
     Blank,
 }
@@ -92,6 +94,19 @@ impl StagingConfig {
             inode_loc_type: StagingInodeLocationType::WithinRootPath,
             root_uri: root_path_uri.to_string(),
             inode_file_uri: inode_file_uri,
+        }
+    }
+
+    /// Config for in-process staging. `name` only names the storage —
+    /// nothing resolves it — so tests can use whatever reads well.
+    pub fn new_memory(name: &str) -> Self {
+        let root_uri = name.strip_suffix('/').unwrap_or(name).to_string();
+        let inode_file_uri = format!("{}/{}", root_uri, DEFAULT_INODE_FILE_NAME);
+        Self {
+            typ: StagingType::Memory,
+            inode_loc_type: StagingInodeLocationType::WithinRootPath,
+            root_uri,
+            inode_file_uri,
         }
     }
 

@@ -58,5 +58,11 @@ pub trait Staging<L> {
 
 pub mod config;
 pub mod s3;
+/// In-memory staging for tests. Not available under `blocking`: it holds
+/// `btree_ondisk`'s `MemoryBlockLoader`, which is `Rc`-based when
+/// `btree-ondisk/rc` is on and so cannot satisfy this trait's `Send`
+/// futures.
+#[cfg(not(feature = "blocking"))]
+pub mod memory;
 #[cfg(feature="bench")]
 pub mod bench;
