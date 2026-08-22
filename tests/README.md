@@ -13,6 +13,7 @@ tests/
 ├── common_reactor/
 │   └── mod.rs                               ← reactor spawner helper
 ├── functional_memory_staging.rs             ← core on in-memory staging, no S3
+├── replay_fsx_log.rs                        ← replay an fsx log, model-checked (optional)
 ├── integration_s3_smoke.rs                  ← happy-path create/write/read/truncate
 ├── integration_s3_rollback.rs               ← rollback (exposure + correctness)
 ├── integration_s3_contract.rs               ← flush contract (invariant) tests
@@ -183,6 +184,35 @@ cargo test --test functional_memory_staging
 
 Runs in about 0.1 s, under every feature combination including
 `--no-default-features --features blocking`.
+
+### `replay_fsx_log`
+
+Replays an `fsx` operation log against hyperfile, checking every read
+against an in-memory model. Optional: with no log to replay it prints a
+message and passes.
+
+```bash
+# produce a log
+fsx -N 1000 -S 1 -P /tmp -d <mountpoint>/fsx.1000 > ops.txt
+# replay it
+HYPERFILE_FSX_LOG=ops.txt cargo test --release --test replay_fsx_log \
+    -- --ignored --test-threads=1 --nocapture
+```
+
+Worth having because running fsx through a filesystem puts the kernel page
+cache between it and hyperfile. A read the kernel answers itself never
+arrives, so a read that returns stale bytes can go unnoticed until a later
+read is served from the page cache — by which point the operation that
+caused it is several steps back. That is how the read-ahead stale-install
+bug hid: fsx flagged a read three operations after the one that went
+wrong, and tests written against the flagged read all passed. Replaying
+the same operations directly has no page cache in the way, so a bad read
+is caught where it happens.
+
+Reads are preceded by a read-ahead fired without waiting, the way a
+filesystem layer doing its own read-ahead would. That is what leaves a
+fetch in flight while later operations run, which is the shape that found
+the bug.
 
 ### `integration_s3_smoke`
 
