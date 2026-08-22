@@ -297,13 +297,42 @@ many blocks it holds.
 
 `fh_with_blocks` never reaches staging, so an index that is not cached is
 reported absent. `fh_read_many` takes the same shape of list and fetches
-those instead, in two crossings — one to ask, one to deliver — with the
-fetches off the handler task. Use the first to look at what is in hand, the
-second to read a list whatever its state.
+those instead. Use the first to look at what is in hand, the second to read
+a list whatever its state.
 
-Doing the second as two steps, `fh_read_ahead` then `fh_with_blocks`, is
-two round trips where the second waits on the first. It also has to name a
-range, and a list of blocks from a directory walk has gaps.
+Both cost one crossing. Where `fh_read_many` runs its closure depends on
+whether anything has to be fetched, because the two cases want opposite
+things:
+
+- **Nothing missing.** The closure runs on the handler task, borrowing
+  straight out of the cache, and the answer goes back from there. No copies.
+- **Something missing.** The fetch has to leave the handler task, so the
+  closure follows it and runs where the fetched bytes are. Blocks that
+  *were* resident are copied, since a spawned task cannot borrow the cache
+  — noise next to the object request being waited on.
+
+The second case also keeps an expensive closure from stalling everything
+else. The first does not: it still occupies the handler, so a batch closure
+should stay cheap and carry its work out rather than doing it inside.
+
+Doing this as two steps instead — `fh_read_ahead` then `fh_with_blocks` — is
+two round trips where the second waits on the first, and it has to name a
+range when a directory walk's list has gaps.
+
+Whether a batch beats reading blocks one at a time depends on the shape, and
+not always the way intuition suggests. Measured over 300 cold blocks asked
+for as 100 lists of 3 — a listing's shape, where the kernel asks for a
+window at a time:
+
+| | time | object requests |
+|---|---|---|
+| one block at a time, concurrently | 488 ms | 300 |
+| `fh_read_many` per list | **445 ms** | **100** |
+
+The wall-clock gain is small because a caller that dispatches concurrently
+has already overlapped the latency; what a batch saves there is requests.
+A batch that costs *more* crossings than the list has blocks loses, which an
+earlier two-crossing version of this did on exactly this shape.
 
 A list with gaps raises a question worth answering explicitly: fetch the
 gaps, or split into one request per run? On an object store the request

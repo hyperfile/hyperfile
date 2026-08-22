@@ -268,28 +268,41 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     /// Read a list of blocks, fetching the ones that are not cached.
     ///
-    /// One crossing to ask, one to deliver, whatever the list holds. The
-    /// fetches happen off the handler task and runs of consecutive indices
-    /// are coalesced, so a list that is mostly contiguous costs few object
-    /// requests, and separate runs are fetched concurrently.
+    /// One crossing, whatever the list holds. Where the closure runs
+    /// depends on whether anything has to be fetched, and the two cases
+    /// want opposite things:
     ///
-    /// This is `spawn_with_blocks` for a caller that wants the blocks
-    /// rather than only the ones already in hand. It exists because doing
-    /// it in two steps — warm the range, then visit it — is two round trips
-    /// where the second waits on the first, which measured slower on cold
-    /// blocks than fetching one block at a time.
-    pub async fn spawn_read_many(&mut self, mut req: FileReqReadMany<'a>, resp: FileResp) -> Result<()> {
+    /// - **Nothing missing.** The closure runs here, borrowing straight out
+    ///   of the cache. No copies, and the answer goes back from this arm.
+    /// - **Something missing.** The fetch has to leave the handler task, so
+    ///   the closure follows it and runs where the fetched bytes are. That
+    ///   costs a copy of each block that *was* resident, since a spawned
+    ///   task cannot borrow the cache — which is noise next to the object
+    ///   request being waited on anyway.
+    ///
+    /// Running the closure off the handler task in that second case is also
+    /// what keeps an expensive one from stalling everything else; in the
+    /// first case it still occupies the handler, so a batch closure should
+    /// stay cheap and carry its work out rather than doing it inside.
+    ///
+    /// Runs of indices are merged across a gap rather than split on one,
+    /// and separate runs are fetched concurrently. See `read_get_max_bytes`.
+    pub async fn spawn_read_many(&mut self, req: FileReqReadMany<'a>, resp: FileResp) -> Result<()> {
+        let FileReqReadMany { indices, mut action, gate, fh } = req;
         let bs = self.config.meta.data_block_size;
         let i_size = self.inode().size() as usize;
 
-        // Which of them are not in hand. Anything at or past EOF is not
-        // fetchable and is reported absent by the closure hop.
+        if *gate.lock().unwrap() {
+            // The caller is gone; its closure must not run.
+            let _ = resp.to_read_many().send(Ok(0));
+            return Ok(());
+        }
+
+        // Which are not in hand. Anything at or past EOF is not fetchable
+        // and is reported absent.
         let mut missing: Vec<BlockIndex> = Vec::new();
-        for blk_idx in req.indices.iter().copied() {
-            if (blk_idx as usize) * bs >= i_size {
-                continue;
-            }
-            if self.cache.has(&blk_idx) {
+        for blk_idx in indices.iter().copied() {
+            if (blk_idx as usize) * bs >= i_size || self.cache.has(&blk_idx) {
                 continue;
             }
             missing.push(blk_idx);
@@ -298,22 +311,42 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         missing.dedup();
 
         if missing.is_empty() {
-            // Everything is here already, so hand it straight to the hop
-            // that runs the closure.
-            let fh = req.fh.clone();
-            let ctx = FileContext::read_many_done(req, resp);
-            let _ = fh.send_cb(ctx);
+            // Everything is here, so borrow it and answer without leaving
+            // the arm.
+            let mut served = 0usize;
+            for blk_idx in indices.iter().copied() {
+                match self.cached_block(blk_idx) {
+                    Some(block) => {
+                        action(blk_idx, Some(block.as_slice()));
+                        block.unlock();
+                        served += 1;
+                    },
+                    None => action(blk_idx, None),
+                }
+            }
+            let _ = resp.to_read_many().send(Ok(served));
             return Ok(());
+        }
+
+        // Something has to be fetched, so the closure is going with it.
+        // Copy what is resident now, while the cache can still be borrowed.
+        let mut resident: Vec<(BlockIndex, Vec<u8>)> = Vec::new();
+        for blk_idx in indices.iter().copied() {
+            if missing.binary_search(&blk_idx).is_ok() {
+                continue;
+            }
+            if let Some(block) = self.cached_block(blk_idx) {
+                resident.push((blk_idx, block.as_slice().to_vec()));
+                block.unlock();
+            }
         }
 
         // Group into runs, joining across a gap rather than splitting on
         // one. A gap costs the bytes it spans; a split costs an object
-        // request. On an object store the request is much the more
-        // expensive of the two — 38 scattered blocks fetched one request
-        // each measured 32 ms against 29 ms for a single request spanning
-        // all of them, gaps included — so runs are merged while the gap is
-        // below what one request may cover, and `plan_read` then decides
-        // how the merged range actually breaks up.
+        // request, and on an object store the request is much the more
+        // expensive — 38 scattered blocks fetched one request each measured
+        // 32 ms against 28 ms for a single request spanning all of them.
+        // `plan_read` then decides how the merged range breaks up.
         let slack = self.config.runtime.read_get_max_bytes / bs;
         let mut runs: Vec<(BlockIndex, usize)> = Vec::new();
         for blk_idx in missing.iter().copied() {
@@ -327,7 +360,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             }
         }
 
-        // Plan each run on the handler task, the same walk a read does.
+        // Plan each run here, the same walk a read does.
         let mut work: Vec<(BlockIndex, usize, Vec<(SegmentId, usize, usize, usize)>)> = Vec::new();
         for (start_blk, nblk) in runs.iter().copied() {
             let start = start_blk as usize * bs;
@@ -351,11 +384,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let staging = self.staging.clone();
         #[cfg(feature = "wal")]
         let flushing_segments = self.flushing_segments.clone();
-        let fh = req.fh.clone();
 
         self.rt.as_ref().unwrap().spawn(async move {
-            // Runs go concurrently; within a run the ops are already
-            // coalesced.
+            // Runs go concurrently; within a run the ops are coalesced.
             let mut joins = Vec::new();
             for (start_blk, span, ops) in work {
                 let staging = staging.clone();
@@ -381,19 +412,28 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                                 continue;
                             }
                         }
-                        if let Err(e) = staging.load_range(segid, src_off, &mut buf[dst_off..dst_off + len]).await {
-                            return Err(e);
-                        }
+                        staging.load_range(segid, src_off, &mut buf[dst_off..dst_off + len]).await?;
                     }
-                    Ok((start_blk, buf))
+                    Ok::<_, Error>((start_blk, buf))
                 }));
             }
 
             let mut failed = None;
-            let mut filled: Vec<(BlockIndex, Vec<u8>)> = Vec::new();
+            let mut fetched: Vec<(BlockIndex, Vec<u8>)> = Vec::new();
             for j in joins {
                 match j.await {
-                    Ok(Ok(v)) => filled.push(v),
+                    Ok(Ok((start_blk, buf))) => {
+                        let mut pos = 0usize;
+                        let mut blk = start_blk;
+                        while pos < buf.len() {
+                            let take = bs.min(buf.len() - pos);
+                            let mut b = vec![0u8; bs];
+                            b[..take].copy_from_slice(&buf[pos..pos + take]);
+                            fetched.push((blk, b));
+                            pos += take;
+                            blk += 1;
+                        }
+                    },
                     Ok(Err(e)) => { warn!("read many load failed: {:?}", e); failed = Some(e); },
                     Err(e) => {
                         warn!("read many task failed: {:?}", e);
@@ -406,23 +446,38 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 return;
             }
 
-            // Cut the runs into blocks for the closure hop.
-            for (start_blk, buf) in filled {
-                let mut pos = 0usize;
-                let mut blk = start_blk;
-                while pos < buf.len() {
-                    let take = bs.min(buf.len() - pos);
-                    let block = DataBlock::new(blk, bs);
-                    block.set_should_cache();
-                    block.as_mut_slice()[..take].copy_from_slice(&buf[pos..pos + take]);
-                    req.fetched.push((blk, block));
-                    pos += take;
-                    blk += 1;
-                }
+            // The caller may have gone while the fetch was out.
+            if *gate.lock().unwrap() {
+                let _ = resp.to_read_many().send(Ok(0));
+                return;
             }
 
-            let ctx = FileContext::read_many_done(req, resp);
-            let _ = fh.send_cb(ctx);
+            let mut served = 0usize;
+            for blk_idx in indices.iter().copied() {
+                if let Some(p) = fetched.iter().position(|(i, _)| *i == blk_idx) {
+                    action(blk_idx, Some(&fetched[p].1));
+                    served += 1;
+                } else if let Some(p) = resident.iter().position(|(i, _)| *i == blk_idx) {
+                    action(blk_idx, Some(&resident[p].1));
+                    served += 1;
+                } else {
+                    action(blk_idx, None);
+                }
+            }
+            // Keep what was fetched, so a later read of the same block does
+            // not fetch it again. Queued before the answer on purpose: `cb`
+            // outranks `user`, so a request the caller makes on waking is
+            // handled after these, and finds the blocks. Queueing them
+            // afterwards would make "what was fetched is kept" true only
+            // eventually, which is not what a caller can build on.
+            for (blk_idx, bytes) in fetched {
+                let block = DataBlock::new(blk_idx, bs);
+                block.set_should_cache();
+                block.as_mut_slice().copy_from_slice(&bytes);
+                let _ = fh.send_cb(FileContext::block_absorb(blk_idx, block));
+            }
+
+            let _ = resp.to_read_many().send(Ok(served));
         });
 
         Ok(())

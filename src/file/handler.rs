@@ -519,10 +519,8 @@ pub struct FileReqReadMany<'a> {
     pub action: BatchBlockAction,
     /// Guards `action`, as for a single block. See [`BlockActionGate`].
     pub gate: BlockActionGate,
-    /// Blocks fetched for the indices that were not cached, filled in by
-    /// the spawned fetch before it hands the request back.
-    pub fetched: Vec<(BlockIndex, DataBlock)>,
-    /// Needed to requeue for the second hop.
+    /// Needed so the spawned fetch can hand what it read back to be
+    /// cached.
     pub fh: ChannelGroup<FileContext<'a>>,
 }
 
@@ -625,7 +623,6 @@ pub enum FileReqOp {
     ReadAhead,
     WithBlocks,
     ReadMany,
-    ReadManyDone,
     BlockAbsorb,
     Flush,
     FlushData,
@@ -937,20 +934,10 @@ impl<'a> FileContext<'a> {
         let req = FileReq {
             op: FileReqOp::ReadMany,
             body: FileReqBody { read_many: ManuallyDrop::new(FileReqReadMany {
-                indices, action, gate, fetched: Vec::new(), fh }), },
+                indices, action, gate, fh }), },
         };
         let resp = FileResp::ReadMany(tx);
         (Self { req: Some(req), resp: Some(resp) }, rx)
-    }
-
-    /// Hand a read-many back after its fetch, for the hop that runs the
-    /// closure.
-    pub fn read_many_done(req: FileReqReadMany<'a>, resp: FileResp) -> Self {
-        let new_req = FileReq {
-            op: FileReqOp::ReadManyDone,
-            body: FileReqBody { read_many: ManuallyDrop::new(req), },
-        };
-        Self { req: Some(new_req), resp: Some(resp) }
     }
 
     pub fn new_with_blocks(indices: Vec<BlockIndex>, action: BatchBlockAction, gate: BlockActionGate) -> (Self, oneshot::Receiver<FileRespWithBlocks>) {
@@ -1419,43 +1406,6 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 if let Err(e) = self.inner.spawn_read_many(r, resp).await {
                     log::warn!("read many failed to start: {:?}", e);
                 }
-            },
-            FileReqOp::ReadManyDone => {
-                let md = unsafe { req.body.read_many };
-                let mut r = ManuallyDrop::into_inner(md);
-                // Everything needed is in hand: the cache for what was
-                // resident, `fetched` for what was not. Nothing here awaits.
-                let mut served = 0usize;
-                {
-                    let closed = *r.gate.lock().unwrap();
-                    if !closed {
-                        let mut fetched = Vec::new();
-                        fetched.append(&mut r.fetched);
-                        for blk_idx in r.indices.clone() {
-                            if let Some(pos) = fetched.iter().position(|(i, _)| *i == blk_idx) {
-                                (r.action)(blk_idx, Some(fetched[pos].1.as_slice()));
-                                served += 1;
-                                continue;
-                            }
-                            match self.inner.cached_block(blk_idx) {
-                                Some(block) => {
-                                    (r.action)(blk_idx, Some(block.as_slice()));
-                                    block.unlock();
-                                    served += 1;
-                                },
-                                None => (r.action)(blk_idx, None),
-                            }
-                        }
-                        // Keep what was fetched, so a later read of the same
-                        // block does not fetch it again. Same staleness rule
-                        // as a read-ahead applies to what is kept, not to
-                        // what the closure was already given.
-                        for (blk_idx, block) in fetched {
-                            self.inner.absorb_block(blk_idx, block);
-                        }
-                    }
-                }
-                let _ = resp.to_read_many().send(Ok(served));
             },
             FileReqOp::WithBlocks => {
                 let md = unsafe { req.body.with_blocks };
