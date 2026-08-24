@@ -98,6 +98,47 @@ impl FlushTiming {
     }
 }
 
+/// One entry of a read plan: what reading part of a range would cost.
+///
+/// See [`HyperFile::read_plan`](crate::file::file::HyperFile::read_plan).
+/// Entries account for the whole range asked about, in the order the
+/// requests would be made, so a range that needs nothing fetched still
+/// appears — as [`Self::Local`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedRead {
+    /// One object request, covering `[off, off + len)` of the file, served
+    /// from `len` bytes at `at` in segment `segid`.
+    ///
+    /// May cover many consecutive blocks: a request is extended while the
+    /// next block's location is adjacent in the same segment and the
+    /// request stays under `read_get_max_bytes`.
+    Get {
+        off: u64,
+        len: u64,
+        segid: crate::SegmentId,
+        at: u64,
+    },
+    /// `[off, off + len)` needs no object request: a hole, a block in the
+    /// data cache, or — with `wal` — a block in a segment still pinned in
+    /// memory.
+    Local { off: u64, len: u64 },
+}
+
+impl PlannedRead {
+    /// The file range this entry covers.
+    pub fn range(&self) -> (u64, u64) {
+        match self {
+            Self::Get { off, len, .. } => (*off, *len),
+            Self::Local { off, len } => (*off, *len),
+        }
+    }
+
+    /// Whether this entry is an object request.
+    pub fn is_get(&self) -> bool {
+        matches!(self, Self::Get { .. })
+    }
+}
+
 /// Read-side counters, the counterpart of [`FlushTiming`].
 ///
 /// The read path's cost is dominated by object-store round trips, and

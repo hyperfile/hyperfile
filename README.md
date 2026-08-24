@@ -54,6 +54,9 @@ Persistent data organized in Log-Structured style, which means, Hyperfile has th
 * Block-level API to borrow a cached block for reading or in-place
   modification, for callers that use hyperfile as block storage rather
   than as a file — see [Block API](docs/block-api.md).
+* Read-only queries for what reading a range would cost and where each
+  block sits, for callers deciding whether a file is worth rearranging
+  — see [Seeing where blocks are](docs/placement.md).
 * Support S3 and S3 Express One Zone as staging area.
 * Optional: WAL(Write-Ahead-Log) support to perserve durability of unflushed data.
 * Optional: data blocks cache and meta blocks cache on local disk to accelerate read path.

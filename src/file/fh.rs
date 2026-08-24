@@ -374,6 +374,61 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
+    /// What reading `[off, off + len)` would cost, without reading it.
+    ///
+    /// See [`HyperFile::read_plan`](crate::file::file::HyperFile::read_plan)
+    /// for what the entries mean and for the one thing worth watching: the
+    /// answer depends on the data cache, so a warm file looks cheap. Use
+    /// [`Self::fh_block_placement`] to judge a layout regardless of cache.
+    pub async fn fh_read_plan(&self, off: u64, len: u64) -> Result<Vec<crate::file::PlannedRead>>
+    {
+        let (ctx, rx) = FileContext::new_read_plan(vec![(off, len)]);
+        self.inner.send(ctx)?;
+        let mut many = rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))??;
+        Ok(many.pop().expect("one range asked about, one answer"))
+    }
+
+    /// [`Self::fh_read_plan`] for several ranges in one crossing, answered
+    /// in the order the ranges were given.
+    ///
+    /// Worth batching because the query is metadata-only: with no object
+    /// request to wait on, the crossing is most of the cost, so a tool
+    /// asking about thousands of files pays for the asking rather than for
+    /// the answers. A long batch does occupy the file for its whole walk.
+    pub async fn fh_read_plan_many(&self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<crate::file::PlannedRead>>>
+    {
+        let (ctx, rx) = FileContext::new_read_plan(ranges.to_vec());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// Where each of `n` blocks starting at `start` currently lives.
+    ///
+    /// See
+    /// [`HyperFile::block_placement`](crate::file::file::HyperFile::block_placement).
+    /// Does not consult the data cache, so it answers about placement alone.
+    pub async fn fh_block_placement(&self, start: BlockIndex, n: usize)
+        -> Result<Vec<Option<(crate::SegmentId, u64)>>>
+    {
+        let (ctx, rx) = FileContext::new_block_placement(vec![(start, n)]);
+        self.inner.send(ctx)?;
+        let mut many = rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))??;
+        Ok(many.pop().expect("one range asked about, one answer"))
+    }
+
+    /// [`Self::fh_block_placement`] for several block ranges in one
+    /// crossing, batched for the reason given on
+    /// [`Self::fh_read_plan_many`].
+    pub async fn fh_block_placement_many(&self, ranges: &[(BlockIndex, usize)])
+        -> Result<Vec<Vec<Option<(crate::SegmentId, u64)>>>>
+    {
+        let (ctx, rx) = FileContext::new_block_placement(ranges.to_vec());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
     pub async fn fh_dirty_block_count(&self) -> Result<usize>
     {
         let (ctx, rx) = FileContext::new_dirty_block_count();

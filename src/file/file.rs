@@ -37,7 +37,7 @@ use crate::data_cache::Cache;
 use super::block::{BlockRef, BlockMut, BlockState};
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
-use super::{HyperTrait, DirtyDataBlocks, FlushTiming};
+use super::{HyperTrait, DirtyDataBlocks, FlushTiming, PlannedRead};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
 use super::state::State;
@@ -755,6 +755,138 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// blocks, and in-flight WAL blocks each break the run and
     /// produce their own per-block op.
     /// Plan a read, counting the blocks it finds resident.
+    /// What reading `[off, off + len)` would cost, without reading it.
+    ///
+    /// One entry per object request, in the order they would be made, plus
+    /// an entry for every part of the range that needs no request, so the
+    /// entries account for the whole range. See [`PlannedRead`].
+    ///
+    /// This is the planner the read path itself uses, which is the point of
+    /// exposing it: a caller working the merging rule out from raw
+    /// placement would be writing a second implementation of it, and a
+    /// second implementation can disagree with the first without saying so.
+    ///
+    /// **The answer depends on the data cache, not only on placement.** A
+    /// resident block needs no request and is reported as
+    /// [`PlannedRead::Local`], so this says what a read *now* would cost —
+    /// which is the question, but it means a warm file looks cheap. To
+    /// judge a layout, ask on a cold handle, or use
+    /// [`Self::block_placement`], which does not consult the cache.
+    ///
+    /// Metadata only: no data request is issued. Index nodes the walk has
+    /// to fetch are counted in `meta_gets`, so a measurement using this can
+    /// subtract what asking cost from what it is measuring.
+    pub async fn read_plan(&mut self, off: u64, len: u64) -> Result<Vec<PlannedRead>> {
+        let plan = self.plan_read_with(off as usize, len as usize, false).await?;
+        let mut out: Vec<PlannedRead> = Vec::with_capacity(plan.len());
+        let mut at_file = off;
+        for op in plan {
+            let dst_len = op.dst_len() as u64;
+            match op {
+                ReadOp::Cache { .. } | ReadOp::Zero { .. } => {
+                    // Merge with the previous local run: whether two
+                    // adjacent stretches need no request for the same
+                    // reason is not something a caller asked about.
+                    match out.last_mut() {
+                        Some(PlannedRead::Local { len, .. }) => *len += dst_len,
+                        _ => out.push(PlannedRead::Local { off: at_file, len: dst_len }),
+                    }
+                },
+                #[cfg(feature = "wal")]
+                ReadOp::Inmem { .. } => match out.last_mut() {
+                    Some(PlannedRead::Local { len, .. }) => *len += dst_len,
+                    _ => out.push(PlannedRead::Local { off: at_file, len: dst_len }),
+                },
+                ReadOp::Range { segid, s3_off, .. } => out.push(PlannedRead::Get {
+                    off: at_file,
+                    len: dst_len,
+                    segid,
+                    at: s3_off as u64,
+                }),
+            }
+            at_file += dst_len;
+        }
+        Ok(out)
+    }
+
+    /// [`Self::read_plan`] for several ranges in one go, answered in the
+    /// order the ranges were given.
+    ///
+    /// Worth batching because these queries are metadata-only: with no
+    /// object request to wait on, reaching the file at all is most of the
+    /// cost, so a tool asking about thousands of files pays for the asking.
+    /// The other side of that is a long batch occupies the file for its
+    /// whole walk — this is for a tool, not for a latency-sensitive path.
+    pub async fn read_plan_many(&mut self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<PlannedRead>>> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for (off, len) in ranges.iter().copied() {
+            out.push(self.read_plan(off, len).await?);
+        }
+        Ok(out)
+    }
+
+    /// Where each of `n` blocks starting at `start` currently lives.
+    ///
+    /// `None` for a block that is in no segment: a hole, or one written and
+    /// not yet flushed. The offset is where in the segment the block
+    /// starts.
+    ///
+    /// Unlike [`Self::read_plan`] this does not consult the data cache, so
+    /// it answers about placement alone and a warm file does not look
+    /// different from a cold one. It says nothing about what a read would
+    /// cost — that is the plan's job — but it says what a cost is made of,
+    /// in terms a caller can aggregate: how many distinct segments a file
+    /// touches, whether its blocks are in file order within them, how far
+    /// apart they are.
+    ///
+    /// The segment id is meaningful only for equality and ordering.
+    pub async fn block_placement(&mut self, start: BlockIndex, n: usize)
+        -> Result<Vec<Option<(SegmentId, u64)>>>
+    {
+        let bs = self.config.meta.data_block_size;
+        let mut out = Vec::with_capacity(n);
+        for blk_idx in start..start + n as BlockIndex {
+            let blk_ptr = match self.bmap.lookup(&blk_idx).await {
+                Ok(p) => p,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    out.push(None);
+                    continue;
+                },
+                Err(e) => {
+                    warn!("block placement - lookup bmap for block index {blk_idx} error: {:?}", e);
+                    return Err(e);
+                },
+            };
+            // Same order of tests as the planner, so the two cannot
+            // disagree about what a pointer means.
+            if BlockPtrFormat::is_zero_block(&blk_ptr) {
+                out.push(None);
+            } else if BlockPtrFormat::is_on_staging(&blk_ptr) {
+                let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
+                out.push(Some((segid, staging_off as u64)));
+            } else {
+                // A dummy pointer: dirty and not yet flushed, so it has no
+                // place on staging to report.
+                let _ = bs;
+                out.push(None);
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Self::block_placement`] for several block ranges in one go,
+    /// answered in the order the ranges were given. Batched for the reason
+    /// given on [`Self::read_plan_many`].
+    pub async fn block_placement_many(&mut self, ranges: &[(BlockIndex, usize)])
+        -> Result<Vec<Vec<Option<(SegmentId, u64)>>>>
+    {
+        let mut out = Vec::with_capacity(ranges.len());
+        for (start, n) in ranges.iter().copied() {
+            out.push(self.block_placement(start, n).await?);
+        }
+        Ok(out)
+    }
+
     pub(crate) async fn plan_read(&mut self, off: usize, buf_len: usize) -> Result<Vec<ReadOp>> {
         self.plan_read_with(off, buf_len, true).await
     }

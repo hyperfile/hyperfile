@@ -123,6 +123,8 @@ pub type FileRespTiming = Result<TimingValue>;
 pub type FileRespDirtyBlockCount = Result<usize>;
 /// How many blocks a read-ahead installed.
 pub type FileRespReadAhead = Result<usize>;
+pub type FileRespReadPlan = Result<Vec<Vec<crate::file::PlannedRead>>>;
+pub type FileRespBlockPlacement = Result<Vec<Vec<Option<(crate::SegmentId, u64)>>>>;
 /// How many of the requested blocks were resident.
 pub type FileRespWithBlocks = Result<usize>;
 /// How many of the requested blocks the closure was given bytes for.
@@ -159,6 +161,8 @@ pub enum FileResp {
     Timing(oneshot::Sender<FileRespTiming>),
     DirtyBlockCount(oneshot::Sender<FileRespDirtyBlockCount>),
     ReadAhead(oneshot::Sender<FileRespReadAhead>),
+    ReadPlan(oneshot::Sender<FileRespReadPlan>),
+    BlockPlacement(oneshot::Sender<FileRespBlockPlacement>),
     WithBlocks(oneshot::Sender<FileRespWithBlocks>),
     ReadMany(oneshot::Sender<FileRespReadMany>),
     /// No response: the requester was answered before requeuing.
@@ -255,6 +259,20 @@ impl FileResp {
         match self {
             Self::WithBlocks(tx) => tx,
             _ => panic!("FileResp::to_with_blocks called on wrong variant"),
+        }
+    }
+
+    pub fn to_read_plan(self) -> oneshot::Sender<FileRespReadPlan> {
+        match self {
+            Self::ReadPlan(tx) => tx,
+            _ => panic!("FileResp::to_read_plan called on wrong variant"),
+        }
+    }
+
+    pub fn to_block_placement(self) -> oneshot::Sender<FileRespBlockPlacement> {
+        match self {
+            Self::BlockPlacement(tx) => tx,
+            _ => panic!("FileResp::to_block_placement called on wrong variant"),
         }
     }
 
@@ -524,6 +542,19 @@ pub struct FileReqReadMany<'a> {
     pub fh: ChannelGroup<FileContext<'a>>,
 }
 
+/// Ranges to answer a read-plan query about.
+///
+/// Batch-shaped even for one range, so the single-range and many-range
+/// entry points cannot drift apart.
+pub struct FileReqReadPlan {
+    pub ranges: Vec<(u64, u64)>,
+}
+
+/// Block ranges to answer a placement query about.
+pub struct FileReqBlockPlacement {
+    pub ranges: Vec<(BlockIndex, usize)>,
+}
+
 pub struct FileReqReadAhead<'a> {
     pub offset: usize,
     pub len: usize,
@@ -621,6 +652,8 @@ pub enum FileReqOp {
     Timing,
     DirtyBlockCount,
     ReadAhead,
+    ReadPlan,
+    BlockPlacement,
     WithBlocks,
     ReadMany,
     BlockAbsorb,
@@ -654,6 +687,8 @@ pub union FileReqBody<'a> {
     timing: ManuallyDrop<FileReqTiming>,
     dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
     read_ahead: ManuallyDrop<FileReqReadAhead<'a>>,
+    read_plan: ManuallyDrop<FileReqReadPlan>,
+    block_placement: ManuallyDrop<FileReqBlockPlacement>,
     with_blocks: ManuallyDrop<FileReqWithBlocks>,
     read_many: ManuallyDrop<FileReqReadMany<'a>>,
     block_absorb: ManuallyDrop<FileReqBlockAbsorb>,
@@ -957,6 +992,26 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { read_ahead: ManuallyDrop::new(FileReqReadAhead { offset, len, fh }), },
         };
         let resp = FileResp::ReadAhead(tx);
+        (Self { req: Some(req), resp: Some(resp) }, rx)
+    }
+
+    pub fn new_read_plan(ranges: Vec<(u64, u64)>) -> (Self, oneshot::Receiver<FileRespReadPlan>) {
+        let (tx, rx) = oneshot::channel::<FileRespReadPlan>();
+        let req = FileReq {
+            op: FileReqOp::ReadPlan,
+            body: FileReqBody { read_plan: ManuallyDrop::new(FileReqReadPlan { ranges }), },
+        };
+        let resp = FileResp::ReadPlan(tx);
+        (Self { req: Some(req), resp: Some(resp) }, rx)
+    }
+
+    pub fn new_block_placement(ranges: Vec<(BlockIndex, usize)>) -> (Self, oneshot::Receiver<FileRespBlockPlacement>) {
+        let (tx, rx) = oneshot::channel::<FileRespBlockPlacement>();
+        let req = FileReq {
+            op: FileReqOp::BlockPlacement,
+            body: FileReqBody { block_placement: ManuallyDrop::new(FileReqBlockPlacement { ranges }), },
+        };
+        let resp = FileResp::BlockPlacement(tx);
         (Self { req: Some(req), resp: Some(resp) }, rx)
     }
 
@@ -1432,6 +1487,21 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     }
                 }
                 let _ = resp.to_with_blocks().send(Ok(resident));
+            },
+            FileReqOp::ReadPlan => {
+                let md = unsafe { req.body.read_plan };
+                let r = ManuallyDrop::into_inner(md);
+                // Metadata only, so it is answered from here rather than
+                // spawned: the walk needs the map, which does not leave
+                // this task.
+                let res = self.inner.read_plan_many(&r.ranges).await;
+                let _ = resp.to_read_plan().send(res);
+            },
+            FileReqOp::BlockPlacement => {
+                let md = unsafe { req.body.block_placement };
+                let r = ManuallyDrop::into_inner(md);
+                let res = self.inner.block_placement_many(&r.ranges).await;
+                let _ = resp.to_block_placement().send(res);
             },
             FileReqOp::ReadAhead => {
                 let md = unsafe { req.body.read_ahead };

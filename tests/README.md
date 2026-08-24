@@ -24,6 +24,7 @@ tests/
 ├── integration_s3_read_timing.rs            ← read-side counters (`read_timing`)
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
 ├── integration_reactor_s3_block_api.rs      ← reactor block access (`fh_with_block*`)
+├── integration_reactor_s3_placement.rs      ← where blocks are (`fh_read_plan`)
 ├── integration_reactor_s3_contention.rs     ← reactor under concurrent use (no stalls)
 ├── integration_reactor_s3_range_lock.rs     ← reactor + range-lock
 ├── integration_reactor_s3_wal.rs            ← reactor + wal
@@ -368,6 +369,25 @@ tokio `AsyncRead`/`AsyncWrite`/`AsyncSeek` surface.
 Feature requirement: `reactor` (default).
 
 Runs in ~1 s.
+
+### `integration_reactor_s3_placement`
+
+The read-only placement queries, `fh_read_plan` and `fh_block_placement` with
+their batch forms — see [docs/placement.md](../docs/placement.md).
+
+`plan_agrees_with_what_the_read_does` carries the weight: the plan is worth
+exposing only because it *is* the planner, so its predicted request count is
+asserted against what a real read issues. The layouts are built to make the
+two easy to disagree about — alternating flushes so consecutive blocks land in
+different segments, and a run longer than `read_get_max_bytes`, which is the
+only way two consecutive requests share a segment.
+
+Verified by injecting three ways a hand-rolled cost model would go wrong —
+merging across segments, merging across the request-size cap, and reporting a
+dirty block as placed. Each fails the suite; the cap case fails only because
+that test exists.
+
+Runs in ~2 s, one 20 MiB write included.
 
 ### `integration_reactor_s3_block_api`
 
