@@ -9,6 +9,8 @@ use super::block::{BlockRef, BlockMut, BlockState};
 use super::hyper::Hyper;
 use super::flags::{HyperFileFlags, FileFlags};
 use super::mode::{HyperFileMode, FileMode};
+use crate::SegmentId;
+use super::PlannedRead;
 
 impl<'a: 'static> Hyper<'a> {
     pub async fn fs_create(client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
@@ -293,6 +295,62 @@ impl<'a: 'static> Hyper<'a> {
     {
         debug!("fs_block_mut - block index: {}, create: {}", idx, create);
         self.inner.block_mut(idx, create).await
+    }
+
+    /// What reading `[off, off + len)` would cost, without reading it.
+    ///
+    /// See
+    /// [`HyperFile::read_plan`](crate::file::file::HyperFile::read_plan) for
+    /// what the entries mean, and
+    /// [Seeing where blocks are](https://github.com/daiyy/hyperfile/blob/main/docs/placement.md)
+    /// for when to use this rather than [`Self::fs_block_placement`]. The
+    /// short of it: this follows the data cache, so a warm file looks free.
+    ///
+    /// Metadata only. No data request is issued; index reads land in
+    /// `meta_gets`.
+    pub async fn fs_read_plan(&mut self, off: u64, len: u64) -> Result<Vec<PlannedRead>>
+    {
+        debug!("fs_read_plan - offset: {}, len: {}", off, len);
+        self.inner.read_plan(off, len).await
+    }
+
+    /// [`Self::fs_read_plan`] for several ranges, answered in the order the
+    /// ranges were given.
+    ///
+    /// On the direct API this saves only the repeated call, since there is no
+    /// channel to cross — unlike the handler surface, where batching is the
+    /// point. Provided so that code written against one surface reads the
+    /// same on the other.
+    pub async fn fs_read_plan_many(&mut self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<PlannedRead>>>
+    {
+        debug!("fs_read_plan_many - range count: {}", ranges.len());
+        self.inner.read_plan_many(ranges).await
+    }
+
+    /// Where each of `n` blocks starting at `start` currently lives:
+    /// which segment and where in it, or `None` for a hole or a block not
+    /// yet flushed.
+    ///
+    /// See
+    /// [`HyperFile::block_placement`](crate::file::file::HyperFile::block_placement).
+    /// Unlike [`Self::fs_read_plan`] this does not consult the data cache, so
+    /// it answers about placement alone — which is what to use when judging
+    /// whether a file is worth rearranging.
+    pub async fn fs_block_placement(&mut self, start: BlockIndex, n: usize)
+        -> Result<Vec<Option<(SegmentId, u64)>>>
+    {
+        debug!("fs_block_placement - start: {}, n: {}", start, n);
+        self.inner.block_placement(start, n).await
+    }
+
+    /// [`Self::fs_block_placement`] for several block ranges, answered in the
+    /// order the ranges were given. Batched for the reason given on
+    /// [`Self::fs_read_plan_many`].
+    pub async fn fs_block_placement_many(&mut self, ranges: &[(BlockIndex, usize)])
+        -> Result<Vec<Vec<Option<(SegmentId, u64)>>>>
+    {
+        debug!("fs_block_placement_many - range count: {}", ranges.len());
+        self.inner.block_placement_many(ranges).await
     }
 
     /// How block `idx` is mapped. See [`BlockState`].

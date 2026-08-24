@@ -358,6 +358,12 @@ writes costing nothing; and `read_timing_reset` zeroing every counter.
 
 Runs in ~2 s.
 
+`the_plan_agrees_with_a_direct_read` covers the placement queries on the
+direct surface (`fs_read_plan`, `fs_block_placement` and their batch forms).
+It lives here rather than with the reactor placement suite because it needs
+the same counters: the queries are worth something only while they agree with
+the read path, and the two surfaces reach it by different routes.
+
 ### `integration_reactor_s3_smoke`
 
 Reactor-mode smoke (`HyperFileHandler` and `HyperFileTokio`). Same

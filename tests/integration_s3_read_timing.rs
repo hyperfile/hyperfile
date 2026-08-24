@@ -384,3 +384,75 @@ async fn read_ahead_does_not_report_cache_hits() {
     let _ = h.fs_release().await;
     tf.cleanup(&client).await;
 }
+
+/// The direct API answers the placement queries too, and the plan it gives
+/// is what the direct read then costs.
+///
+/// The reactor surface has its own suite for these
+/// (`integration_reactor_s3_placement`); this is here because the queries
+/// are only worth anything while they agree with the read path, and the two
+/// surfaces reach it by different routes.
+#[tokio::test]
+#[ignore]
+async fn the_plan_agrees_with_a_direct_read() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const NB: usize = 48;
+
+    // Even blocks in one flush, odd in another, so consecutive blocks land in
+    // different segments and the read cannot merge across them.
+    {
+        let mut h = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        for b in (0..NB).filter(|b| b % 2 == 0) {
+            let _ = h.fs_write(b * BLK, &vec![(b % 251) as u8; BLK]).await.expect("write");
+        }
+        let _ = h.fs_flush().await.expect("flush");
+        for b in (0..NB).filter(|b| b % 2 == 1) {
+            let _ = h.fs_write(b * BLK, &vec![(b % 251) as u8; BLK]).await.expect("write");
+        }
+        let _ = h.fs_flush().await.expect("flush");
+        let _ = h.fs_release().await.expect("release");
+    }
+
+    let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await.expect("reopen");
+    h.read_timing_reset();
+
+    let plan = h.fs_read_plan(0, (NB * BLK) as u64).await.expect("fs_read_plan");
+    let bytes: u64 = plan.iter().map(|e| e.range().1).sum();
+    let gets = plan.iter().filter(|e| e.is_get()).count();
+    assert_eq!(bytes, (NB * BLK) as u64, "entries must account for the whole range");
+    assert!(gets > 1, "alternating segments cannot merge into one request, got {}", gets);
+    assert_eq!(h.read_timing().snapshot().data_gets, 0, "asking must issue no data request");
+
+    let mut buf = vec![0u8; NB * BLK];
+    let n = h.fs_read(0, &mut buf).await.expect("read");
+    assert_eq!(n, NB * BLK);
+    let t = h.read_timing().snapshot();
+    assert_eq!(t.data_gets as usize, gets,
+        "the plan predicted {} requests and the read issued {}", gets, t.data_gets);
+
+    // Placement explains that count: two flushes, two segments, alternating.
+    let places = h.fs_block_placement(0, NB).await.expect("fs_block_placement");
+    assert_eq!(places.len(), NB);
+    let segs: std::collections::BTreeSet<_> = places.iter()
+        .filter_map(|p| p.map(|(s, _)| s)).collect();
+    assert_eq!(segs.len(), 2, "two flushes, two segments, got {:?}", segs);
+
+    // And the batch forms agree with the single-range ones.
+    let ranges = [(0u64, (4 * BLK) as u64), ((10 * BLK) as u64, (3 * BLK) as u64)];
+    let batch = h.fs_read_plan_many(&ranges).await.expect("fs_read_plan_many");
+    assert_eq!(batch.len(), ranges.len());
+    for (i, (off, len)) in ranges.iter().copied().enumerate() {
+        assert_eq!(batch[i], h.fs_read_plan(off, len).await.expect("fs_read_plan"),
+            "range {} answered differently in a batch", i);
+    }
+    let b_batch = h.fs_block_placement_many(&[(0, 4), (10, 3)]).await.expect("fs_block_placement_many");
+    assert_eq!(b_batch.len(), 2);
+    assert_eq!(b_batch[0], h.fs_block_placement(0, 4).await.expect("fs_block_placement"));
+
+    let _ = h.fs_release().await.expect("release");
+    tf.cleanup(&client).await;
+}

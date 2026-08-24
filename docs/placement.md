@@ -12,13 +12,19 @@ issues a data request.
 | `read_plan(off, len)` | what reading this range would cost | **yes** |
 | `block_placement(start, n)` | where each block is | no |
 
-Batch forms take several ranges in one crossing: `read_plan_many`,
-`block_placement_many`. On the reactor surface all four are `fh_*`.
+Batch forms take several ranges at once: `read_plan_many`,
+`block_placement_many`.
+
+All four exist on both surfaces — `fs_*` on `Hyper`, `fh_*` on
+`HyperFileHandler` — and on the generic `HyperFile` under the bare names. The
+batch forms are the point on the handler, where they collapse a crossing per
+range into one; on the direct API they save only the repeated call, and are
+there so that code reads the same on either surface.
 
 ## The plan
 
 ```rust
-let plan = fh.fh_read_plan(0, len).await?;
+let plan = fh.fh_read_plan(0, len).await?;          // or h.fs_read_plan(..)
 let requests = plan.iter().filter(|e| e.is_get()).count();
 ```
 
@@ -50,6 +56,8 @@ handle, or use `block_placement`, which does not consult the cache.
 ```rust
 let places = fh.fh_block_placement(0, n).await?;   // Vec<Option<(SegmentId, u64)>>
 ```
+
+which is also `h.fs_block_placement(0, n)` on the direct API.
 
 `None` for a block in no segment: a hole, or one written and not yet flushed.
 The segment id is meaningful only for equality and ordering.
