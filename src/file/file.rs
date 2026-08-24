@@ -621,11 +621,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     if !copied {
                         // The flush landed, so the same bytes are on staging.
                         self.staging.load_range(segid, s3_off, &mut buf[consumed..consumed + dst_len]).await?;
+                        self.staging.read_timing().add_read_ahead_get(dst_len);
                     }
                     fetched.push((consumed, dst_len));
                 },
                 ReadOp::Range { segid, s3_off, dst_len: _ } => {
                     self.staging.load_range(segid, s3_off, &mut buf[consumed..consumed + dst_len]).await?;
+                    self.staging.read_timing().add_read_ahead_get(dst_len);
                     fetched.push((consumed, dst_len));
                 },
             }

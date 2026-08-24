@@ -259,6 +259,19 @@ the read that wants the bytes asks normally and finds them.
 use `fh_read_timing`, which returns an owned snapshot because a
 reference to the live counters cannot leave the reactor task.
 
+Read-ahead's own requests are counted twice over: in `data_gets` with
+everything else, and again in `read_ahead_gets`, which is a subset rather
+than a separate total. A read's own requests are therefore
+`data_gets - read_ahead_gets`, and the same holds for the byte counters.
+
+That subtraction is the only way to tell the two apart. The counter is
+incremented where the request is made, and staging sees a ranged load with
+nothing about its purpose — so a measurement that leaves read-ahead on
+cannot otherwise attribute what it cost, and turning read-ahead off measures
+a different system. A consumer comparing two files of identical layout found
+one costing twice the requests of the other, and could not establish whether
+they were measuring the layout or how much read-ahead each file attracted.
+
 Two configurations behave differently:
 
 * **Data cache disabled** (`data_cache_blocks = 0`, which `O_DIRECT`

@@ -456,3 +456,88 @@ async fn the_plan_agrees_with_a_direct_read() {
     let _ = h.fs_release().await.expect("release");
     tf.cleanup(&client).await;
 }
+
+/// Read-ahead's requests are attributable, so a read's own cost can be had
+/// by subtraction.
+///
+/// Without this the two are indistinguishable — the counter is incremented
+/// where the request is made, and staging cannot see who asked. A consumer
+/// comparing two identically-laid-out files found one costing twice the
+/// requests of the other and could not tell whether they were measuring the
+/// layout or how much read-ahead each file attracted.
+#[tokio::test]
+#[ignore]
+async fn read_ahead_requests_are_attributable() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const NB: usize = 64;
+
+    seed(&client, tf.uri(), NB).await;
+
+    // A plain cold read attributes nothing to read-ahead.
+    {
+        let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await.expect("reopen");
+        h.read_timing_reset();
+        let mut buf = vec![0u8; NB * BLK];
+        let _ = h.fs_read(0, &mut buf).await.expect("read");
+        let t = h.read_timing().snapshot();
+        assert!(t.data_gets >= 1, "a cold read must fetch");
+        assert_eq!(t.read_ahead_gets, 0, "no read-ahead was asked for");
+        assert_eq!(t.read_ahead_bytes, 0);
+        let _ = h.fs_release().await.expect("release");
+    }
+
+    // Warming attributes everything to read-ahead, and the read that follows
+    // adds nothing because it is served from the cache.
+    {
+        let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await.expect("reopen");
+        h.read_timing_reset();
+
+        let _ = h.fs_read_ahead(0, NB * BLK).await.expect("read ahead");
+        let warm = h.read_timing().snapshot();
+        assert!(warm.data_gets >= 1, "warming must fetch");
+        assert_eq!(warm.read_ahead_gets, warm.data_gets,
+            "every request so far was read-ahead's: {} of {}", warm.read_ahead_gets, warm.data_gets);
+        assert_eq!(warm.read_ahead_bytes, warm.data_bytes);
+
+        let mut buf = vec![0u8; NB * BLK];
+        let _ = h.fs_read(0, &mut buf).await.expect("read");
+        let after = h.read_timing().snapshot();
+        assert_eq!(after.data_gets, warm.data_gets, "the read was served from the cache");
+        assert_eq!(
+            after.data_gets - after.read_ahead_gets, 0,
+            "so the read's own requests subtract to nothing",
+        );
+        let _ = h.fs_release().await.expect("release");
+    }
+
+    // Mixed: warm one half, read the other. Subtraction separates them.
+    {
+        let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await.expect("reopen");
+        h.read_timing_reset();
+
+        let half = NB / 2 * BLK;
+        let _ = h.fs_read_ahead(0, half).await.expect("read ahead");
+        let ra = h.read_timing().snapshot().read_ahead_gets;
+        assert!(ra >= 1);
+
+        let mut buf = vec![0u8; half];
+        let _ = h.fs_read(half, &mut buf).await.expect("read the cold half");
+
+        let t = h.read_timing().snapshot();
+        assert_eq!(t.read_ahead_gets, ra, "reading must not add to read-ahead's count");
+        assert!(t.data_gets > ra, "the cold half had to be fetched");
+        assert_eq!(t.data_gets - t.read_ahead_gets, t.data_gets - ra,
+            "the read's own requests are what is left over");
+        assert!(t.read_ahead_bytes < t.data_bytes, "and the same holds for bytes");
+
+        // Both subsets, never larger than the total they are part of.
+        assert!(t.read_ahead_gets <= t.data_gets);
+        assert!(t.read_ahead_bytes <= t.data_bytes);
+
+        let _ = h.fs_release().await.expect("release");
+    }
+
+    tf.cleanup(&client).await;
+}

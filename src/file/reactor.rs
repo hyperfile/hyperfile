@@ -562,10 +562,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         continue;
                     }
                 }
-                if let Err(e) = staging.load_range(segid, src_off, &mut buf[dst_off..dst_off + len]).await {
-                    warn!("read ahead load failed: {:?}", e);
-                    failed = Some(e);
-                    break;
+                match staging.load_range(segid, src_off, &mut buf[dst_off..dst_off + len]).await {
+                    Ok(_) => staging.read_timing().add_read_ahead_get(len),
+                    Err(e) => {
+                        warn!("read ahead load failed: {:?}", e);
+                        failed = Some(e);
+                        break;
+                    },
                 }
             }
 

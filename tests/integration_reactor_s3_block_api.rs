@@ -1186,3 +1186,45 @@ async fn reactor_read_many_fetches_a_sparse_list() {
     let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
+
+/// The handler's read-ahead attributes its requests too, so the separation
+/// holds on both surfaces. See `read_ahead_requests_are_attributable` in
+/// `integration_s3_read_timing` for why it is needed.
+#[tokio::test]
+#[ignore]
+async fn fh_read_ahead_requests_are_attributable() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+    const NB: usize = 64;
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("fh create");
+        let _ = fh.fh_write(0, &vec![0x3Cu8; NB * BLK]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await;
+    }
+
+    let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly())
+        .await.expect("fh open");
+    let _ = fh.fh_read_timing_reset().await;
+
+    let _ = fh.fh_read_ahead(0, NB * BLK).await.expect("read ahead");
+    let warm = fh.fh_read_timing().await.expect("timing");
+    assert!(warm.data_gets >= 1, "warming must fetch");
+    assert_eq!(warm.read_ahead_gets, warm.data_gets,
+        "every request so far was read-ahead's: {} of {}", warm.read_ahead_gets, warm.data_gets);
+    assert_eq!(warm.read_ahead_bytes, warm.data_bytes);
+
+    let mut buf = vec![0u8; NB * BLK];
+    let _ = fh.fh_read(0, &mut buf).await.expect("read");
+    let after = fh.fh_read_timing().await.expect("timing");
+    assert_eq!(after.data_gets - after.read_ahead_gets, 0,
+        "the read was served from the cache, so its own requests subtract to nothing");
+
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}

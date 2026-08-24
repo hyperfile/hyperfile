@@ -166,6 +166,23 @@ pub struct ReadTiming {
     /// Bytes returned by those requests, including any read past what
     /// the caller asked for as a result of coalescing.
     pub data_bytes: AtomicU64,
+    /// Of `data_gets`, those issued by read-ahead rather than by a read.
+    ///
+    /// A subset, not a separate total: a read-ahead's request is counted in
+    /// `data_gets` as well, so a read's own requests are
+    /// `data_gets - read_ahead_gets`.
+    ///
+    /// Without this the two cannot be told apart, since the counter is
+    /// incremented where the request is made and staging does not know who
+    /// asked. A consumer comparing two files found one costing twice the
+    /// requests of the other with both laid out identically, and could not
+    /// establish whether they were measuring the layout or how much
+    /// read-ahead each file attracted — the alternative being to turn
+    /// read-ahead off, which measures a different system.
+    pub read_ahead_gets: AtomicU64,
+    /// Bytes returned by those requests. A subset of `data_bytes`, for the
+    /// same reason.
+    pub read_ahead_bytes: AtomicU64,
     /// Object requests issued to fetch meta (index) blocks.
     pub meta_gets: AtomicU64,
     /// Bytes returned by those requests.
@@ -193,6 +210,10 @@ pub struct ReadTiming {
 pub struct ReadTimingSnapshot {
     pub data_gets: u64,
     pub data_bytes: u64,
+    /// Of `data_gets` / `data_bytes`, what read-ahead issued. See
+    /// [`ReadTiming::read_ahead_gets`].
+    pub read_ahead_gets: u64,
+    pub read_ahead_bytes: u64,
     pub meta_gets: u64,
     pub meta_bytes: u64,
     pub inode_gets: u64,
@@ -219,6 +240,8 @@ impl ReadTiming {
         ReadTimingSnapshot {
             data_gets: self.data_gets.load(Ordering::Relaxed),
             data_bytes: self.data_bytes.load(Ordering::Relaxed),
+            read_ahead_gets: self.read_ahead_gets.load(Ordering::Relaxed),
+            read_ahead_bytes: self.read_ahead_bytes.load(Ordering::Relaxed),
             meta_gets: self.meta_gets.load(Ordering::Relaxed),
             meta_bytes: self.meta_bytes.load(Ordering::Relaxed),
             inode_gets: self.inode_gets.load(Ordering::Relaxed),
@@ -230,6 +253,8 @@ impl ReadTiming {
 
     pub fn reset(&self) {
         self.data_gets.store(0, Ordering::Relaxed);
+        self.read_ahead_gets.store(0, Ordering::Relaxed);
+        self.read_ahead_bytes.store(0, Ordering::Relaxed);
         self.data_bytes.store(0, Ordering::Relaxed);
         self.meta_gets.store(0, Ordering::Relaxed);
         self.meta_bytes.store(0, Ordering::Relaxed);
@@ -244,6 +269,18 @@ impl ReadTiming {
         self.data_gets.fetch_add(1, Ordering::Relaxed);
         self.data_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         self.staging_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    /// Attribute a request already counted in `data_gets` to read-ahead.
+    ///
+    /// Called by the read-ahead path itself rather than by staging, which
+    /// has no way to know: it sees a ranged load and nothing about its
+    /// purpose. Called once per successful load, so a fetch that failed
+    /// after staging counted it is not attributed here — the two counters
+    /// disagree by that request, which is the honest answer.
+    pub(crate) fn add_read_ahead_get(&self, bytes: usize) {
+        self.read_ahead_gets.fetch_add(1, Ordering::Relaxed);
+        self.read_ahead_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     #[inline]
