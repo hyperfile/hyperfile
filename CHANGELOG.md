@@ -9,6 +9,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.8] - 2026-08-24
+
+### Added
+
+- **Two read-only queries for where a file's blocks are**, and what reading
+  them would cost. See [docs/placement.md](docs/placement.md).
+
+  A read is served by one object request per stretch of blocks that adjoins
+  within a single segment, so where the blocks landed decides what reading
+  the file costs. Nothing exposed that. A consumer arrived with two files of
+  the same size and contents, both left in one or two extents of their own
+  address space by different routes, where reading one cost 259 object
+  requests and the other 128 — with no way to tell whether the expensive one
+  was spread over many segments, over few in a poor order, or something else
+  again. Everything they could observe was the same.
+
+  ```rust
+  let plan = fh.fh_read_plan(off, len).await?;      // what a read would cost
+  let places = fh.fh_block_placement(start, n).await?;   // where each block is
+  ```
+
+  `read_plan` returns one entry per object request, in the order they would
+  be made, plus an entry for every stretch that needs none, so the entries
+  account for the whole range. `block_placement` returns which segment each
+  block is in and where, `None` for a hole or a block not yet flushed. Batch
+  forms take several ranges at once. All four on `Hyper` as `fs_*`, on
+  `HyperFileHandler` as `fh_*`, and on `HyperFile` under the bare names.
+
+  The plan is the planner the read path uses, not a description of it. That
+  is the reason to expose it rather than leaving callers to work the merging
+  rule out from raw placement: a second implementation of the rule can
+  disagree with the first silently, and in the direction of reporting a
+  layout as fine when it is not. So the predicted request count is asserted
+  against what a real read issues, on layouts built to make the two easy to
+  disagree about.
+
+  **The plan follows the data cache.** A resident block needs no request, so
+  it is reported as local. That makes the answer what a read *now* would
+  cost, which is the question, but it means a warm file looks free. Judging a
+  layout wants a cold handle, or `block_placement`, which does not consult
+  the cache.
+
+  Metadata only: no data request is issued, which is asserted rather than
+  assumed, and index reads the walk needs land in the existing `meta_gets` so
+  a measurement using these can subtract what asking cost from what it is
+  measuring. Neither query influences placement, exposes segment contents, or
+  promises the answers will be anything in particular.
+
+  Batching earns its place on the handler, where it collapses a crossing per
+  range into one — worth more here than for `fh_read_many`, since with no
+  object request to wait on the crossing is most of the cost. It also cuts
+  the other way: the map does not leave its task, so a long batch occupies
+  the file for its whole walk. On the direct API there is no crossing, so
+  those forms save only the repeated call.
+
+### Notes on what the queries revealed
+
+Building layouts these queries could be tested against turned up something
+about flush that was not written down anywhere:
+
+- A flush emits its blocks **sorted by index and packed**. So two
+  file-consecutive blocks that are both in one segment are always adjacent
+  within it, and writing a file's blocks in reverse order lays them down
+  ascending regardless.
+- Requests therefore break where the **segment** changes, which is a property
+  of when each block was last flushed rather than of the file's own order.
+  Overwriting one block in the middle of a flushed run splits a read of that
+  run into three requests: the blocks before it, the new block in its new
+  segment, the blocks after it.
+- Two *consecutive* requests can share a segment only when the request-size
+  cap splits a run. A 20 MiB contiguous run reads as two requests under the
+  16 MiB `read_get_max_bytes` default.
+
+That last point decided a test. Three ways a hand-rolled cost model would go
+wrong were each injected and confirmed to fail the suite — merging across
+segments, merging across the request-size cap, and reporting a dirty block as
+placed. The cap case passed the whole suite until a test for a run longer than
+the budget existed, because no smaller layout can produce the situation.
+
+### Documentation
+
+- **What coalescing does, and how much it depends on the ask.** A request is
+  extended only while the next block's location is strictly adjacent in the
+  same segment, so a read fetches nothing the caller did not ask for; the
+  `read_get_max_bytes` budget caps a request's size rather than a gap it may
+  span. Worth stating because it is easy to assume the opposite.
+
+  The consequence is that **how fragmented a file looks depends on how much
+  is asked for at a time.** A consumer measured the same file as effectively
+  unfragmented at the library layer and ten times slower through a
+  filesystem — 25.87 against 2.650 MiB/s, 135 requests against 854. Nothing
+  about the file changed: the library read asked for 4 MiB at a time, giving
+  the planner 1024 blocks to walk and one budget to spend, while through the
+  mount the kernel asks 128 KiB at a time and each call pays for whatever
+  runs it straddles. Every measurement in `docs/concurrency.md` is a
+  library-layer one, so they are an upper bound on what coalescing can do
+  rather than what a caller asking in small pieces will see.
+
 ## [0.6.7] - 2026-08-22
 
 ### Added
