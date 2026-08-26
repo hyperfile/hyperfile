@@ -372,6 +372,13 @@ and goes through the request/response channel. Covers read, write,
 truncate extend/shrink, flush, getattr, setattr, as well as the
 tokio `AsyncRead`/`AsyncWrite`/`AsyncSeek` surface.
 
+`reactor_seek_hole_and_data_match_the_direct_api` asserts the handler's
+`SEEK_HOLE`/`SEEK_DATA` against spelled-out expected values *and* against the
+direct API on the same file, so neither a wrong answer nor two surfaces wrong
+together passes. `reactor_seek_sees_unflushed_writes` covers the case the
+direct API once regressed on, a dirty block reported as a hole. Swapping the
+two whences in the dispatch arm fails both.
+
 Feature requirement: `reactor` (default).
 
 Runs in ~1 s.

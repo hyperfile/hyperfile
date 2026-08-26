@@ -851,3 +851,113 @@ async fn reactor_read_ahead_discards_a_fetch_the_file_outran() {
     let _ = fh.fh_release().await;
     tf.cleanup(&client).await;
 }
+
+/// `fh_seek_hole` / `fh_seek_data` answer what the direct API answers.
+///
+/// The layout is the one the direct-API seek tests use: block 0 = data,
+/// block 1 = hole, block 2 = data, block 3 = trailing hole to EOF at 4
+/// blocks. Expected values are spelled out rather than only compared across
+/// surfaces, so the test still means something if both surfaces are wrong
+/// together.
+#[tokio::test]
+#[ignore]
+async fn reactor_seek_hole_and_data_match_the_direct_api() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const BLOCK: usize = 4096;
+
+    {
+        let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+            &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("fh create");
+        let _ = fh.fh_write(0, &vec![0xAAu8; BLOCK]).await.expect("write block 0");
+        let _ = fh.fh_write(BLOCK * 2, &vec![0xCCu8; BLOCK]).await.expect("write block 2");
+        let _ = fh.fh_truncate(BLOCK * 4).await.expect("truncate to 16 KiB");
+        let _ = fh.fh_flush().await.expect("flush");
+        let _ = fh.fh_release().await;
+    }
+
+    // The offsets the direct-API tests pin down, and what they must answer.
+    let hole_cases = [
+        (0usize, Some(BLOCK)),              // block 1 is the first hole
+        (BLOCK * 2 + 10, Some(BLOCK * 3)),  // from data into the trailing hole
+        (BLOCK * 4, Some(BLOCK * 4)),       // at EOF: EOF is an implicit hole
+        (BLOCK * 5, None),                  // past EOF
+    ];
+    let data_cases = [
+        (0usize, Some(0)),                  // block 0 is data
+        (BLOCK, Some(BLOCK * 2)),           // from inside the hole
+        (100, Some(100)),                   // partway into data: the offset itself
+        (BLOCK * 3, None),                  // trailing hole, no data to EOF
+        (BLOCK * 4, None),                  // at EOF
+    ];
+
+    {
+        let mut fh = HyperFileHandler::fh_open(&reactor, &client, tf.uri(), FileFlags::rdonly())
+            .await.expect("fh open");
+        for (off, want) in hole_cases {
+            assert_eq!(fh.fh_seek_hole(off).await.expect("fh_seek_hole"), want,
+                "fh_seek_hole({})", off);
+        }
+        for (off, want) in data_cases {
+            assert_eq!(fh.fh_seek_data(off).await.expect("fh_seek_data"), want,
+                "fh_seek_data({})", off);
+        }
+        let _ = fh.fh_release().await;
+    }
+
+    // Same file through the direct API, so parity is asserted and not assumed.
+    {
+        let mut hyper = hyperfile::file::hyper::Hyper::fs_open(
+            &client, tf.uri(), FileFlags::rdonly()).await.expect("fs open");
+        for (off, want) in hole_cases {
+            assert_eq!(hyper.fs_seek_hole(off).await.expect("fs_seek_hole"), want,
+                "the two surfaces disagree at fs_seek_hole({})", off);
+        }
+        for (off, want) in data_cases {
+            assert_eq!(hyper.fs_seek_data(off).await.expect("fs_seek_data"), want,
+                "the two surfaces disagree at fs_seek_data({})", off);
+        }
+        let _ = hyper.fs_release().await;
+    }
+
+    tf.cleanup(&client).await;
+}
+
+/// Unflushed writes count as data, on the handler surface too.
+///
+/// The direct API had a regression here once: the seek path consulted only
+/// the bmap and reported a hole where a dirty block held data. The handler
+/// reaches the same code, but the reason it is worth asserting separately is
+/// that the handler's writes are multi-hop, so a query arriving between hops
+/// sees state the direct API never presents.
+#[tokio::test]
+#[ignore]
+async fn reactor_seek_sees_unflushed_writes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let reactor = make_reactor();
+
+    const BLOCK: usize = 4096;
+
+    let mut fh = HyperFileHandler::fh_open_or_create_with_default_opt(
+        &reactor, &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+    ).await.expect("fh create");
+
+    // Block 1 only, and no flush: block 0 is a hole, block 1 is dirty data.
+    let _ = fh.fh_write(BLOCK, &vec![0xBBu8; BLOCK]).await.expect("write block 1");
+
+    assert_eq!(fh.fh_seek_data(0).await.expect("fh_seek_data"), Some(BLOCK),
+        "an unflushed write is data, so SEEK_DATA must find it");
+    assert_eq!(fh.fh_seek_hole(0).await.expect("fh_seek_hole"), Some(0),
+        "block 0 was never written, so it is a hole");
+    assert_eq!(fh.fh_seek_hole(BLOCK).await.expect("fh_seek_hole"), Some(BLOCK * 2),
+        "past the dirty block is the trailing hole at EOF");
+
+    let _ = fh.fh_release().await;
+    tf.cleanup(&client).await;
+}

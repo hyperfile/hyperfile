@@ -46,7 +46,8 @@ write access on its own, matching Linux, where
 `open(O_RDONLY | O_APPEND)` followed by a `write` fails with `EBADF`.
 
 `lseek` — including the `SEEK_DATA` / `SEEK_HOLE` extensions behind
-`fs_seek_data` / `fs_seek_hole` — requires no particular access mode
+`fs_seek_data` / `fs_seek_hole`, or `fh_seek_data` / `fh_seek_hole` on the
+handler — requires no particular access mode
 and is never gated.
 
 Operations that read internally are not affected by the read gate. A

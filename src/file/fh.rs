@@ -34,7 +34,7 @@ use crate::staging::{s3::S3Staging, StagingIntercept};
 use super::hyper::Hyper;
 use super::flags::FileFlags;
 use super::mode::FileMode;
-use super::handler::FileContext;
+use super::handler::{FileContext, SeekWhence};
 
 /// Reactor-mode handle to a hyperfile-backed file.
 ///
@@ -370,6 +370,34 @@ impl<'a: 'static> HyperFileHandler<'a> {
     pub async fn fh_read_ahead(&self, off: usize, len: usize) -> Result<usize>
     {
         let (ctx, rx) = FileContext::new_read_ahead(off, len, self.inner.clone());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// `lseek(SEEK_HOLE)`: smallest offset >= `off` in a hole, or `None`
+    /// (caller maps to `ENXIO`) if `off` is at or past EOF.
+    ///
+    /// EOF counts as a hole, so a file that is data all the way through
+    /// answers with its size rather than `None`.
+    ///
+    /// The direct-API equivalent is `Hyper::fs_seek_hole`. Both walk the map
+    /// and consider unflushed writes to be data, so the answer accounts for
+    /// what has been written but not yet persisted.
+    pub async fn fh_seek_hole(&self, off: usize) -> Result<Option<usize>>
+    {
+        let (ctx, rx) = FileContext::new_seek(off, SeekWhence::Hole);
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// `lseek(SEEK_DATA)`: smallest offset >= `off` holding data, or `None`
+    /// (`ENXIO`) if there is none before EOF.
+    ///
+    /// The counterpart of [`Self::fh_seek_hole`], and the direct-API
+    /// equivalent is `Hyper::fs_seek_data`.
+    pub async fn fh_seek_data(&self, off: usize) -> Result<Option<usize>>
+    {
+        let (ctx, rx) = FileContext::new_seek(off, SeekWhence::Data);
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }

@@ -123,6 +123,7 @@ pub type FileRespTiming = Result<TimingValue>;
 pub type FileRespDirtyBlockCount = Result<usize>;
 /// How many blocks a read-ahead installed.
 pub type FileRespReadAhead = Result<usize>;
+pub type FileRespSeek = Result<Option<usize>>;
 pub type FileRespReadPlan = Result<Vec<Vec<crate::file::PlannedRead>>>;
 pub type FileRespBlockPlacement = Result<Vec<Vec<Option<(crate::SegmentId, u64)>>>>;
 /// How many of the requested blocks were resident.
@@ -161,6 +162,7 @@ pub enum FileResp {
     Timing(oneshot::Sender<FileRespTiming>),
     DirtyBlockCount(oneshot::Sender<FileRespDirtyBlockCount>),
     ReadAhead(oneshot::Sender<FileRespReadAhead>),
+    Seek(oneshot::Sender<FileRespSeek>),
     ReadPlan(oneshot::Sender<FileRespReadPlan>),
     BlockPlacement(oneshot::Sender<FileRespBlockPlacement>),
     WithBlocks(oneshot::Sender<FileRespWithBlocks>),
@@ -259,6 +261,13 @@ impl FileResp {
         match self {
             Self::WithBlocks(tx) => tx,
             _ => panic!("FileResp::to_with_blocks called on wrong variant"),
+        }
+    }
+
+    pub fn to_seek(self) -> oneshot::Sender<FileRespSeek> {
+        match self {
+            Self::Seek(tx) => tx,
+            _ => panic!("FileResp::to_seek called on wrong variant"),
         }
     }
 
@@ -542,6 +551,21 @@ pub struct FileReqReadMany<'a> {
     pub fh: ChannelGroup<FileContext<'a>>,
 }
 
+/// Which of the two `lseek` extension queries to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekWhence {
+    /// `SEEK_DATA`.
+    Data,
+    /// `SEEK_HOLE`.
+    Hole,
+}
+
+/// Where to start looking, and what to look for.
+pub struct FileReqSeek {
+    pub offset: usize,
+    pub whence: SeekWhence,
+}
+
 /// Ranges to answer a read-plan query about.
 ///
 /// Batch-shaped even for one range, so the single-range and many-range
@@ -652,6 +676,7 @@ pub enum FileReqOp {
     Timing,
     DirtyBlockCount,
     ReadAhead,
+    Seek,
     ReadPlan,
     BlockPlacement,
     WithBlocks,
@@ -687,6 +712,7 @@ pub union FileReqBody<'a> {
     timing: ManuallyDrop<FileReqTiming>,
     dirty_block_count: ManuallyDrop<FileReqDirtyBlockCount>,
     read_ahead: ManuallyDrop<FileReqReadAhead<'a>>,
+    seek: ManuallyDrop<FileReqSeek>,
     read_plan: ManuallyDrop<FileReqReadPlan>,
     block_placement: ManuallyDrop<FileReqBlockPlacement>,
     with_blocks: ManuallyDrop<FileReqWithBlocks>,
@@ -992,6 +1018,16 @@ impl<'a> FileContext<'a> {
             body: FileReqBody { read_ahead: ManuallyDrop::new(FileReqReadAhead { offset, len, fh }), },
         };
         let resp = FileResp::ReadAhead(tx);
+        (Self { req: Some(req), resp: Some(resp) }, rx)
+    }
+
+    pub fn new_seek(offset: usize, whence: SeekWhence) -> (Self, oneshot::Receiver<FileRespSeek>) {
+        let (tx, rx) = oneshot::channel::<FileRespSeek>();
+        let req = FileReq {
+            op: FileReqOp::Seek,
+            body: FileReqBody { seek: ManuallyDrop::new(FileReqSeek { offset, whence }), },
+        };
+        let resp = FileResp::Seek(tx);
         (Self { req: Some(req), resp: Some(resp) }, rx)
     }
 
@@ -1487,6 +1523,17 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                     }
                 }
                 let _ = resp.to_with_blocks().send(Ok(resident));
+            },
+            FileReqOp::Seek => {
+                let md = unsafe { req.body.seek };
+                let r = ManuallyDrop::into_inner(md);
+                // A map walk, so it is answered from here: the map does not
+                // leave this task.
+                let res = match r.whence {
+                    SeekWhence::Data => self.inner.seek_data(r.offset).await,
+                    SeekWhence::Hole => self.inner.seek_hole(r.offset).await,
+                };
+                let _ = resp.to_seek().send(res);
             },
             FileReqOp::ReadPlan => {
                 let md = unsafe { req.body.read_plan };
