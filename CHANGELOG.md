@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.9] - 2026-08-26
+
+### Added
+
+- **`read_ahead_gets` and `read_ahead_bytes`**, so a read's own cost can be
+  told from what read-ahead spent on its behalf.
+
+  `data_gets` counted every data request alike. Nothing could separate the
+  two, because the counter is incremented where the request is made and
+  staging sees a ranged load with nothing about its purpose. That leaves a
+  measurement with read-ahead enabled unable to attribute what it cost, and
+  the only alternative — turning read-ahead off — measures a different system.
+
+  Subsets rather than separate totals: a read-ahead's request is still
+  counted in `data_gets`, so existing assertions keep their meaning, and
+
+  ```
+  a read's own requests = data_gets - read_ahead_gets
+  a read's own bytes    = data_bytes - read_ahead_bytes
+  ```
+
+  Attributed by the read-ahead path itself on both surfaces, once per
+  successful load. Three cases resolved towards the honest answer rather than
+  the tidy one: a fetch that fails after staging counted it is not
+  attributed, so the counters disagree by that request; the `wal` path that
+  copies from a segment still pinned in memory issues no request and counts
+  nothing, matching `data_gets`; and `fh_read_many`'s fetches are not
+  attributed here, since they are asked for rather than speculative.
+
+  Both attribution sites were confirmed load-bearing by removing them in
+  turn — each makes the assertion that every request during a warm was
+  read-ahead's fail with 0 of 1.
+
+### Notes on what prompted this
+
+A consumer brought two files of the same size and contents, one costing 259
+object requests to read and the other 128, and took the difference to be a
+matter of how the files were laid out. The placement queries added in 0.6.8
+answered that on their first use, and answered it against the hypothesis:
+both files sat in a single segment with no discontinuity anywhere, so by the
+criteria those queries expose, both layouts were as good as a layout gets.
+
+What differed was how many times their own caller asked — 384 against 256 —
+and whether that was prefetch volume could not be established, because the
+counters did not say. Hence these two.
+
+Worth recording alongside the queries themselves: a prediction made here from
+the 0.6.8 invariants was wrong, and wrong for a specific reason. Reasoning
+that each 128 KiB window costing two requests implied a segment change per
+window assumed one request *arriving* per window, which was never established
+and turned out to be false. The invariants held; the inference from them did
+not. A cost figure cannot be read without knowing how many times the caller
+asked, which is the same class of mistake as reading a coalescing figure
+without knowing how much was asked for at once — see the note under 0.6.8.
+
 ## [0.6.8] - 2026-08-24
 
 ### Added
