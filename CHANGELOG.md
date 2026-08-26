@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.10] - 2026-08-26
+
+### Added
+
+- **`fh_seek_hole` and `fh_seek_data`**, the handler equivalents of
+  `Hyper::fs_seek_hole` and `fs_seek_data`. A caller in reactor mode
+  previously had no way to ask where a file's holes are.
+
+  Both are a map walk, and the core methods take `&self`, so the dispatch arm
+  answers them directly — nothing spawned, no permit taken, and the map never
+  leaves its task. One request op carries a whence discriminant rather than
+  there being two, so the pair cannot drift apart in how it is dispatched.
+
+  Unflushed writes count as data, so the answer accounts for what has been
+  written but not yet persisted. This is asserted separately on the handler
+  even though it reaches the same code as the direct API, because a handler
+  write is multi-hop: a query can arrive between hops and see state the direct
+  API never presents.
+
+  Tested against spelled-out expected offsets *and* against the direct API on
+  the same file. Spelling them out is what makes the test mean something — a
+  cross-surface comparison alone passes when both surfaces are wrong together.
+  Swapping the two whences in the arm fails both new tests.
+
 ## [0.6.9] - 2026-08-26
 
 ### Added
