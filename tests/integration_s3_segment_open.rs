@@ -93,3 +93,62 @@ async fn segment_open_at_and_above_fetch_size() {
     write_one_segment_then_open(1024 * 1024).await;     // above it
     write_one_segment_then_open(16 * 1024 * 1024).await; // well above it
 }
+
+/// A container whose format this build cannot represent is refused, not read.
+///
+/// Containers written before `i_meta_config` was populated carry zero there,
+/// which decoded to a root of 0 bytes and blocks of 1 byte — and since the
+/// container's config overwrites the caller's, that 1-byte block size then
+/// decided how every read was cut up. A consumer opened such a container with
+/// 0.6.x and got a device reporting 33280 bytes where 2 GiB had been written.
+///
+/// The inode object is patched in place rather than a legacy container being
+/// checked in, so the test states exactly which byte matters.
+#[tokio::test]
+#[ignore]
+async fn open_refuses_a_container_format_it_cannot_represent() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    // A perfectly good container first.
+    {
+        let mut h = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = h.fs_write(0, &vec![0x5Au8; 8192]).await.expect("write");
+        let _ = h.fs_flush().await.expect("flush");
+        let _ = h.fs_release().await.expect("release");
+    }
+    // It opens.
+    {
+        let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await
+            .expect("a container this build wrote must open");
+        let _ = h.fs_release().await;
+    }
+
+    // Zero `i_meta_config`, which is what a pre-0.4 container carries. Offset
+    // 44 in `InodeRaw`: four u64 timestamps and ino, then three u32 nsec
+    // fields.
+    let bucket = test_bucket();
+    let key = format!("{}/inode", tf.uri().strip_prefix(&format!("s3://{}/", bucket)).expect("uri prefix"));
+    let got = client.get_object().bucket(&bucket).key(&key).send().await.expect("get inode");
+    let mut bytes = got.body.collect().await.expect("collect").to_vec();
+    assert!(bytes.len() >= 48, "inode object is {} bytes", bytes.len());
+    assert_ne!(&bytes[44..48], &[0u8; 4], "i_meta_config should be populated before patching");
+    bytes[44..48].copy_from_slice(&0u32.to_ne_bytes());
+    client.put_object().bucket(&bucket).key(&key)
+        .body(bytes.into()).send().await.expect("put patched inode");
+
+    // Now it must refuse, and say what it saw.
+    let err = match Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await {
+        Ok(_) => panic!("an unrepresentable container format must not open"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "got {:?}: {}", err.kind(), err);
+    let msg = format!("{}", err);
+    assert!(msg.contains("unrecognised container format"), "message was: {}", msg);
+    assert!(msg.contains("0x00000000"), "the raw value must be reported: {}", msg);
+
+    tf.cleanup(&client).await;
+}

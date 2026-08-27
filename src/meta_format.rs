@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::{BlockPtr, SegmentId, SegmentOffset};
+use std::io::{Error, ErrorKind, Result};
 
 const BLOCK_PTR_DUMMY: u64 = 0x3FFF_FFFF_FFFF_FFFF;
 // a block ptr to a zero block
@@ -32,14 +33,29 @@ pub enum BlockPtrFormat {
 }
 
 impl BlockPtrFormat {
+    /// Decode a format byte, or report one this build does not know.
+    ///
+    /// Separate from [`Self::from_u8`] because this byte can arrive from a
+    /// persisted container written by another version, and a library has no
+    /// business panicking over what it read from storage.
+    #[inline]
+    pub fn try_from_u8(data: u8) -> Result<Self> {
+        match data {
+            0 => Ok(Self::Nop),
+            1 => Ok(Self::Flat),
+            2 => Ok(Self::MicroGroup),
+            n => Err(Error::new(ErrorKind::InvalidData,
+                format!("unknown block ptr format {}", n))),
+        }
+    }
+
+    /// Decode a format byte, panicking on one this build does not know.
+    ///
+    /// For a byte this crate produced itself. Anything decoded from a
+    /// container should use [`Self::try_from_u8`].
     #[inline]
     pub fn from_u8(data: u8) -> Self {
-        match data {
-            0 => Self::Nop,
-            1 => Self::Flat,
-            2 => Self::MicroGroup,
-            n @ _ => panic!("Unkown block ptr format {}", n),
-        }
+        Self::try_from_u8(data).expect("block ptr format")
     }
 
     #[inline]
@@ -164,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Unkown block ptr format")]
+    #[should_panic(expected = "unknown block ptr format")]
     fn from_u8_invalid() {
         BlockPtrFormat::from_u8(3);
     }

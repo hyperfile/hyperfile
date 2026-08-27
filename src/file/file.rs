@@ -282,8 +282,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 return Err(e);
             },
         }
-        // get back meta config from inode raw
-        let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
+        // Get the meta config back from the inode — and refuse the open if it
+        // is not one this build can represent. Everything below this line
+        // trusts the inode, including `i_size` and the block size that cuts
+        // every read up, and the container's config overwrites the caller's
+        // further down. A container written before this field was populated
+        // carries zero, which used to decode to 1-byte blocks and was read
+        // without complaint.
+        let meta_config = HyperFileMetaConfig::try_from_u32(raw_inode.i_meta_config)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, format!(
+                "unrecognised container format: inode meta config {:#010x} — {}. \
+                 Refusing to open rather than reading it with a format this build \
+                 does not understand",
+                raw_inode.i_meta_config, e)))?;
         // Borrowed, not copied: see the note in `HyperTrait::refresh_bmap`.
         let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::read(&raw_inode.i_bmap, meta_config.meta_block_size, meta_block_loader, node_cache)?;
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());

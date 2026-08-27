@@ -13,6 +13,12 @@ use crate::*;
 const MIN_ROOT_SIZE: usize = 56;
 const MIN_META_BLOCK_SIZE: usize = 4096;
 const MIN_DATA_BLOCK_SIZE: usize = 4096;
+/// Largest block-size shift a container may name. Not a policy — 1 GiB
+/// blocks are already absurd — but a bound, so that a byte from a container
+/// this build does not understand cannot become a shift overflow. The
+/// encoded field is a whole byte, so without this a stray value shifts by up
+/// to 255.
+const MAX_BLOCK_SHIFT: u32 = 30;
 
 pub(crate) const DEFAULT_ROOT_SIZE: usize = MIN_ROOT_SIZE;
 const DEFAULT_META_BLOCK_SIZE: usize = MIN_META_BLOCK_SIZE;
@@ -72,18 +78,65 @@ impl HyperFileMetaConfig {
         root_multiple << 24 | meta_block_shift << 16 | data_block_shift << 8 | block_ptr_format
     }
 
-    // decode from u32
-    pub fn from_u32(data: u32) -> Self {
-        let block_ptr_format = BlockPtrFormat::from_u8((data & 0xFF) as u8);
-        let data_block_size = 1 << ((data >> 8) & 0xFF);
-        let meta_block_size = 1 << ((data >> 16) & 0xFF);
-        let root_size = (((data >> 24) & 0xFF) * 8).try_into().unwrap();
-        Self {
+    /// Decode from the `u32` an inode carries, rejecting anything this build
+    /// cannot represent.
+    ///
+    /// Every field is checked, because this value comes from storage and may
+    /// have been written by a version whose layout differs. A container from
+    /// before this field was populated carries zero, which decodes to a root
+    /// of 0 bytes and blocks of 1 byte — all three below the minimums that
+    /// were already named above. Read without checking, those propagate: the
+    /// caller's own config is overwritten by what the container says (see
+    /// `HyperFile::do_open`), so a one-byte block size then decides how every
+    /// read and write is cut up.
+    ///
+    /// Refusing is the point. A container this build does not understand
+    /// cannot be read correctly, and reporting the raw value at the first
+    /// step is much better than presenting a file whose size and block size
+    /// are quietly wrong.
+    pub fn try_from_u32(data: u32) -> Result<Self> {
+        let block_ptr_format = BlockPtrFormat::try_from_u8((data & 0xFF) as u8)?;
+        if block_ptr_format == BlockPtrFormat::Nop {
+            return Err(Error::new(ErrorKind::InvalidData,
+                "block ptr format is Nop, which no container is written with"));
+        }
+
+        let data_shift = (data >> 8) & 0xFF;
+        let meta_shift = (data >> 16) & 0xFF;
+        // Checked before shifting, not after: the shift itself would
+        // overflow.
+        for (what, shift, min) in [
+            ("data block size", data_shift, MIN_DATA_BLOCK_SIZE),
+            ("meta block size", meta_shift, MIN_META_BLOCK_SIZE),
+        ] {
+            let min_shift = min.ilog2();
+            if shift < min_shift || shift > MAX_BLOCK_SHIFT {
+                return Err(Error::new(ErrorKind::InvalidData, format!(
+                    "{} shift {} is outside {}..={}", what, shift, min_shift, MAX_BLOCK_SHIFT)));
+            }
+        }
+        let data_block_size = 1usize << data_shift;
+        let meta_block_size = 1usize << meta_shift;
+
+        let root_size: usize = (((data >> 24) & 0xFF) * 8) as usize;
+        if root_size < MIN_ROOT_SIZE {
+            return Err(Error::new(ErrorKind::InvalidData, format!(
+                "root size {} is below the minimum {}", root_size, MIN_ROOT_SIZE)));
+        }
+
+        Ok(Self {
             root_size,
             meta_block_size,
             data_block_size,
             block_ptr_format,
-        }
+        })
+    }
+
+    /// Decode from a `u32` this crate produced itself, panicking on one it
+    /// cannot represent. Anything read from a container should go through
+    /// [`Self::try_from_u32`].
+    pub fn from_u32(data: u32) -> Self {
+        Self::try_from_u32(data).expect("meta config")
     }
 }
 
@@ -371,5 +424,59 @@ mod tests {
     fn meta_config_from_invalid_json() {
         let result = HyperFileConfig::from_json_string("not json");
         assert!(result.is_err());
+    }
+
+    /// A container written before `i_meta_config` was populated carries zero.
+    /// That used to decode without complaint into a root of 0 bytes and
+    /// blocks of 1 byte, and since the container's config overwrites the
+    /// caller's, the 1-byte block size then decided how reads were cut up.
+    #[test]
+    fn meta_config_rejects_an_unpopulated_field() {
+        let e = HyperFileMetaConfig::try_from_u32(0).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+        // Nop is reached first, being the low byte.
+        assert!(format!("{}", e).contains("Nop"), "{}", e);
+    }
+
+    /// Every field is checked, not just the one that happens to be wrong in
+    /// the containers that prompted this.
+    #[test]
+    fn meta_config_rejects_each_field_out_of_range() {
+        let good = HyperFileMetaConfig::default();
+        let ok = good.as_u32();
+        assert_eq!(HyperFileMetaConfig::try_from_u32(ok).unwrap(), good,
+            "a config this crate encoded must decode back");
+
+        // Block ptr format this build does not know.
+        assert!(HyperFileMetaConfig::try_from_u32((ok & !0xFF) | 0x07).is_err());
+
+        // Data block shift below the minimum, and absurdly high. The high
+        // case is the one that would shift by more than a usize has bits.
+        let below = (ok & !0x0000FF00) | (11 << 8);
+        assert!(HyperFileMetaConfig::try_from_u32(below).is_err(), "shift 11 accepted");
+        let absurd = (ok & !0x0000FF00) | (200 << 8);
+        assert!(HyperFileMetaConfig::try_from_u32(absurd).is_err(), "shift 200 accepted");
+
+        // Meta block shift, same two ends.
+        assert!(HyperFileMetaConfig::try_from_u32((ok & !0x00FF0000) | (11 << 16)).is_err());
+        assert!(HyperFileMetaConfig::try_from_u32((ok & !0x00FF0000) | (200 << 16)).is_err());
+
+        // Root size below the minimum.
+        assert!(HyperFileMetaConfig::try_from_u32(ok & !0xFF000000).is_err());
+    }
+
+    /// The sizes hypercli round-trips must stay acceptable, so the guard
+    /// rejects the unrepresentable rather than the merely unusual.
+    #[test]
+    fn meta_config_accepts_the_sizes_in_use() {
+        for data_block_size in [4096usize, 65536, 524288] {
+            let c = HyperFileMetaConfig::new(
+                DEFAULT_ROOT_SIZE, DEFAULT_META_BLOCK_SIZE, data_block_size,
+                DEFAULT_BLOCK_PTR_FORMAT);
+            let back = HyperFileMetaConfig::try_from_u32(c.as_u32())
+                .expect("a config in use must decode");
+            assert_eq!(back.data_block_size, data_block_size);
+            assert_eq!(back, c);
+        }
     }
 }

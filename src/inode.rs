@@ -71,7 +71,7 @@ impl fmt::Display for Inode {
         writeln!(f, "  access time: {:?}", dt_atime.unwrap())?;
         writeln!(f, "  change time: {:?}", dt_ctime.unwrap())?;
         writeln!(f, "  modify time: {:?}", dt_mtime.unwrap())?;
-        let meta_config = HyperFileMetaConfig::from_u32(self.i_meta_config);
+        let meta_config = HyperFileMetaConfig::try_from_u32(self.i_meta_config).unwrap_or_default();
         writeln!(f, "  format: {:?}, root size: {}, meta block size: {}, data block size: {}",
             meta_config.block_ptr_format, meta_config.root_size,
             meta_config.meta_block_size, meta_config.data_block_size)?;
@@ -177,7 +177,7 @@ impl Inode {
     }
 
     pub fn meta_config(&self) -> HyperFileMetaConfig {
-        HyperFileMetaConfig::from_u32(self.i_meta_config)
+        HyperFileMetaConfig::try_from_u32(self.i_meta_config).unwrap_or_default()
     }
 
     pub fn mode(&self) -> HyperFileMode {
@@ -256,7 +256,13 @@ impl Inode {
     }
 
     pub fn to_stat(&self, dev: u64, rdev: u64) -> libc::stat {
-        let meta_config = HyperFileMetaConfig::from_u32(self.i_meta_config);
+        // Falls back rather than refusing, because refusing a container this
+        // build cannot represent is `HyperFile::do_open`'s job and it happens
+        // before any inode is trusted. What reaches here is either an inode
+        // that passed that gate, or one built in memory whose config field is
+        // not populated yet — and neither `to_stat` nor `Display` may panic
+        // over a field they only report.
+        let meta_config = HyperFileMetaConfig::try_from_u32(self.i_meta_config).unwrap_or_default();
         let mut stat: libc::stat = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         stat.st_dev = dev;
         stat.st_ino = self.i_ino;
