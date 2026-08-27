@@ -22,6 +22,7 @@ tests/
 ├── integration_s3_block_api.rs              ← block borrow API (`fs_block*`)
 ├── integration_s3_local_disk_cache.rs       ← local-disk data cache tier
 ├── integration_s3_read_timing.rs            ← read-side counters (`read_timing`)
+├── integration_s3_open_cno.rs               ← read-only checkpoint views (`open_cno`)
 ├── integration_reactor_s3_smoke.rs          ← reactor smoke (default features)
 ├── integration_reactor_s3_block_api.rs      ← reactor block access (`fh_with_block*`)
 ├── integration_reactor_s3_placement.rs      ← where blocks are (`fh_read_plan`)
@@ -363,6 +364,20 @@ direct surface (`fs_read_plan`, `fs_block_placement` and their batch forms).
 It lives here rather than with the reactor placement suite because it needs
 the same counters: the queries are worth something only while they agree with
 the read path, and the two surfaces reach it by different routes.
+
+### `integration_s3_open_cno`
+
+Opening a published checkpoint read-only, `Hyper::open_cno`. Each checkpoint
+shows its own contents; a view does not move while the container advances;
+write access is refused at open; an unpublished cno errors.
+
+The load-bearing one is `a_checkpoint_view_cannot_write`. A checkpoint view
+holds a historical inode, so anything of it reaching storage would publish the
+past as the present — it asserts the write-class operations fail *and* that the
+container is unchanged afterwards, release included. Writing this found that
+`release` flushed unconditionally: closing a checkpoint view attempted to
+publish, and only the on-disk state check stopped it, at the cost of three
+retries and a `ResourceBusy` with no clean way to close.
 
 ### `integration_reactor_s3_smoke`
 

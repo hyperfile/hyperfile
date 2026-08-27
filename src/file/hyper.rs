@@ -83,6 +83,35 @@ impl<'a: 'static> Hyper<'a> {
         })
     }
 
+    /// Open a published checkpoint, read-only.
+    ///
+    /// The inode is read from segment `cno` rather than from the container's
+    /// current inode, so the file is seen as it stood at that checkpoint while
+    /// the container carries on. `flags` must be read-only; anything else is
+    /// refused by [`HyperFile::open_cno`].
+    ///
+    /// This is not what `hypercli file rollback` does. That reads an inode out
+    /// of a segment and publishes it as the container's current inode, so it
+    /// moves the whole container back and every reader with it. This changes
+    /// nothing: it is a second, read-only view alongside the live one.
+    ///
+    /// `cno` must name a checkpoint that has been published. A cno returned by
+    /// a flush is published by the time the flush returns, on the default
+    /// build.
+    ///
+    /// [`HyperFile::open_cno`]: crate::file::file::HyperFile::open_cno
+    pub async fn open_cno(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
+    {
+        let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
+        let loader = staging.to_block_loader();
+        let node_cache = LocalDiskNodeCache::from(&file_config.node_cache).await;
+        let file = HyperFile::<S3Staging, S3BlockLoader, LocalDiskNodeCache>::open_cno(
+            staging, loader, node_cache, file_config, flags, cno).await?;
+        Ok(Self {
+            inner: file,
+        })
+    }
+
     pub async fn create(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
     {
         let staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;

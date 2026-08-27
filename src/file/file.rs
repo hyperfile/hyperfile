@@ -389,7 +389,17 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
-        let segid = self.flush().await?;
+        // A read-only handle has nothing to publish, and must not try. It
+        // matters most for a handle opened at a checkpoint: that one holds a
+        // historical inode, so publishing would move the container back to it.
+        // The attempt is caught by the on-disk state check and fails, which is
+        // safe but leaves no way to close such a handle cleanly — and rests on
+        // a conflict being detected rather than on not writing.
+        let segid = if self.flags.is_rdonly() {
+            self.inode().get_last_cno()
+        } else {
+            self.flush().await?
+        };
         self.cache.shutdown();
         self.bmap.get_node_cache().shutdown();
         Ok(segid)
