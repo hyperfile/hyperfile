@@ -136,6 +136,38 @@ described in [flush.md](flush.md#with-wal-the-segment-is-pinned-and-the-front-en
 together with what a write has to do differently and what it costs a
 concurrent reader.
 
+### Which flush paths do this
+
+Worth stating plainly, because the two surfaces differ and the
+difference is easy to get backwards:
+
+- **Reactor.** `fh_flush` / `fh_fdatasync` reach a WAL-specific
+  dispatch arm that calls `kick_wal_protected_flush_reactor`, which
+  hands the upload to a spawned task and returns. Both the threshold
+  flush and the explicit one take this path.
+- **Direct API.** `fs_flush` goes through `HyperTrait::flush` to
+  `flush_process`, which has no WAL branch: it waits for the segment
+  and then for the inode.
+
+So `flush_process` being synchronous says nothing about what a
+reactor-mode caller experiences.
+
+What the asynchronous publish does *not* change is how many objects a
+run produces. Every flush still builds a segment, whether or not the
+caller waits for it. Measured over 50 writes each followed by an
+explicit flush, 64 KiB apiece:
+
+| | objects | time |
+|---|---|---|
+| no wal | 51 | 752 ms |
+| with wal | 51 | 783 ms |
+
+51 is 50 segments plus the inode. The time barely moves either,
+because each flush takes the flush lock and the spawned upload holds
+it until it finishes — so the next flush waits for the previous
+upload regardless of having returned early. That serialization is
+deliberate; see the TODO.
+
 ## Cleanup (WAL object delete)
 
 After a successful flush (in the reactor WAL path,
@@ -228,12 +260,33 @@ measure.
   gone. Doing it there would extend the check to every segment
   put, not only replays.
 
-- **Replay the log to storage in the background.** A flush
-  serializes behind the previous one, so under frequent flushing an
-  explicit flush still waits for the previous upload even though
-  the log has already made its data durable. A background task
-  turning lagging log segments into stored segments would let every
-  flush return immediately.
+- **Satisfy a flush from the log, and replay to storage in the
+  background.** The remaining cost of a flush is not the waiting —
+  the reactor path already returns before the upload — it is that
+  every flush builds and stores a segment at all. A consumer
+  measured 200 objects for a hundred fsync'd files either way, and
+  1 object when the flush was suppressed entirely at their layer:
+  4059 ms without the log, 3333 ms with it, 1904 ms suppressed. The
+  gap between the second and third rows is the segment per flush,
+  not the wait.
+
+  In principle the log makes it safe to satisfy a flush without
+  producing a segment: the data is durable the moment the log holds
+  it, and recovery replays it. What stops this being a small change
+  is that nothing then bounds the log. A fsync-heavy workload grows
+  it without limit, and recovery time grows with it, so a background
+  task turning lagging log segments into stored segments is a
+  **prerequisite** rather than an optimization on top.
+
+  It also needs the serialization to be reconsidered. A flush takes
+  the flush lock and the spawned upload holds it to completion, so
+  flushes complete one at a time — which is what keeps `is_flushing`
+  meaningful across the upload window, and what a background replay
+  would have to work with rather than around.
+
+  Until then, a caller who wants this can suppress the flush itself
+  when a WAL is configured, which is sound for the same reason and
+  is what the consumer above does.
 
 ## Related tests
 
