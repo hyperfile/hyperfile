@@ -9,6 +9,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.12] - 2026-08-27
+
+### Fixed
+
+- **A container format this build cannot represent is refused instead of
+  read.** Opening decoded the inode's `i_meta_config` and believed the result.
+  A container written before that field was populated carries zero, which
+  decoded to a root of 0 bytes and blocks of 1 byte — and since `do_open` ends
+  by overwriting the caller's config with the container's, that 1-byte block
+  size then decided how every read and write was cut up. A consumer opened
+  such a container and got a device reporting 33280 bytes where 2 GiB had been
+  written. Nothing about it was detectable from outside: a wrong size looks
+  like a small file.
+
+  No new format version was needed. The minimums to check against were
+  already named in `config.rs` — `MIN_ROOT_SIZE`, `MIN_META_BLOCK_SIZE`,
+  `MIN_DATA_BLOCK_SIZE` — and a zeroed field decodes below all three. The open
+  now reports the raw value it could not make sense of.
+
+  Two further ways the same decode could go wrong, neither of them the
+  reported symptom: `BlockPtrFormat::from_u8` panicked on a format byte it did
+  not know, and the block-size shifts come from a whole byte, so a stray value
+  shifted by up to 255. There is now a `try_from_u8`, and the shifts are
+  range-checked before the shift rather than after.
+
+  `Display` and `to_stat` decode the same field and must not panic over a
+  field they only report — an inode built in memory has not populated it yet —
+  so those fall back to the default. Rejection stays in the one place that
+  decides whether the container is usable at all.
+
+- **A publish that cannot be completed no longer panics.** A WAL flush answers
+  as soon as the log holds the data and uploads detached, so when that upload
+  fails the caller has already been told, truly, that the data is durable.
+  There is nobody to return an error to. Replaying the log is the remedy, and
+  it can fail for the same reason the publish did.
+
+  That case ended in `panic!("please fix wal with offline tools")`, which for a
+  server built on this crate is the whole process, including the reads it was
+  still serving correctly. There were two such panics; the one in the dispatch
+  arm is the one actually reached.
+
+  Recovery now retries a bounded number of times with backoff. When those are
+  spent the file stops accepting modification and goes on serving reads —
+  every acknowledged write is in the log, so nothing is lost and offline
+  repair has what it needs, whereas continuing to accept writes would pile
+  more data behind a publish that is not happening. Reads through that handle
+  may not show the newest data, since the flush had already repointed the map
+  at the segment it could not publish; reopening replays the log and produces
+  it.
+
+  Recovery also no longer mistakes an already-published checkpoint for a
+  failure. A segment object is written create-only, so replaying one that
+  reached storage fails with 412 — which is what the common case looks like,
+  the segment landed and only the inode did not. Counting that as a failure
+  would take a file read-only over data that is present and correct. Before
+  this change that path panicked, since `do_open` calls recovery through
+  `let _ =`, which a panic goes straight past. See the TODO in
+  [docs/wal.md](docs/wal.md) for verifying rather than inferring this.
+
+### Added
+
+- **`Hyper::open_cno`** opens a published checkpoint read-only, so a
+  checkpoint can be read as a second view while the container carries on.
+  `HyperFile::open_cno` was already public but unreachable in practice: it
+  wants the three generic parameters constructed, and `Hyper` keeps its inner
+  file `pub(crate)`, so a caller who built one by hand still could not wrap it
+  and had none of the `fs_*` surface.
+
+  This is not what `hypercli file rollback` does — that publishes an old inode
+  as the current one, so it moves the container and every reader with it, and
+  the device has to come off first.
+
+  Writing the tests found that `release` flushed unconditionally, which is the
+  more serious half of this: a checkpoint handle holds a historical inode, so
+  closing one attempted to publish the past as the present. The on-disk state
+  check caught it, so nothing was corrupted, but it cost three flush retries
+  and ended in `ResourceBusy` — and it rested on a conflict being detected
+  rather than on not writing. A read-only handle now skips the flush, which
+  also drops a pointless flush attempt from every ordinary read-only close.
+
+  A checkpoint is opened through the same `do_open` as anything else, so the
+  container-format check above applies to historical segments too.
+
+### Documentation
+
+- **Which flush paths publish asynchronously.** `flush_process` has no WAL
+  branch, but a reactor-mode explicit flush does not go through it: `fh_flush`
+  reaches a WAL-specific dispatch arm that hands the upload to a spawned task
+  and returns. Only the direct API's `fs_flush` publishes synchronously. The
+  third request was to make explicit flush take the WAL path — it already
+  does.
+
+  What the asynchronous publish does not change is the object count. Measured
+  over 50 writes each followed by an explicit flush, 64 KiB apiece: 51 objects
+  and about 760 ms whether or not a WAL is configured. Every flush still builds
+  a segment, and the spawned upload holds the flush lock, so the next flush
+  waits for it regardless of having returned early.
+
+  So a consumer's measured gain — 200 objects against 1 — comes from not
+  producing a segment per flush rather than from not waiting for one. That is
+  recorded as a TODO along with why it is not a small change: nothing bounds
+  the log once flushes stop producing segments, so replaying it to storage in
+  the background is a prerequisite rather than an optimization on top.
+
 ## [0.6.11] - 2026-08-27
 
 ### Fixed
