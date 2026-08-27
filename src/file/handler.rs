@@ -1791,9 +1791,15 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let md = unsafe { req.body.wal_flush_recovery };
                 let req = ManuallyDrop::into_inner(md);
                 let lock = req.lock;
-                let res = self.inner.wal_flush_recovery(lock).await;
-                if res.is_err() {
-                    panic!("wal flush recovery failed {:?}", res);
+                // Nothing to answer: this arm was queued by a detached upload
+                // that failed, so its caller was told long ago that the data
+                // is durable — which it is, the wal holds it. Recovery having
+                // failed means the file is now read-only, which
+                // `wal_flush_recovery` has already recorded. Panicking here
+                // would take the whole process with it, including reads that
+                // are still being served correctly.
+                if let Err(e) = self.inner.wal_flush_recovery(lock).await {
+                    log::warn!("wal flush recovery failed, file is read-only: {}", e);
                 }
                 let _ = resp.to_wal_flush_recovery();
             },

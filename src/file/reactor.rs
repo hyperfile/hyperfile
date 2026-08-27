@@ -1491,6 +1491,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
+        // Refused for the same reason and at the same point as a bad access
+        // mode: publishing has failed for good, so accepting more data would
+        // only pile it up behind a publish that is not happening.
+        self.check_writable()?;
         let buf = req.buf;
         let len = buf.len();
         // O_APPEND: override caller-supplied offset to current
@@ -1565,6 +1569,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
+        // Refused for the same reason and at the same point as a bad access
+        // mode: publishing has failed for good, so accepting more data would
+        // only pile it up behind a publish that is not happening.
+        self.check_writable()?;
         let len = req.len;
         // O_APPEND: same rule as spawn_write(). See the
         // corresponding comment there.

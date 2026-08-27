@@ -379,6 +379,10 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn sleep(dur: Duration) -> impl Future<Output = ()>;
     fn flush_timing(&self) -> &FlushTiming;
 
+    /// `Err` once publishing has failed unrecoverably. See
+    /// `State::publish_failed`.
+    fn check_writable(&self) -> Result<()>;
+
     // wal
     #[cfg(feature = "wal")]
     fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
@@ -1021,6 +1025,12 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
     fn flush(&mut self) -> impl Future<Output = Result<SegmentId>> {async {
         use crate::config::FlushConflictPolicy;
+        // A file that cannot publish must stop trying. Without this every
+        // operation that flushes first — truncate among them — would reattempt
+        // the failed publish and report its error rather than the read-only
+        // state, and a steady stream of them would keep the retry cycle
+        // running for good.
+        self.check_writable()?;
         let policy = self.config().runtime.flush_conflict_policy;
 
         let mut retries = 0;

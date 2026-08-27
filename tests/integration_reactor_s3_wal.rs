@@ -835,3 +835,94 @@ async fn reactor_wal_write_during_flush_keeps_the_untouched_bytes() {
     let _ = fh.fh_release().await;
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// When publishing fails and replaying the log cannot clear it either, the
+/// file stops accepting writes and goes on serving reads. It does not panic.
+///
+/// A WAL flush answers as soon as the log holds the data and uploads detached,
+/// so by the time that upload fails the caller has already been told — truly —
+/// that the data is durable. There is nobody to return an error to. Replaying
+/// is the remedy, and it publishes through the same path, so a store that is
+/// refusing writes defeats it too.
+///
+/// That case used to end in `panic!("please fix wal with offline tools")`,
+/// which for a server built on this crate is the whole process, including the
+/// reads it was still serving correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_publish_failure_turns_read_only_without_panicking() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+
+    let reactor = make_reactor();
+    let config = build_wal_config(tf.uri());
+
+    // Call 1 is create's own inode publish, so fail from call 2 on: the
+    // explicit flush and every recovery attempt after it.
+    let hyper = Hyper::create_with_interceptor(
+        client.clone(),
+        config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+        FailOnFlushInode::from(2),
+    ).await.expect("create with interceptor");
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("fh_from_hyper");
+
+    let payload = vec![0x9Cu8; 4096];
+    let n = fh.fh_write(0, &payload).await.expect("write must succeed: the wal takes it");
+    assert_eq!(n, payload.len());
+
+    // Reading back what was written keeps working throughout.
+    let mut buf = vec![0u8; payload.len()];
+    let _ = fh.fh_read(0, &mut buf).await.expect("read");
+    assert_eq!(buf, payload, "the wal-held data must still read back");
+
+    // Ask for a flush. Whether this reports an error or not is not the point
+    // — the publish it triggers runs detached — so drive it and then wait for
+    // the bounded retries to be spent.
+    let _ = fh.fh_flush().await;
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+    // Writes are refused now, and say why.
+    let err = fh.fh_write(0, &[0xFF; 4096]).await
+        .expect_err("writes must be refused once publishing has failed for good");
+    assert_eq!(err.kind(), std::io::ErrorKind::ReadOnlyFilesystem, "got {:?}: {}", err.kind(), err);
+    assert!(format!("{}", err).contains("wal"), "the message should point at the wal: {}", err);
+
+    let e = fh.fh_write_zero(0, 4096).await.expect_err("write_zero must be refused");
+    assert_eq!(e.kind(), std::io::ErrorKind::ReadOnlyFilesystem, "write_zero gave {:?}: {}", e.kind(), e);
+    let e = fh.fh_truncate(0).await.expect_err("truncate must be refused");
+    assert_eq!(e.kind(), std::io::ErrorKind::ReadOnlyFilesystem, "truncate gave {:?}: {}", e.kind(), e);
+
+    // Reads are still served rather than the process being gone, which is the
+    // reason not to panic. What they show is a separate matter: the flush had
+    // already repointed the map at the segment it could not publish, so this
+    // handle no longer has the newest data to hand. Durability is unaffected —
+    // the log holds it — and the assertion that matters is further down.
+    let mut buf2 = vec![0u8; payload.len()];
+    let _ = fh.fh_read(0, &mut buf2).await.expect("reads must keep being served");
+    let _ = fh.fh_getattr().await.expect("getattr must keep working");
+
+    let _ = fh.fh_release().await;
+    drop(fh);
+
+    // The point of answering a wal flush early is that the log makes the data
+    // durable whether or not the publish lands. So open again without the
+    // failure injected: recovery replays the log and the write is there.
+    {
+        let mut hyper = Hyper::open(
+            client.clone(),
+            config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("reopen after a failed publish");
+        let mut buf3 = vec![0u8; payload.len()];
+        let n = hyper.fs_read(0, &mut buf3).await.expect("read after recovery");
+        assert_eq!(n, payload.len());
+        assert_eq!(buf3, payload,
+            "the write was acknowledged, so recovery must produce it");
+        let _ = hyper.fs_release().await;
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}

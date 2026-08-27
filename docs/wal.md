@@ -100,6 +100,32 @@ through, the next open starts from scratch and replays the same
 set of segids again. The replay is deterministic because `seq`
 gives a total order of writes within a segid.
 
+A segment object is written create-only, so replaying a checkpoint
+that already reached storage fails the conditional put with 412,
+surfaced as `AlreadyExists`. That is treated as progress rather
+than failure: the segment is there, segment objects are immutable
+and named by checkpoint, so the one already stored is the one the
+replay would have written. Its log entries are then deleted, as
+they would be after a replay that did the work — otherwise every
+open lists them again and repeats the skip. It is logged each time.
+See the TODO below for how this should be tightened.
+
+Recovery is what a failed publish falls back to, and it can fail
+for the same reason the publish did — an object store refusing
+writes. It retries a bounded number of times with backoff. When
+those are spent, the file stops accepting modification and goes on
+serving reads: every acknowledged write is in the log, so nothing
+is lost and offline repair has what it needs, whereas continuing
+to accept writes would pile more data behind a publish that is not
+happening. Reads through that handle may not show the newest data,
+because the flush had already repointed the map at the segment it
+could not publish; durability is unaffected, and reopening replays
+the log.
+
+This case previously panicked. For a server built on this crate
+that means the whole process, including the reads it was still
+serving correctly.
+
 ## Flushing without stopping the front end
 
 Because the WAL makes a flush's completion a given, the flush does not
@@ -166,6 +192,49 @@ measure.
   allocate `seq` independently. Key collisions are possible. Use
   WAL from a single writer at a time.
 
+## TODO
+
+- **Verify an already-published checkpoint instead of assuming it.**
+  Recovery currently treats a 412 on a segment put as "this
+  checkpoint is already stored" and moves on. That is sound as far
+  as it goes — segment objects are immutable and named by
+  checkpoint — but it is an inference from the key, not a check of
+  the contents. The stricter form is to compare the candidate
+  segment against the stored one and to treat a difference as a
+  consistency violation to be fixed with offline tools rather than
+  worked around at runtime.
+
+  Two things stand in the way, both worth recording because they
+  are why this is not a small change:
+
+  - `s_chksum` in the segment header **is always zero**. The field
+    exists and `realize_ss` takes a checksum argument, but both
+    production call sites pass `0` and the code says as much
+    (`don't actually need checksum now`). So every segment written
+    to date carries no checksum, and a newly computed one would
+    never match an old segment — the comparison would report a
+    mismatch on the most ordinary reopen. Whatever is adopted needs
+    an answer for segments that cannot be verified at all.
+  - **Comparing the bytes will not do.** The segment header embeds
+    `s_inode`, and a replay updates mtime and ctime, so a replay of
+    identical data produces different bytes. A meaningful checksum
+    has to name which bytes it covers — the data and metadata
+    blocks, not the header — which is likely why the field was left
+    unused.
+
+  The comparison also has to happen where the candidate bytes still
+  exist, which is the staging put path rather than the recovery
+  loop; by the time recovery sees `AlreadyExists` the bytes are
+  gone. Doing it there would extend the check to every segment
+  put, not only replays.
+
+- **Replay the log to storage in the background.** A flush
+  serializes behind the previous one, so under frequent flushing an
+  explicit flush still waits for the previous upload even though
+  the log has already made its data durable. A background task
+  turning lagging log segments into stored segments would let every
+  flush return immediately.
+
 ## Related tests
 
 - `reactor_wal_smoke_write_flush_reopen` — happy path round trip.
@@ -173,6 +242,10 @@ measure.
   flush does not pick up stale WAL.
 - `reactor_wal_delete_after_flush` — WAL objects are actually
   removed from S3 after a reactor flush.
+- `reactor_wal_publish_failure_turns_read_only_without_panicking` —
+  a publish that keeps failing exhausts recovery's retries, after
+  which writes are refused and reads are still served; reopening
+  recovers the acknowledged write from the log.
 - `direct_api_wal_delete_after_flush` — same, but via
   `Hyper::fs_*` direct API.
 - `reactor_wal_crash_recovery_replays_unflushed_write` — drop

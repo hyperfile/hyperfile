@@ -33,6 +33,22 @@ pub(crate) struct State {
     /// on to other work.
     #[cfg(feature = "reactor")]
     mutation_gen: std::sync::Arc<AtomicU64>,
+    /// Set when publishing has failed in a way this file cannot resolve,
+    /// after which it accepts no further modification.
+    ///
+    /// Reached only by the WAL flush path, whose upload runs detached: by
+    /// the time it fails the caller has already been told the data is
+    /// durable, which it is — the WAL holds it — so there is nobody left to
+    /// return an error to. Replaying the WAL is the remedy and it is tried
+    /// a bounded number of times first. When even that will not go through,
+    /// the honest end state is to stop accepting writes and keep serving
+    /// reads, leaving the WAL intact for offline repair.
+    ///
+    /// Previously this case panicked, which for a server built on this
+    /// crate means the whole process, and takes down reads that were still
+    /// being served correctly.
+    #[cfg(feature = "wal")]
+    publish_failed: AtomicBool,
 }
 
 impl Default for State {
@@ -50,6 +66,8 @@ impl State {
             flush_pending: AtomicBool::new(false),
             #[cfg(feature = "reactor")]
             mutation_gen: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "wal")]
+            publish_failed: AtomicBool::new(false),
         }
     }
 
@@ -72,6 +90,20 @@ impl State {
 
     pub(crate) fn clear_flushing(&self) {
         self.flushing.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether publishing has failed unrecoverably. See the field.
+    #[cfg(feature = "wal")]
+    pub(crate) fn is_publish_failed(&self) -> bool {
+        self.publish_failed.load(Ordering::SeqCst)
+    }
+
+    /// One-way: there is no path back without offline repair, and pretending
+    /// otherwise would let a write land on a file whose newest data is only
+    /// in the log.
+    #[cfg(feature = "wal")]
+    pub(crate) fn set_publish_failed(&self) {
+        self.publish_failed.store(true, Ordering::SeqCst);
     }
 
     // Set while a flush waits for in-flight ranges to drain, so that new

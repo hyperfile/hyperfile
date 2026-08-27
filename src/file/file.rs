@@ -38,6 +38,8 @@ use super::block::{BlockRef, BlockMut, BlockState};
 use super::flags::HyperFileFlags;
 use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks, FlushTiming, PlannedRead};
+#[cfg(feature = "wal")]
+use crate::{DEFAULT_FLUSH_RETRIES, DEFAULT_FLUSH_BACKOFF_SECS};
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
 use super::state::State;
@@ -1077,6 +1079,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn write(&mut self, off: usize, buf: &[u8]) -> Result<usize> {
+        self.check_writable()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1167,6 +1170,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn write_zero(&mut self, off: usize, len: usize) -> Result<usize> {
+        self.check_writable()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1271,6 +1275,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// with `try_lock`, so it can put the request back instead of
     /// waiting on the handler task; see `HyperFile::try_lock`.
     pub(crate) async fn write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize> {
+        self.check_writable()?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.write_aligned_batch_locked(blocks, permit).await
     }
@@ -1508,6 +1513,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// only through this API and never calls `flush` will grow the
     /// dirty set without bound.
     pub async fn block_mut(&mut self, blk_idx: BlockIndex, create: bool) -> Result<Option<BlockMut<'_>>> {
+        self.check_writable()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1790,20 +1796,60 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     // starting wal flush recovery process by reloading inode from backend storage
     // everything should be clean or give a panic if unrecoverable
     #[cfg(feature = "wal")]
+    /// Replay the log to publish what a failed flush could not, retrying a
+    /// bounded number of times before giving up on this file.
+    ///
+    /// The caller of the flush is long gone — a WAL flush answers as soon as
+    /// the log holds the data, and the upload runs detached — so there is
+    /// nobody to return an error to. Replaying is the remedy, and it can fail
+    /// for the same reason the original publish did: the object store is
+    /// refusing writes.
+    ///
+    /// When it will not go through, the file stops accepting modification and
+    /// goes on serving reads. Every write that has been acknowledged is in the
+    /// log, so nothing is lost and offline repair still has everything it
+    /// needs — whereas continuing to accept writes would pile more data
+    /// behind a publish that is not happening. This used to panic, which for
+    /// a server built on this crate means the process, and takes down reads
+    /// that were still being served correctly.
     pub(crate) async fn wal_flush_recovery(&mut self, lock: OwnedMutexGuard<()>) -> Result<SegmentId> {
         debug!("wal_flush_recovery - started");
-        match self.do_wal_flush_recovery().await {
-            Ok(cno) => {
-                self.flush_unlock(lock);
-                if cno != 0 { return Ok(cno); }
-                warn!("wal_flush_recovery - return with cno 0");
-            },
-            Err(e) => {
-                self.flush_unlock(lock);
-                warn!("wal_flush_recovery - return with err {}", e);
-            },
+        let mut last_err = None;
+        for attempt in 1..=DEFAULT_FLUSH_RETRIES {
+            match self.do_wal_flush_recovery().await {
+                Ok(cno) if cno != 0 => {
+                    self.flush_unlock(lock);
+                    return Ok(cno);
+                },
+                Ok(_) => {
+                    warn!("wal_flush_recovery - attempt {}/{} returned cno 0",
+                        attempt, DEFAULT_FLUSH_RETRIES);
+                },
+                Err(e) => {
+                    warn!("wal_flush_recovery - attempt {}/{} failed: {}",
+                        attempt, DEFAULT_FLUSH_RETRIES, e);
+                    last_err = Some(e);
+                },
+            }
+            if attempt < DEFAULT_FLUSH_RETRIES {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    DEFAULT_FLUSH_BACKOFF_SECS * attempt as u64)).await;
+            }
         }
-        panic!("wal_flush_recovery - failed, please fix wal with offline tools");
+
+        // Out of attempts. Release the flush lock first, so reads that defer
+        // on a flush being in progress are not held behind a flush that will
+        // never finish.
+        self.flush_unlock(lock);
+        self.state.set_publish_failed();
+        let msg = format!(
+            "wal_flush_recovery - could not publish after {} attempts, \
+             file is now read-only; unflushed data is in the wal and can be \
+             recovered with offline tools{}",
+            DEFAULT_FLUSH_RETRIES,
+            last_err.map(|e| format!(": {}", e)).unwrap_or_default());
+        warn!("{}", msg);
+        Err(Error::new(ErrorKind::ReadOnlyFilesystem, msg))
     }
 
     // handler flush lock in caller
@@ -1818,8 +1864,30 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         let mut cno = 0;
         for segid in segids {
-            cno = self.wal_replay_chunks(segid).await?;
-            assert!(cno == segid + 1);
+            match self.wal_replay_chunks(segid).await {
+                Ok(c) => {
+                    assert!(c == segid + 1);
+                    cno = c;
+                },
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // A conditional put that fails with 412 on the segment
+                    // object means that checkpoint is already on storage, and
+                    // segment objects are immutable and named by checkpoint —
+                    // so the one already there is the one this replay would
+                    // have written. Counting it as a failure would take a file
+                    // read-only over data that is present and correct, which
+                    // is what the common case looks like: the segment landed
+                    // and only the inode did not.
+                    warn!("do_wal_flush_recovery - checkpoint {} is already on \
+                          storage, skipping its replay: {}", segid, e);
+                    cno = segid + 1;
+                    // The log entries for it are redundant now, exactly as
+                    // they are after a replay that did the work. Without this
+                    // every open would list them again and repeat the skip.
+                    self.wal_spawn_delete_segment(segid);
+                },
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(cno)
@@ -1955,6 +2023,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     // truncate
     /// Blocking-acquire wrapper; see `HyperFile::try_lock`.
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
+        self.check_writable()?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.truncate_locked(new_size, permit).await
     }
@@ -2335,6 +2404,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     // write in batch style, input blocks could be incomplete
     /// Blocking-acquire wrapper; see `HyperFile::try_lock`.
     pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
+        self.check_writable()?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.write_batch_locked(blocks, permit).await
     }
@@ -2634,6 +2704,22 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
 
     fn set_last_flush(&mut self) {
         self.state.set_last_flush();
+    }
+
+    /// Refuse a modification when publishing has failed unrecoverably.
+    ///
+    /// Only the WAL path can reach that state; without `wal` this is always
+    /// `Ok`. See `State::publish_failed` for why the file stops accepting
+    /// writes rather than continuing or panicking.
+    #[inline]
+    fn check_writable(&self) -> Result<()> {
+        #[cfg(feature = "wal")]
+        if self.state.is_publish_failed() {
+            return Err(Error::new(ErrorKind::ReadOnlyFilesystem,
+                "publishing failed unrecoverably; this file is read-only until \
+                 the wal is recovered with offline tools"));
+        }
+        Ok(())
     }
 
     fn flush_timing(&self) -> &FlushTiming {

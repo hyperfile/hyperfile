@@ -101,6 +101,10 @@ impl TestFile {
 #[derive(Clone)]
 pub struct FailOnFlushInode {
     target_count: usize,
+    /// Fail every call from `target_count` on, rather than only that one.
+    /// Needed to test a publish failure that recovery cannot clear either,
+    /// since recovery republishes through the same path.
+    persistent: bool,
     calls: Arc<AtomicUsize>,
 }
 
@@ -108,6 +112,16 @@ impl FailOnFlushInode {
     pub fn at(target_count: usize) -> Self {
         Self {
             target_count,
+            persistent: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Fail the `target_count`th call and every call after it.
+    pub fn from(target_count: usize) -> Self {
+        Self {
+            target_count,
+            persistent: true,
             calls: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -125,7 +139,11 @@ impl StagingIntercept<S3Staging> for FailOnFlushInode {
         _flag: FlushInodeFlag,
     ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {
         let current = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let should_fail = current == self.target_count;
+        let should_fail = if self.persistent {
+            current >= self.target_count
+        } else {
+            current == self.target_count
+        };
         Box::pin(async move {
             if should_fail {
                 Err(std::io::Error::new(
