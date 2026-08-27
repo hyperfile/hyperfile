@@ -33,7 +33,7 @@ futures = "0.3.31"
 ulid = "1.2.1"
 foyer = "0.19.2"
 serde_json = "1.0.145"
-btree-ondisk = { version = "0.18.0", default-features = false, features = ["tokio-runtime"] }
+btree-ondisk = { version = "0.20.0", default-features = false, features = ["tokio-runtime"] }
 hyperfile-reactor = { version = "0.3.2", optional = true }
 
 [dev-dependencies]
