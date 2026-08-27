@@ -284,8 +284,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
         // get back meta config from inode raw
         let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
-        let b = raw_inode.i_bmap;
-        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::read(&b, meta_config.meta_block_size, meta_block_loader, node_cache)?;
+        // Borrowed, not copied: see the note in `HyperTrait::refresh_bmap`.
+        let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::read(&raw_inode.i_bmap, meta_config.meta_block_size, meta_block_loader, node_cache)?;
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());
         bmap.set_cache_limit(config.runtime.node_cache_blocks);
 
@@ -1679,11 +1679,11 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // 1. reload persisted inode + rebuild bmap
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let inode_state = self.staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
-        let b = raw_inode.i_bmap;
         let meta_block_loader = self.staging.to_block_loader();
         let node_cache = self.bmap.get_node_cache();
+        // Borrowed, not copied: see the note in `HyperTrait::refresh_bmap`.
         let new_bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, L, C>::read(
-            &b,
+            &raw_inode.i_bmap,
             self.config.meta.meta_block_size,
             meta_block_loader,
             node_cache,

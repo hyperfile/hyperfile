@@ -468,8 +468,12 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // get back node cache
         let node_cache = self.bmap_get_node_cache();
 
-        let b = raw_inode.i_bmap;
-        let mut bmap = BMap::<BlockIndex, V, BlockPtr, L, C>::read(&b, self.config().meta.meta_block_size, meta_block_loader, node_cache)?;
+        // Borrowed out of the inode rather than copied to a local: `BMap::read`
+        // wants an 8-byte-aligned buffer, and `BMapRawType` is `[u8; N]`, whose
+        // own alignment is 1. `InodeRaw` is `align(8)` and `i_bmap` sits at an
+        // 8-aligned offset within it, so this reference is aligned by
+        // construction — a copy would be wherever the compiler put it.
+        let mut bmap = BMap::<BlockIndex, V, BlockPtr, L, C>::read(&raw_inode.i_bmap, self.config().meta.meta_block_size, meta_block_loader, node_cache)?;
 
         let _permit = self.lock().await;
 

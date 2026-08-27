@@ -715,4 +715,26 @@ mod tests {
         hdr.write_to(&mut buf2);
         assert_eq!(buf1, buf2, "write_to is not byte-identical on repeat");
     }
+
+    /// `BMap::read` wants an 8-byte-aligned buffer, and the bmap root is
+    /// handed to it as `&raw_inode.i_bmap`. That reference is only aligned
+    /// because `InodeRaw` is `align(8)` and `i_bmap` sits at an 8-aligned
+    /// offset within it — `BMapRawType` is `[u8; N]`, whose own alignment is
+    /// 1, so nothing about the field's type carries the property.
+    ///
+    /// Inserting a `u32` anywhere above `i_bmap` would break this silently:
+    /// the code would keep compiling and keep working on x86-64 until it
+    /// did not.
+    #[test]
+    fn inode_bmap_is_eight_byte_aligned() {
+        assert_eq!(std::mem::align_of::<InodeRaw>() % 8, 0,
+            "InodeRaw must stay at least 8-aligned");
+        assert_eq!(std::mem::offset_of!(InodeRaw, i_bmap) % 8, 0,
+            "i_bmap must sit at an 8-aligned offset, since BMap::read is handed \
+             a reference to it and BMapRawType has alignment 1");
+
+        // And the reference really is aligned, not merely computed to be.
+        let raw: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        assert_eq!((&raw.i_bmap as *const _ as usize) % 8, 0);
+    }
 }
