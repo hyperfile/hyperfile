@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.11] - 2026-08-27
+
+### Fixed
+
+- **`BMap::read` was handed a bmap root with no alignment guarantee.** All
+  three places that reopen a map from a persisted inode copied the root out
+  into a local first:
+
+  ```rust
+  let b = raw_inode.i_bmap;
+  BMap::read(&b, ..)
+  ```
+
+  `BMap::read` wants an 8-byte-aligned buffer. `BMapRawType` is `[u8; N]`,
+  whose alignment is 1, so the copy sat wherever the compiler put it —
+  `InodeRaw` being `repr(C, align(8))` does not carry over to a value copied
+  out of it, since the alignment belongs to the struct and not to the field's
+  type.
+
+  It worked, and would have kept working on x86-64, where such a local gets an
+  aligned slot in practice. That is what made it worth fixing rather than
+  leaving: nothing enforced the property and nothing would have reported its
+  loss.
+
+  Borrowing instead of copying makes it aligned by construction, since
+  `i_bmap` sits at offset 104 of an `align(8)` struct. A unit test pins both
+  halves of that, because neither is visible at the call site.
+
+  Raised by btree-ondisk against callers that reopen a map from a `Vec<u8>`.
+  We were not doing that; we were doing something weaker, since a `Vec`'s
+  buffer at least comes from the allocator.
+
+### Changed
+
+- **btree-ondisk 0.18 → 0.20.0.** Nothing in 0.19.0 or 0.20.0 changes an
+  existing signature or behaviour.
+
+  0.20.0 adds a reachability API — `collect_ptrs` for maps whose leaf values
+  are storage locations, `collect_meta_ptrs` for maps whose leaves hold inline
+  payload. Neither is called here; hyperfile has no reachability question to
+  ask, and never used `nonleafnode_iter`, the method they replace. What the
+  bump does for this crate is enforce something previously assumed:
+  `collect_ptrs` requires `V == P`, checked before any node is read, and this
+  crate's `V == P == u64` is what makes the call legal for the callers that do
+  ask — the library now draws that line itself.
+
+  0.19.0 comes along with it, adding `BtreeNodeDirty::id()`. Not adopted.
+  Recorded in case it ever is: a node that has never been placed carries an
+  internal sequence number, and `is_invalid()` returns false for those, so
+  discriminating with it would hand a sequence number back as a storage
+  offset. `is_valid_extern_assign()` is the correct test.
+
 ## [0.6.10] - 2026-08-26
 
 ### Added
