@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.13] - 2026-08-28
+
+### Added
+
+- **`writes_durable_on_ack`**, on `Hyper` and `HyperFile`. True when a write
+  that has returned `Ok` is already recoverable with no further flush: its
+  bytes are in the write-ahead log, and opening the container again replays
+  them.
+
+  A caller that skips flushing on that basis was relying on a property this
+  crate had never stated as an interface, and had to work out whether it held
+  by checking that the WAL URI starts with `s3://` — a copy of a judgement this
+  crate owns. The copy agrees today. What makes it worth removing is the
+  direction it can diverge: add any path where a log is configured but the
+  guarantee does not hold — a feature switch, a degraded mode, a deferred init
+  that failed — and the caller skips a flush it needed, with nothing reporting
+  it and the data gone after the next crash.
+
+  Named for the guarantee and not for the mechanism on purpose. If this crate
+  ever keeps a log while not offering the property — batching log writes so a
+  write can return before its bytes are down — it has to start answering
+  `false`, which a name like `wal_enabled` could not do honestly.
+
+### Documentation
+
+- **The durability contract is stated in the terms that were ambiguous**, in
+  [docs/wal.md](docs/wal.md): which bytes it covers (those each `Ok` write
+  reports, with no ordering promised between separate writes), from when (the
+  moment the call returns), that it is independent of `commit_bytes`,
+  `commit_interval_ms` and of any publish having happened, and that reopening
+  with the same log configuration replays it with no manual step.
+
+  It also says what the guarantee is not, to keep it apart from checkpoint
+  views: it does not make a cno openable, since reading those bytes back needs
+  the container reopened rather than a checkpoint published.
+
+  Pinned by `reactor_wal_writes_are_durable_on_ack_without_any_flush`, which
+  sets the publish thresholds out of reach so nothing incidental can produce a
+  segment, writes, drops the handle without flushing, and compares bytes after
+  reopening — alongside a no-log control, without which the first half would
+  pass just as well if writes were simply never lost.
+
+- **Corrects the TODO about satisfying a flush from the log.** It claimed a
+  background replay was a prerequisite, because nothing would otherwise bound
+  the log. The commit thresholds bound it. Measured on one workload, 256 MiB /
+  1 h gives 3 container objects and a log peak of 869 objects, while 16 MiB /
+  2 s gives 10 objects and a peak of 86 — both of the things publishing on
+  every flush was wanted for, which costs 200 objects. So the background
+  replay is an optimization after all; what it would add is bounding the log
+  by time since the last publish without traffic having to trigger one.
+
 ## [0.6.12] - 2026-08-27
 
 ### Fixed
