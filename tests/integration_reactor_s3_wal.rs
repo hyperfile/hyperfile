@@ -926,3 +926,134 @@ async fn reactor_wal_publish_failure_turns_read_only_without_panicking() {
 
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// A write that returned `Ok` survives without any flush, and
+/// `writes_durable_on_ack` is what says so.
+///
+/// This pins the property a caller relies on when it decides it may skip
+/// flushing: the bytes are in the log the moment the write returns, no publish
+/// need have happened, and reopening replays them. The publish thresholds are
+/// set out of reach so that nothing incidental can produce a segment — if one
+/// did, the test would pass for the wrong reason.
+///
+/// The no-log half is not decoration. Without it, a test that writes, drops
+/// and reads the data back proves nothing: the same result would follow from
+/// the write never having been lost in the first place. The control shows the
+/// bytes really do go missing when the log is not there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_writes_are_durable_on_ack_without_any_flush() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let payload = vec![0x6Du8; 8192];
+
+    // Thresholds no workload of this size can reach, so a publish cannot
+    // happen behind the test's back.
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let with_log = |uri: &str| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", uri));
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+    let without_log = |uri: &str| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    // --- with a log: the write survives, and the query says it will ---
+    let tf = TestFile::new(&client).await;
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), with_log(tf.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        assert!(hyper.writes_durable_on_ack(),
+            "a container with a log must report the guarantee");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let _ = fh.fh_release().await;
+    }
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), with_log(tf.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("reopen");
+        assert!(hyper.writes_durable_on_ack());
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let n = fh.fh_write(0, &payload).await.expect("write");
+        assert_eq!(n, payload.len());
+        // No flush, no release: the process is gone as far as the container
+        // is concerned.
+        drop(fh);
+        drop(reactor);
+    }
+    {
+        let mut hyper = Hyper::open(
+            client.clone(), with_log(tf.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("reopen after crash");
+        let mut buf = vec![0u8; payload.len()];
+        let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert_eq!(buf, payload,
+            "the write returned Ok, so it must survive with no flush of any kind");
+        let _ = hyper.fs_release().await;
+    }
+    cleanup_with_wal(&client, tf.uri()).await;
+
+    // --- the control: no log, so the same sequence loses the write ---
+    let tf2 = TestFile::new(&client).await;
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), without_log(tf2.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        assert!(!hyper.writes_durable_on_ack(),
+            "without a log there is no such guarantee to report");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let _ = fh.fh_release().await;
+    }
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), without_log(tf2.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("reopen");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let _ = fh.fh_write(0, &payload).await.expect("write");
+        drop(fh);
+        drop(reactor);
+    }
+    {
+        let mut hyper = Hyper::open(
+            client.clone(), without_log(tf2.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("reopen");
+        // Asserted on the size, not on the bytes read: the write left no size
+        // behind, so a read returns nothing at all — and "every byte of the
+        // zero bytes I read was zero" would be true of any outcome.
+        let st = hyper.fs_getattr().expect("getattr");
+        assert_eq!(st.st_size, 0,
+            "without a log an unflushed write must leave no size behind, else \
+             the half above proves nothing");
+        let mut buf = vec![0xFFu8; payload.len()];
+        let n = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert_eq!(n, 0, "and nothing to read");
+        let _ = hyper.fs_release().await;
+    }
+    tf2.cleanup(&client).await;
+}

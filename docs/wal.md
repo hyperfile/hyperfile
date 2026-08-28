@@ -22,19 +22,64 @@ those entries into the file. The caller observes a simple
 
 ## Durability contract
 
-With `wal` enabled:
+**A write that has returned `Ok` is recoverable with no further
+flush.** Its bytes are in the log, and opening the container again
+replays them.
 
-- `fh_write` / `fh_write_zero` / `HyperFileTokio::write` return
-  `Ok` only after the corresponding WAL object PUT to S3 has
-  completed.
-- A crash after `Ok` keeps the write on S3 as a WAL object and
-  recoverable on next open.
-- A crash before `Ok` may or may not have landed on S3 — the caller
-  should treat it the same as any other pending `Result`.
+Spelled out, because "durable" is otherwise read four different
+ways:
+
+- **Scope** — the bytes each `Ok` return of `write` or `write_zero`
+  reports as written. Nothing is promised about a write that
+  returned an error, and nothing about ordering between separate
+  writes: without a flush between them a caller should not assume
+  one landed before another.
+- **When** — from the moment the call returns. `fh_write` /
+  `fh_write_zero` / `HyperFileTokio::write` return `Ok` only after
+  the log object PUT has completed. A crash *before* `Ok` may or
+  may not have landed, like any pending `Result`.
+- **Independent of publishing** — it holds regardless of
+  `commit_bytes` and `commit_interval_ms`, and does not require any
+  flush or segment publish to have happened. Callers may therefore
+  skip flushing on this basis.
+- **Recovery** — reopening the same container with the same log
+  configuration replays it, with no manual step.
+
+It says nothing about a checkpoint existing for those bytes.
+Reading them back needs the container reopened, not a checkpoint
+published, so this guarantee does not make a cno openable.
 
 This is stronger than the no-WAL baseline, where "`fh_write`
 returned `Ok`" only means the data is in the in-memory cache and a
 crash erases it.
+
+### Ask for it, do not infer it
+
+```rust
+if hyper.writes_durable_on_ack() { /* may skip flushing */ }
+```
+
+A caller that skips flushing on this basis should read the
+guarantee from `Hyper::writes_durable_on_ack` rather than deciding
+for itself whether a log is configured. Inferring it — checking
+that the WAL URI looks like `s3://`, say — copies a judgement this
+crate owns, and the copy can only diverge in the unsafe direction:
+add any path where a log is configured but the guarantee does not
+hold, and the caller skips a flush it needed and says nothing about
+it.
+
+The name is deliberate. It reports the guarantee, not the
+mechanism, so if this crate ever keeps a log while not offering the
+property — batching log writes so a write can return before its
+bytes are down — it must start answering `false`, and callers
+degrade rather than lose data quietly.
+
+`reactor_wal_writes_are_durable_on_ack_without_any_flush` pins all
+of this: publish thresholds set out of reach so nothing incidental
+can produce a segment, a write, a simulated process death with no
+flush, and a byte comparison after reopening — alongside a no-log
+control that must lose the write, since without it the first half
+would also pass if writes were simply never lost.
 
 ## On-disk layout
 
@@ -272,21 +317,36 @@ measure.
 
   In principle the log makes it safe to satisfy a flush without
   producing a segment: the data is durable the moment the log holds
-  it, and recovery replays it. What stops this being a small change
-  is that nothing then bounds the log. A fsync-heavy workload grows
-  it without limit, and recovery time grows with it, so a background
-  task turning lagging log segments into stored segments is a
-  **prerequisite** rather than an optimization on top.
+  it, and recovery replays it. The question is what then bounds the
+  log, since a fsync-heavy workload would otherwise grow it without
+  limit and recovery time with it.
 
-  It also needs the serialization to be reconsidered. A flush takes
-  the flush lock and the spawned upload holds it to completion, so
-  flushes complete one at a time — which is what keeps `is_flushing`
-  meaningful across the upload window, and what a background replay
-  would have to work with rather than around.
+  The commit thresholds turn out to be the answer, and a better
+  lever than publishing on every flush. The same consumer measured,
+  on the same workload:
 
-  Until then, a caller who wants this can suppress the flush itself
-  when a WAL is configured, which is sound for the same reason and
-  is what the consumer above does.
+  | thresholds | container objects | log peak | after clean stop |
+  |---|---|---|---|
+  | 256 MiB / 1 h (deliberately unreachable) | 3 | 869 | 883 |
+  | 16 MiB / 2 s | 10 | 86 | 5 |
+
+  Tight thresholds give few objects *and* a bounded log, which is
+  what publishing per flush was wanted for — at 200 objects. So a
+  background replay is an optimization after all rather than a
+  prerequisite; what it would add is bounding the log by time since
+  the last publish without a publish having to be triggered by
+  traffic.
+
+  It would need the serialization reconsidered either way. A flush
+  takes the flush lock and the spawned upload holds it to
+  completion, so flushes complete one at a time — which is what
+  keeps `is_flushing` meaningful across the upload window, and what
+  a background replay would have to work with rather than around.
+
+  Until then, a caller who wants this suppresses the flush itself
+  when `writes_durable_on_ack` reports true, which is sound for the
+  same reason and is what the consumer above does, with the two
+  thresholds set tight enough to bound the log.
 
 ## Related tests
 
@@ -295,6 +355,9 @@ measure.
   flush does not pick up stale WAL.
 - `reactor_wal_delete_after_flush` — WAL objects are actually
   removed from S3 after a reactor flush.
+- `reactor_wal_writes_are_durable_on_ack_without_any_flush` — a
+  write survives a simulated death with no flush of any kind, with
+  publish thresholds out of reach and a no-log control that loses it.
 - `reactor_wal_publish_failure_turns_read_only_without_panicking` —
   a publish that keeps failing exhausts recovery's retries, after
   which writes are refused and reads are still served; reopening

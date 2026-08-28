@@ -353,6 +353,21 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.block_placement_many(ranges).await
     }
 
+    /// True when a write that has returned `Ok` is already recoverable with no
+    /// further flush.
+    ///
+    /// See
+    /// [`HyperFile::writes_durable_on_ack`](crate::file::file::HyperFile::writes_durable_on_ack)
+    /// for exactly what is and is not promised. Ask it once after opening: a
+    /// caller that may skip flushing on this basis should be reading the
+    /// guarantee from here rather than inferring it from its own copy of the
+    /// configuration, which cannot stay in step with a mechanism it does not
+    /// own.
+    pub fn writes_durable_on_ack(&self) -> bool
+    {
+        self.inner.writes_durable_on_ack()
+    }
+
     /// How block `idx` is mapped. See [`BlockState`].
     ///
     /// One bmap lookup, no data transfer.

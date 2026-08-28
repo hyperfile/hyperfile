@@ -407,6 +407,42 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(segid)
     }
 
+    /// True when a write that has returned `Ok` is already recoverable with no
+    /// further flush: its bytes are in the write-ahead log, and opening this
+    /// container again replays them.
+    ///
+    /// Named for the guarantee rather than for what currently provides it. A
+    /// caller deciding whether it may skip a flush is relying on the
+    /// guarantee, so if this crate ever keeps a log while not offering the
+    /// guarantee — batching log writes so a write can return before its bytes
+    /// are down, say — this must start answering `false` and the caller
+    /// degrades instead of silently losing data.
+    ///
+    /// What it covers, and does not:
+    ///
+    /// * **Scope** — the bytes each `Ok` return of `write` or `write_zero`
+    ///   reports as written. Nothing about writes that returned an error, and
+    ///   no ordering between separate writes.
+    /// * **When** — from the moment the call returns.
+    /// * **Independent of publishing** — holds regardless of
+    ///   `commit_bytes` and `commit_interval_ms`, and does not require any
+    ///   flush or segment publish to have happened.
+    /// * **Recovery** — reopening the same container with the same log
+    ///   configuration replays it. No manual step.
+    ///
+    /// It says nothing about a checkpoint existing for those bytes. Reading
+    /// them back needs the container reopened, not a checkpoint published.
+    pub fn writes_durable_on_ack(&self) -> bool {
+        #[cfg(feature = "wal")]
+        {
+            self.wal.is_some()
+        }
+        #[cfg(not(feature = "wal"))]
+        {
+            false
+        }
+    }
+
     pub fn stat(&self) -> libc::stat {
         // TODO: set dev and rdev here
         let dev = 0;
