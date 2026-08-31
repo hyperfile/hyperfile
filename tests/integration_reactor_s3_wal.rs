@@ -2196,3 +2196,92 @@ async fn reactor_wal_barrier_mode_publishes_only_when_asked() {
         cleanup_with_wal(&client, tf.uri()).await;
     }
 }
+
+/// Records that `Barrier` declined stay reachable, even after an inode-only
+/// publish.
+///
+/// A session that declines a group moves its sequence past it, so as not to
+/// write into that group's namespace. An attribute change with no dirty data
+/// then publishes the inode on its own, carrying the advanced sequence — and a
+/// recovery trigger that reads the sequence concludes there is nothing to do
+/// while the records are still sitting there.
+///
+/// Which matters because the two ends of the same question used different bases:
+/// the trigger read `last_seq`, the replay filters by `last_ondisk_cno`. They
+/// agree until a session advances one without publishing the other. Reopening in
+/// `Latest` after a `Barrier` session is exactly that case, and it is a promise
+/// made in the mode's own documentation: what `Barrier` set aside, `Latest` can
+/// still take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_declined_records_survive_an_inode_only_publish() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let config_for = |mode: WalRecoveryMode| {
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()))
+            .with_recovery_mode(mode);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    // Write, then die with the group unsealed.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config_for(WalRecoveryMode::Barrier),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0x8A);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    // Open in Barrier: it declines the group and moves its sequence past it.
+    // Then change an attribute and flush, which publishes the inode alone,
+    // carrying that advanced sequence to storage.
+    {
+        let mut hyper = Hyper::open(
+            client.clone(), config_for(WalRecoveryMode::Barrier),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("open barrier");
+        let r = hyper.wal_recovery_report();
+        assert!(r.records_dropped > 0, "the group should have been declined: {:?}", r);
+        let _ = hyper.fs_chmod(0o600).await.expect("chmod");
+        let _ = hyper.fs_flush().await.expect("inode-only publish");
+        let _ = hyper.fs_release().await.expect("release");
+    }
+
+    // Now Latest must still find and apply what Barrier set aside.
+    {
+        let mut hyper = Hyper::open(
+            client.clone(), config_for(WalRecoveryMode::Latest),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("open latest");
+        let r = hyper.wal_recovery_report();
+        assert!(r.replayed,
+            "Latest must still be able to take what Barrier declined: {:?}", r);
+        let mut buf = vec![0u8; BLK];
+        let n = hyper.fs_read(0, &mut buf).await.expect("read");
+        assert_eq!(n, BLK, "the declined write should be back");
+        assert!(buf.iter().all(|b| *b == 0x8A),
+            "came back {:#x}, expected 0x8a", buf[0]);
+        let _ = hyper.fs_release().await;
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}

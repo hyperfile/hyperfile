@@ -414,9 +414,24 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let v = wal.list_segments().await?;
             if let Some(wal_max_segid) = v.iter().max() {
                 let wal_max_segid = *wal_max_segid;
-                let last_seq = file.inode().get_last_seq();
-                if wal_max_segid >= last_seq {
-                    warn!("inconsistent wal data - max segid on wal: {}, seq in inode: {}", wal_max_segid, last_seq);
+                // Decided against `last_ondisk_cno`, which is what the replay
+                // itself filters by. Using two different bases for one question
+                // is how a group becomes unreachable: the trigger says there is
+                // nothing to do while the filter would have found something.
+                //
+                // They agree as long as every publish moves all three of
+                // `last_seq`, `last_cno` and `last_ondisk_cno` together, which
+                // was true until a session could advance `last_seq` on its own —
+                // it does that now, to avoid writing into a checkpoint whose
+                // records recovery declined. After that, an inode-only publish
+                // (an attribute change with no dirty data, which a filesystem
+                // above does constantly) writes the advanced `last_seq` out, and
+                // a trigger reading it concludes there is nothing to recover
+                // while the records are still sitting there.
+                let last_ondisk = file.inode().get_last_ondisk_cno();
+                if wal_max_segid >= last_ondisk {
+                    warn!("wal holds checkpoints up to {} at or beyond the last one \
+                          on disk ({}), recovering", wal_max_segid, last_ondisk);
                     let lock = file.flush_lock().await;
                     let _ = file.wal_flush_recovery(lock).await;
                 }
@@ -2494,7 +2509,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let stop_after_this = upto.is_some();
             match self.wal_replay_chunks_upto(segid, upto).await {
                 Ok(c) => {
-                    assert!(c == segid + 1);
+                    // Newer than the checkpoint replayed, but not necessarily
+                    // the next number along. That held while `last_seq` tracked
+                    // checkpoints one for one; a session that declined a group
+                    // moves `last_seq` past it without publishing anything, so
+                    // replaying that group later lands further ahead. What has
+                    // to be true is that the replay produced something newer.
+                    assert!(c > segid, "replay of {} produced {}", segid, c);
                     cno = c;
                 },
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
