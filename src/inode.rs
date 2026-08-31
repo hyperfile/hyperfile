@@ -397,6 +397,17 @@ impl Inode {
         self.i_last_seq
     }
 
+    /// Move the sequence forward, so records written from now on belong to a
+    /// checkpoint no earlier group occupies.
+    ///
+    /// Only moves forward: going back would put this session's records into a
+    /// namespace another session already used.
+    pub fn set_last_seq(&mut self, seq: SegmentId) {
+        if seq > self.i_last_seq {
+            self.i_last_seq = seq;
+        }
+    }
+
     #[inline]
     pub fn get_last_cno(&self) -> u64 {
         self.i_last_cno

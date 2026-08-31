@@ -413,11 +413,42 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if let Some(ref wal) = file.wal {
             let v = wal.list_segments().await?;
             if let Some(wal_max_segid) = v.iter().max() {
+                let wal_max_segid = *wal_max_segid;
                 let last_seq = file.inode().get_last_seq();
-                if *wal_max_segid >= last_seq {
+                if wal_max_segid >= last_seq {
                     warn!("inconsistent wal data - max segid on wal: {}, seq in inode: {}", wal_max_segid, last_seq);
                     let lock = file.flush_lock().await;
                     let _ = file.wal_flush_recovery(lock).await;
+                }
+
+                // Whatever recovery declined to apply is still in the log, and
+                // this session must not write into its checkpoint.
+                //
+                // Two reasons, and the second is the worse one. Record keys are
+                // `<seq>_<offset>_<len>` and the counter restarts at zero for a
+                // new session, so the first write lands on the key an unapplied
+                // record already occupies — a create-only PUT, so the write
+                // fails with 412. Replaying a similar workload makes that
+                // likely rather than rare: a consumer saw a run get partway
+                // through and then fail, and reported it as data appearing
+                // "partially".
+                //
+                // Worse, the two sets would end up in one group. A later
+                // barrier for that checkpoint would list this session's records
+                // *and* the ones recovery refused, and call the result
+                // complete — a seal vouching for work that was deliberately
+                // set aside.
+                //
+                // So move past everything the log holds. The records left
+                // behind stay findable: recovery filters by `last_ondisk_cno`,
+                // which a session that published nothing does not advance.
+                let last_seq = file.inode().get_last_seq();
+                if wal_max_segid >= last_seq {
+                    let next = wal_max_segid + 1;
+                    warn!("wal holds checkpoints up to {} that were not applied; \
+                          starting this session at {} so its records do not join \
+                          them", wal_max_segid, next);
+                    file.inode_mut().set_last_seq(next);
                 }
             }
         }

@@ -2033,3 +2033,75 @@ async fn direct_wal_aborting_a_transaction_undoes_it_here_and_now() {
 
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// Barrier recovery that has nothing to apply must not leave the container
+/// read-only.
+///
+/// "Stopped at an unsealed group, so nothing was applied" is `Barrier`'s most
+/// ordinary outcome, and it produced cno 0. The retry loop read 0 as failure,
+/// spent its attempts, and then set the fail-stop flag — after which every write
+/// fails, on a container that opened successfully. `do_open` discards the error,
+/// so nothing says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_barrier_recovery_with_nothing_to_apply_stays_writable() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()))
+        .with_recovery_mode(WalRecoveryMode::Barrier);
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    // Records with no barrier behind them: the whole log is one unsealed group,
+    // so Barrier recovery applies nothing at all.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0x71);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    let reactor = make_reactor();
+    let hyper = Hyper::open(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+    ).await.expect("reopen");
+
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+    // The container must still take writes. Nothing failed — there was simply
+    // nothing this mode was willing to apply.
+    let b = AlignedDataBlockWrapper::new(0, BLK, false);
+    b.as_mut_slice().fill(0x72);
+    let n = fh.fh_write_aligned_batch(vec![b]).await
+        .expect("a container that recovered to a seal must still be writable");
+    assert_eq!(n, BLK);
+    let _ = fh.fh_flush().await.expect("and flushable");
+
+    let mut buf = vec![0u8; BLK];
+    let _ = fh.fh_read(0, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0x72));
+
+    let _ = fh.fh_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
