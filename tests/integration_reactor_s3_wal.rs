@@ -2114,3 +2114,85 @@ async fn reactor_wal_barrier_recovery_with_nothing_to_apply_stays_writable() {
     cleanup_with_wal(&client, tf.uri()).await;
 }
 
+/// In `Barrier` mode nothing publishes unless the caller asks, and a write that
+/// would need a publish to make room is refused instead.
+///
+/// The mode sells one thing: the state recovery lands on is one the caller
+/// declared consistent. Recovery cannot land earlier than the newest published
+/// checkpoint, so anything else that publishes puts a checkpoint nobody declared
+/// beneath the floor and the guarantee is gone. Whether that publish also writes
+/// a barrier is beside the point — publishing at all is what does it.
+///
+/// The control is `Latest`, where the threshold must still publish: the memory
+/// bound is the reason it exists, and this is a change of who may publish, not
+/// the removal of a bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_barrier_mode_publishes_only_when_asked() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    // A threshold a handful of blocks crosses.
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = 8 * BLK;
+    runtime.data_cache_dirty_max_blocks_threshold = 8;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    runtime.segment_buffer_size = 8 * BLK;
+
+    for mode in [WalRecoveryMode::Barrier, WalRecoveryMode::Latest] {
+        let tf = TestFile::new(&client).await;
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()))
+            .with_recovery_mode(mode);
+        let config = HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build();
+
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config,
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        let before = fh.fh_last_cno().await.expect("last cno");
+        let mut refused = None;
+        for i in 0..40usize {
+            let b = AlignedDataBlockWrapper::new(i as u64, BLK, false);
+            b.as_mut_slice().fill(0x60 + (i % 16) as u8);
+            match fh.fh_write_aligned_batch(vec![b]).await {
+                Ok(_) => {},
+                Err(e) => { refused = Some(e); break; },
+            }
+        }
+        let after = fh.fh_last_cno().await.expect("last cno");
+
+        match mode {
+            WalRecoveryMode::Barrier => {
+                let e = refused.expect(
+                    "Barrier must refuse a write it cannot make room for rather than \
+                     publishing a checkpoint the caller never declared");
+                assert_eq!(e.kind(), std::io::ErrorKind::OutOfMemory, "got {:?}: {}", e.kind(), e);
+                assert_eq!(after, before,
+                    "and nothing may have published on its own: {} -> {}", before, after);
+                // Asking explicitly still works, and makes room.
+                let _ = fh.fh_flush().await.expect("an explicit flush is the way out");
+                assert!(fh.fh_last_cno().await.expect("cno") > before,
+                    "the caller's own flush must publish");
+            },
+            WalRecoveryMode::Latest => {
+                assert!(refused.is_none(),
+                    "Latest keeps its memory bound by publishing: {:?}", refused);
+                assert!(after > before,
+                    "so the threshold must still have published: {} -> {}", before, after);
+            },
+        }
+
+        let _ = fh.fh_release().await;
+        cleanup_with_wal(&client, tf.uri()).await;
+    }
+}

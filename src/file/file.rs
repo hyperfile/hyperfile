@@ -487,9 +487,27 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// suppressed. Reporting the overflow is the honest outcome: publishing
     /// would break what the interval promised, and growing without limit would
     /// trade the memory bound away without saying so.
+    /// Whether publishing happens only when the caller asks.
+    ///
+    /// True inside a transaction, and true throughout `Barrier` recovery mode.
+    /// They are the same requirement at different scopes: a transaction says
+    /// "this stretch of writes is one unit, do not publish inside it", and
+    /// `Barrier` says "every stretch between my flushes is one unit".
+    ///
+    /// `Barrier` has no choice about it. What that mode sells is that the state
+    /// recovery lands on is one the caller declared consistent, and recovery
+    /// cannot land earlier than the newest published checkpoint — so anything
+    /// else that publishes puts a checkpoint the caller never declared beneath
+    /// the floor, and the guarantee is gone. Sealing it or not makes no
+    /// difference; publishing at all is what does it.
+    #[cfg(feature = "wal")]
+    pub(crate) fn publishes_on_request_only(&self) -> bool {
+        self.txn_open || self.wal_recovery_mode() == WalRecoveryMode::Barrier
+    }
+
     #[cfg(feature = "wal")]
     pub(crate) fn check_txn_room(&self) -> Result<()> {
-        if !self.txn_open {
+        if !self.publishes_on_request_only() {
             return Ok(());
         }
         let dirty = self.cache.dirty_count();
@@ -498,9 +516,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             || dirty > self.config.runtime.data_cache_dirty_max_blocks_threshold
         {
             return Err(Error::new(ErrorKind::OutOfMemory, format!(
-                "a transaction has reached {} dirty bytes in {} blocks, past the \
-                 configured limits; nothing can be published while it is open, so the \
-                 transaction is too large to hold", bytes, dirty)));
+                "{} dirty bytes in {} blocks, past the configured limits, and nothing \
+                 may publish without the caller asking — flush, or commit the \
+                 transaction, to make room", bytes, dirty)));
         }
         Ok(())
     }
@@ -1710,6 +1728,11 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub(crate) async fn write_aligned_batch_locked(&mut self, mut blocks: Vec<AlignedDataBlockWrapper>, permit: OwnedSemaphorePermit) -> Result<usize> {
+        // Checked here rather than only in the outer wrapper: the reactor's
+        // batch arms call this directly, so a guard above it covers one surface
+        // and not the other.
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -2093,7 +2116,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // make half of that unit the container's newest checkpoint — which the
         // next open would take as its baseline.
         #[cfg(feature = "wal")]
-        if self.txn_open {
+        if self.publishes_on_request_only() {
             return false;
         }
         #[cfg(feature = "wal")]
@@ -3058,6 +3081,11 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     }
 
     pub async fn write_batch_locked(&mut self, blocks: Vec<BatchDataBlockWrapper>, permit: OwnedSemaphorePermit) -> Result<usize> {
+        // Checked here rather than only in the outer wrapper: the reactor's
+        // batch arms call this directly, so a guard above it covers one surface
+        // and not the other.
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
