@@ -2397,6 +2397,34 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Ok(WalGroupState::Complete)
     }
 
+    /// Whether a later session sealed a group above this one.
+    ///
+    /// A barrier above means some session wrote and sealed on top of a base that
+    /// did not include this group. So this group belongs to a session that is
+    /// gone, and the work above it is a delta on the very checkpoint recovery
+    /// would land on — applying that is not inventing a state, it is the state
+    /// the later session had.
+    ///
+    /// Cheap on purpose, and asked only of a group that would otherwise stop the
+    /// replay: one read per group above it, none at all in the ordinary case
+    /// where nothing stops.
+    ///
+    /// A barrier is the evidence rather than a whole group state because that is
+    /// what makes the group abandoned; each group above is still judged on its
+    /// own when the walk reaches it.
+    #[cfg(feature = "wal")]
+    async fn wal_group_superseded(&self, segid: SegmentId, above: &[SegmentId]) -> Result<bool> {
+        let Some(ref wal) = self.wal else {
+            return Err(Error::new(ErrorKind::Unsupported, "wal is not configured"));
+        };
+        for id in above.iter().filter(|id| **id > segid) {
+            if wal.read_barrier(*id).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     // starting wal flush recovery process by reloading inode from backend storage
     // everything should be clean or give a panic if unrecoverable
     #[cfg(feature = "wal")]
@@ -2484,6 +2512,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         let mut cno = 0;
         let mut stopped_at: Option<SegmentId> = None;
+        let mut skipped: Vec<SegmentId> = Vec::new();
         let mut last_applied_sealed = true;
         let mut remaining = segids.clone();
         for segid in segids {
@@ -2502,6 +2531,45 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // that cannot be answered afterwards because a replayed group's
             // objects are deleted once it lands.
             let state = self.wal_group_state(segid).await?;
+
+            // A group that is not whole gets one more question asked of it
+            // before it is allowed to stop anything: is there a barrier above
+            // it? If there is, this group was abandoned by a session that is
+            // gone and a later one sealed past it — see `wal_group_superseded`.
+            //
+            // Stopping at it instead is a floor that nothing lifts. The group
+            // does not go away, and until something publishes,
+            // `last_ondisk_cno` does not move past it — so every later open
+            // walks into the same group and stops in the same place while the
+            // sealed groups behind it stay unreachable. Arriving here takes
+            // nothing more than a crash in mid-flush, which makes it the
+            // ordinary outcome rather than a corner.
+            //
+            // The invariant that makes the question answerable: a session seals
+            // each group before advancing past it, and never writes into a
+            // group it found already there. So the only group a session can
+            // leave unsealed is the last one it wrote, and an unsealed group
+            // with a barrier above it cannot belong to anyone still running.
+            let superseded = if state == WalGroupState::Complete {
+                false
+            } else {
+                self.wal_group_superseded(segid, &remaining).await?
+            };
+            let barrier_mode = self.wal_recovery_mode() == WalRecoveryMode::Barrier;
+
+            // Applying part of a superseded group is the one thing `Barrier`
+            // must not do, so there it is skipped whole — including the records
+            // before an open transaction, which a later session never saw
+            // either. `Latest` keeps every acknowledged write and lands on
+            // mixed states by design, so what changes for it is only that such
+            // a group no longer stops the replay.
+            if superseded && barrier_mode {
+                warn!("do_wal_flush_recovery - checkpoint {} was abandoned and a \
+                      later session sealed past it, setting it aside", segid);
+                skipped.push(segid);
+                continue;
+            }
+
             // An interval the caller left open is honoured in both modes: it is
             // an explicit declaration, not an inference about where the crash
             // fell. Records before it are ordinary and still applied; from it on
@@ -2513,7 +2581,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                       left open at seq {}; applying what came before it and stopping \
                       there", segid, from_seq);
                 upto = Some(from_seq);
-                stopped_at = Some(segid);
+                if !superseded {
+                    stopped_at = Some(segid);
+                }
             }
             if upto.is_none() && self.wal_recovery_mode() == WalRecoveryMode::Barrier {
                 match state {
@@ -2534,16 +2604,25 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 }
             }
             last_applied_sealed = state == WalGroupState::Complete;
-            let stop_after_this = upto.is_some();
+            let stop_after_this = upto.is_some() && !superseded;
             match self.wal_replay_chunks_upto(segid, upto).await {
                 Ok(c) => {
-                    // Newer than the checkpoint replayed, but not necessarily
-                    // the next number along. That held while `last_seq` tracked
-                    // checkpoints one for one; a session that declined a group
-                    // moves `last_seq` past it without publishing anything, so
-                    // replaying that group later lands further ahead. What has
-                    // to be true is that the replay produced something newer.
-                    assert!(c > segid, "replay of {} produced {}", segid, c);
+                    // The checkpoint a replay lands on bears no fixed relation
+                    // to the number of the group being replayed, and asserting
+                    // that it did has been wrong three times. It held only
+                    // while `last_seq` tracked checkpoints one for one, and
+                    // three things now move one without the other: a session
+                    // that declines a group moves `last_seq` past it, a
+                    // deferred publish moves it without publishing, and a group
+                    // set aside is never published at all. Recovery also runs
+                    // before this session advances `last_seq`, so a replay can
+                    // land on a number below the group it came from.
+                    //
+                    // What has to be true is that the floor moved forward, or
+                    // the next open finds the same work waiting.
+                    assert!(c > last_ondisk,
+                        "replay of {} produced {}, which is not past the floor \
+                         recovery started from ({})", segid, c, last_ondisk);
                     cno = c;
                 },
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -2579,10 +2658,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // it left behind is counted so the caller knows work was set aside
         // rather than lost — the records are still in the log.
         let mut dropped = 0usize;
-        if let Some(segid) = stopped_at {
-            for id in std::iter::once(segid).chain(remaining.into_iter()) {
-                dropped += self.wal_list_chunks(id).await.map(|m| m.len()).unwrap_or(0);
-            }
+        let stopped = match stopped_at {
+            Some(segid) => vec![segid],
+            None => Vec::new(),
+        };
+        // Groups set aside count too. They were superseded rather than lost —
+        // still in the log, and still readable by a caller that goes looking —
+        // but nothing here applied them, and a report that said zero would be
+        // claiming otherwise.
+        for id in stopped.into_iter().chain(skipped.into_iter()).chain(remaining.into_iter()) {
+            dropped += self.wal_list_chunks(id).await.map(|m| m.len()).unwrap_or(0);
         }
         // Stopping happens only at a seal, so that landing point is one by
         // construction. Otherwise it depends on the last group applied.

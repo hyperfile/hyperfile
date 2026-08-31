@@ -2411,3 +2411,290 @@ async fn count_container_objects(client: &aws_sdk_s3::Client, uri: &str) -> usiz
     }
     n
 }
+
+/// A group that a dead session left unsealed must not keep the sealed work above
+/// it out of reach.
+///
+/// `Barrier` declines an unsealed group, which is right, and leaves it in the
+/// log, which is also right — a caller may still want to look at it. What was
+/// wrong is that the next session then wrote on top of the same checkpoint,
+/// sealed its own group, and recovery walked into the declined one again and
+/// stopped there, never reaching the sealed group behind it. Nothing lifts that:
+/// the group does not go away, and `last_ondisk_cno` does not move until
+/// something publishes, so every later open stops in the same place. A consumer
+/// hit it on the first run of a crash round that did an ordinary write after a
+/// recovery, and reported acknowledged writes that were not there afterwards.
+///
+/// Sealed-without-publishing is arranged here with `publish_every`, which makes
+/// the state deterministic. The reported route there was a publish that had been
+/// spawned and had not finished when the process died — the same log state either
+/// way, which is what recovery reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_work_sealed_past_an_abandoned_group_is_still_recovered() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let config_for = |uri: &str, every: usize| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", uri))
+            .with_recovery_mode(WalRecoveryMode::Barrier)
+            .with_publish_every(every);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    let tf = TestFile::new(&client).await;
+
+    // Published work, then work with no flush behind it, then die. That leaves
+    // an unsealed group, which is what the next open declines.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config_for(tf.uri(), 1),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        let published = AlignedDataBlockWrapper::new(0, BLK, false);
+        published.as_mut_slice().fill(0xE1);
+        let _ = fh.fh_write_aligned_batch(vec![published]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush publishes it");
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let abandoned = AlignedDataBlockWrapper::new(1, BLK, false);
+        abandoned.as_mut_slice().fill(0xE2);
+        let _ = fh.fh_write_aligned_batch(vec![abandoned]).await.expect("write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    // A session that declines that group, and then does ordinary work on top of
+    // the checkpoint it landed on and seals it.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config_for(tf.uri(), 2),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("open declines the unsealed group");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        let sealed = AlignedDataBlockWrapper::new(2, BLK, false);
+        sealed.as_mut_slice().fill(0xE3);
+        let _ = fh.fh_write_aligned_batch(vec![sealed]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush seals without publishing");
+        drop(fh);
+        drop(reactor);
+    }
+
+    let mut hyper = Hyper::open(
+        client.clone(), config_for(tf.uri(), 1),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+
+    let mut buf = vec![0u8; BLK];
+    let _ = hyper.fs_read(0, &mut buf).await.expect("read the published block");
+    assert!(buf.iter().all(|b| *b == 0xE1), "published work went missing");
+
+    let mut buf = vec![0u8; BLK];
+    let _ = hyper.fs_read(BLK, &mut buf).await.expect("read the abandoned block");
+    assert!(buf.iter().all(|b| *b != 0xE2),
+        "the unsealed group was applied, which is what Barrier declines to do");
+
+    // The point. Its group is sealed and complete, and it sits above a group
+    // nobody will ever apply — which is not a reason to leave it unreachable.
+    let mut buf = vec![0u8; BLK];
+    let _ = hyper.fs_read(2 * BLK, &mut buf).await.expect("read the sealed block");
+    assert!(buf.iter().all(|b| *b == 0xE3),
+        "work sealed after a decline was lost: recovery stopped at the abandoned \
+         group instead of setting it aside, so everything behind it is unreachable \
+         and stays that way");
+
+    let _ = hyper.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// Two sessions in a row can die without sealing, and a third's work still has
+/// to be reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_several_abandoned_groups_are_all_set_aside() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let config_for = |uri: &str, every: usize| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", uri))
+            .with_recovery_mode(WalRecoveryMode::Barrier)
+            .with_publish_every(every);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    let tf = TestFile::new(&client).await;
+
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config_for(tf.uri(), 1),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0xC1);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let b = AlignedDataBlockWrapper::new(1, BLK, false);
+        b.as_mut_slice().fill(0xC2);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    // Second session: declines the first's group, then dies without sealing its
+    // own. Now there are two groups nobody will apply.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config_for(tf.uri(), 1),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("open");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let b = AlignedDataBlockWrapper::new(2, BLK, false);
+        b.as_mut_slice().fill(0xC3);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    // Third session: seals, does not publish.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config_for(tf.uri(), 2),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("open");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let b = AlignedDataBlockWrapper::new(3, BLK, false);
+        b.as_mut_slice().fill(0xC4);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush seals without publishing");
+        drop(fh);
+        drop(reactor);
+    }
+
+    let mut hyper = Hyper::open(
+        client.clone(), config_for(tf.uri(), 1),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+
+    let mut buf = vec![0u8; BLK];
+    let _ = hyper.fs_read(3 * BLK, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0xC4),
+        "two abandoned groups in front of it, and the sealed work is still gone");
+
+    for (idx, byte) in [(1usize, 0xC2u8), (2, 0xC3)] {
+        let mut buf = vec![0u8; BLK];
+        let _ = hyper.fs_read(idx * BLK, &mut buf).await.expect("read");
+        assert!(buf.iter().all(|b| *b != byte),
+            "block {} came from an abandoned group", idx);
+    }
+
+    let _ = hyper.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// An attribute change made after a decline is durable, which is a different
+/// question from the data one: the log carries writes, not attributes, so what
+/// makes a `chmod` survive is the inode publish and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_attr_change_after_a_decline_is_durable() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let tf = TestFile::new(&client).await;
+    let config_for = |uri: &str| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", uri))
+            .with_recovery_mode(WalRecoveryMode::Barrier);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config_for(tf.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0xA1);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let b = AlignedDataBlockWrapper::new(1, BLK, false);
+        b.as_mut_slice().fill(0xA2);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config_for(tf.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("open declines the unsealed group");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let mut stat = fh.fh_getattr().await.expect("getattr");
+        stat.st_mode = (stat.st_mode & libc::S_IFMT) | 0o600;
+        let _ = fh.fh_setattr(stat).await.expect("setattr");
+        let _ = fh.fh_flush().await.expect("flush publishes the inode");
+        drop(fh);
+        drop(reactor);
+    }
+
+    let mut hyper = Hyper::open(
+        client.clone(), config_for(tf.uri()),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+    let stat = hyper.fs_getattr().expect("getattr");
+    assert_eq!(stat.st_mode & 0o777, 0o600,
+        "the mode set after a decline went back to its old value");
+    let _ = hyper.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
