@@ -13,6 +13,7 @@ use common::*;
 use hyperfile::file::hyper::Hyper;
 use hyperfile::file::flags::FileFlags;
 use hyperfile::file::mode::FileMode;
+use hyperfile::buffer::AlignedDataBlockWrapper;
 
 /// Verify basic create → write → flush → release → reopen → read round-trip.
 #[tokio::test]
@@ -2031,6 +2032,62 @@ async fn smoke_o_direct_read_write_does_not_panic() {
         assert!(buf[150..].iter().all(|&b| b == 0xAA));
         let _ = hyper.fs_release().await;
     }
+
+    tf.cleanup(&client).await;
+}
+
+/// An aligned batch write over a block that is sitting clean in the read cache
+/// replaces it, and what lands on storage is the new content.
+///
+/// That path merges into the cached copy rather than starting from a fresh
+/// block, which is correct here only because a whole-block write replaces every
+/// byte. It used to log "this is not by design" every time, which sent a
+/// consumer looking for a correctness bug; this is the test that says there
+/// isn't one.
+#[tokio::test]
+#[ignore]
+async fn smoke_batch_overwrite_of_a_clean_cached_block() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLOCK: usize = 4096;
+
+    // Publish two blocks, then reopen cold.
+    {
+        let mut h = Hyper::fs_open_or_create_with_default_opt(
+            &client, tf.uri(), FileFlags::rdwr(), FileMode::default_file(),
+        ).await.expect("create");
+        let _ = h.fs_write(0, &vec![0x11u8; 2 * BLOCK]).await.expect("write");
+        let _ = h.fs_flush().await.expect("flush");
+        let _ = h.fs_release().await.expect("release");
+    }
+
+    let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdwr()).await.expect("reopen");
+
+    // Read block 1, which leaves it clean in the read cache.
+    let mut buf = vec![0u8; BLOCK];
+    let _ = h.fs_read(BLOCK, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0x11));
+
+    // Overwrite it through the aligned batch path, which merges into that
+    // cached copy.
+    let blk = AlignedDataBlockWrapper::new(1, BLOCK, false);
+    blk.as_mut_slice().fill(0x22);
+    let n = h.fs_write_aligned_batch(vec![blk]).await.expect("batch write");
+    assert_eq!(n, BLOCK);
+    let _ = h.fs_flush().await.expect("flush");
+    let _ = h.fs_release().await.expect("release");
+
+    // Cold reopen: every byte is the new content, and its neighbour is untouched.
+    let mut h = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly()).await.expect("reopen");
+    let mut buf = vec![0u8; BLOCK];
+    let _ = h.fs_read(BLOCK, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0x22),
+        "the overwrite did not fully land: first byte {:#x}", buf[0]);
+    let mut buf0 = vec![0u8; BLOCK];
+    let _ = h.fs_read(0, &mut buf0).await.expect("read block 0");
+    assert!(buf0.iter().all(|b| *b == 0x11), "block 0 changed");
+    let _ = h.fs_release().await.expect("release");
 
     tf.cleanup(&client).await;
 }

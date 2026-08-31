@@ -178,12 +178,29 @@ impl Cache for MemCache {
             // found in dirty list, just update it's content
             block.copy(off, buf);
         } else if let Some(mut block) = self.data_blocks_cache.pop(blk_idx) {
-            // not found in dirty list but on cache list,
-            // let's update block content and move it to dirty list
-            // NOTE: this not intend to happen in currently design, kick warning
+            // Clean in the read cache: its bytes are what storage holds, so
+            // updating it and moving it to the dirty list is correct.
+            //
+            // Whether arriving here means anything is wrong depends on how much
+            // of the block is being written. A whole-block write replaces every
+            // byte, so it does not matter what was underneath — and that is the
+            // ordinary case for the aligned batch path, which has no reason to
+            // prepare a block it is going to overwrite entirely.
+            //
+            // A partial write is different: it keeps the bytes it does not
+            // touch, so it needs a block whose content is known good.
+            // `write_prepare` promotes a clean block into the dirty list for
+            // exactly that reason, so reaching here with a partial write means
+            // preparation was skipped. That is worth a warning; the whole-block
+            // case is not, and warning about it sent a consumer looking for a
+            // correctness bug that was not there.
+            let partial = off != 0 || buf.len() != self.data_block_size;
             block.copy(off, buf);
             self.data_blocks_dirty.insert(*blk_idx, block);
-            warn!("update_cache - block index: {blk_idx} not in dirty list but in cache list, this is not by design");
+            if partial {
+                warn!("update_cache - block index: {blk_idx} was clean in the read \
+                       cache and is being partially written without preparation");
+            }
         } else {
             // can't found in dirty list, create a new one
             let mut block = DataBlock::new(*blk_idx, self.data_block_size);
