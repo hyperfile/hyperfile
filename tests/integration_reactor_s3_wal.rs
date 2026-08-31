@@ -2768,3 +2768,60 @@ async fn reactor_wal_deferred_publish_still_publishes_an_attr_only_flush() {
     let _ = hyper.fs_release().await;
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// A request whose work needs the flush lock must not wait for it on the handler
+/// task.
+///
+/// The reactor's WAL flush hands the flush lock's guard to a spawned publish, and
+/// the guard comes back as a callback — to the handler task, the same one that
+/// runs every request. So a request that waits for that lock stops the task from
+/// ever taking the callback, the guard never returns, and the handle is wedged
+/// for good. Not slowed down: wedged, with no error and no timeout.
+///
+/// The window is `fh_flush` returning until the publish behind it lands, which is
+/// a couple of object-store round trips. `fsync` then `chmod` lands in it, and a
+/// filesystem does that pairing constantly.
+///
+/// `release` was already right about this — it reports the conflict and its arm
+/// puts the request back on the queue. Returning to the loop is the whole point,
+/// because that is when the callback gets taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_setattr_right_after_flush_does_not_wedge_the_handler() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let tf = TestFile::new(&client).await;
+    let config = build_wal_config(tf.uri());
+
+    let reactor = make_reactor();
+    let hyper = Hyper::create(
+        client.clone(), config,
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+    ).await.expect("create");
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+    let b = AlignedDataBlockWrapper::new(0, BLK, false);
+    b.as_mut_slice().fill(0x77);
+    let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+
+    // Returns while the publish is still in flight, so the guard is out.
+    let _ = fh.fh_flush().await.expect("flush");
+
+    // No delay on purpose: that is the window.
+    let mut stat = fh.fh_getattr().await.expect("getattr");
+    stat.st_mode = (stat.st_mode & libc::S_IFMT) | 0o600;
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(20), fh.fh_setattr(stat)).await;
+    match res {
+        Ok(r) => { let _ = r.expect("setattr"); },
+        Err(_) => panic!("setattr never came back: it waited for the flush lock on \
+                          the handler task, so the callback carrying that lock back \
+                          can never be taken"),
+    }
+
+    let _ = fh.fh_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}

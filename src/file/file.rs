@@ -785,6 +785,17 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     pub async fn update_stat(&mut self, stat: &libc::stat) -> Result<libc::stat> {
+        // The flush lock may be travelling with a publish that is already in
+        // flight. Under the reactor its guard is handed to a spawned task and
+        // comes back as a callback to the handler task — the same task that runs
+        // this. Waiting for it here means the callback never gets processed, the
+        // guard never returns, and the handler is wedged for good. So report the
+        // conflict and let the caller's arm re-queue the request, which is what
+        // `release` has always done.
+        #[cfg(feature = "reactor")]
+        if self.state.is_flushing() {
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is in-progress"));
+        };
         let stat = self.inode.update_stat(stat);
         let _ = self.flush().await?;
         Ok(stat)

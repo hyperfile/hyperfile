@@ -752,7 +752,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
 
     pub async fn fh_setattr(&self, stat: libc::stat) -> Result<libc::stat>
     {
-        let (ctx, rx) = FileContext::new_setattr(stat);
+        let (ctx, rx) = FileContext::new_setattr(self.inner.clone(), stat);
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }

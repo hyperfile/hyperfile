@@ -627,8 +627,11 @@ pub struct FileReqWithBlock<'a> {
 
 pub struct FileReqGetAttr {}
 
-pub struct FileReqSetAttr {
+pub struct FileReqSetAttr<'a> {
     pub stat: libc::stat,
+    /// Carried so the arm can re-queue this request when a flush is in flight;
+    /// see the `SetAttr` arm of `Task::handle`.
+    pub fh: ChannelGroup<FileContext<'a>>,
 }
 
 pub struct FileReqFlush<'a> {
@@ -701,7 +704,7 @@ pub enum FileReqOp {
 #[repr(C)]
 pub union FileReqBody<'a> {
     getattr: ManuallyDrop<FileReqGetAttr>,
-    setattr: ManuallyDrop<FileReqSetAttr>,
+    setattr: ManuallyDrop<FileReqSetAttr<'a>>,
     read: ManuallyDrop<FileReqRead<'a>>,
     write: ManuallyDrop<FileReqWrite<'a>>,
     write_zero: ManuallyDrop<FileReqWriteZero<'a>>,
@@ -757,11 +760,11 @@ impl<'a> FileContext<'a> {
         (Self { req: Some(req), resp: Some(resp), }, rx)
     }
 
-    pub fn new_setattr(stat: libc::stat) -> (Self, oneshot::Receiver<FileRespSetAttr>) {
+    pub fn new_setattr(fh: ChannelGroup<FileContext<'a>>, stat: libc::stat) -> (Self, oneshot::Receiver<FileRespSetAttr>) {
         let (tx, rx) = oneshot::channel::<FileRespSetAttr>();
         let req = FileReq {
             op: FileReqOp::SetAttr,
-            body: FileReqBody { setattr: ManuallyDrop::new(FileReqSetAttr { stat: stat }), },
+            body: FileReqBody { setattr: ManuallyDrop::new(FileReqSetAttr { stat: stat, fh, }), },
         };
         let resp = FileResp::SetAttr(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
@@ -1194,6 +1197,14 @@ impl<'a> FileContext<'a> {
         Self { req: Some(req), resp: Some(resp) }
     }
 
+    pub fn reform_setattr(req: FileReqSetAttr<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::SetAttr,
+            body: FileReqBody { setattr: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
     pub fn reform_flush(req: FileReqFlush<'a>, resp: FileResp) -> Self {
         let req = FileReq {
             op: FileReqOp::Flush,
@@ -1238,7 +1249,22 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let req = ManuallyDrop::into_inner(md);
                 let stat = req.stat;
                 let res = self.inner.update_stat(&stat).await;
-                let _ = resp.to_setattr().send(res);
+                match res {
+                    // Persisting the change needs the flush lock, and under a
+                    // WAL that lock may be travelling with a publish already in
+                    // flight — its guard comes back as a callback to this task.
+                    // Waiting for it here would stop this task from ever taking
+                    // that callback, so `update_stat` reports the conflict and
+                    // the request goes back on the queue. Returning to the loop
+                    // is the whole point: that is when the callback gets taken
+                    // and the lock comes back.
+                    Err(ref e) if e.kind() == ErrorKind::ResourceBusy => {
+                        let fh = req.fh.clone();
+                        let ctx = FileContext::reform_setattr(req, resp);
+                        let _ = fh.send_highprio(ctx);
+                    },
+                    _ => { let _ = resp.to_setattr().send(res); },
+                }
             },
             FileReqOp::Read => {
                 let md = unsafe { req.body.read };
@@ -1883,7 +1909,8 @@ mod tests {
         let local = LocalSet::new();
         local.block_on(&rt, async {
             let stat_in: libc::stat = unsafe { std::mem::zeroed() };
-            let (ctx, rx) = FileContext::new_setattr(stat_in);
+            let fh = make_handler().await;
+            let (ctx, rx) = FileContext::new_setattr(fh, stat_in);
             let (req, resp) = ctx.take();
             assert!(matches!(req.op, FileReqOp::SetAttr));
             let body = ManuallyDrop::into_inner(unsafe { req.body.setattr });
