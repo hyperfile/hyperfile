@@ -36,6 +36,7 @@ use hyperfile::file::mode::HyperFileMode;
 use hyperfile::config::{HyperFileConfig, HyperFileConfigBuilder};
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::wal::config::HyperFileWalConfig;
+use hyperfile::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 
 /// Build a HyperFileConfig with WAL pointing at `<uri>/wal/`.
 fn build_wal_config(uri: &str) -> HyperFileConfig {
@@ -1056,4 +1057,385 @@ async fn reactor_wal_writes_are_durable_on_ack_without_any_flush() {
         let _ = hyper.fs_release().await;
     }
     tf2.cleanup(&client).await;
+}
+
+/// Count objects under the WAL prefix.
+async fn wal_object_count(client: &aws_sdk_s3::Client, uri: &str) -> usize {
+    let bucket = test_bucket();
+    let prefix = format!("{}/wal/", uri.strip_prefix(&format!("s3://{}/", bucket)).expect("uri"));
+    let mut n = 0;
+    let mut token = None;
+    loop {
+        let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+        if let Some(t) = token { req = req.continuation_token(t); }
+        let r = req.send().await.expect("list wal prefix");
+        n += r.contents().len();
+        match r.next_continuation_token() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    n
+}
+
+/// A batch write reaches the log, like any other write.
+///
+/// `write_inner` logs; `write_aligned_batch_locked` did not, so a caller using
+/// the batch API got a log that stayed empty and a recovery that had nothing to
+/// replay. That is not merely a missing feature: the flush path answers early
+/// *because* the log holds the data, so writes it never saw are acknowledged
+/// while living only in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_batch_write_reaches_the_log() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const NB: usize = 24;
+    const BLK: usize = 4096;
+
+    let reactor = make_reactor();
+    let hyper = Hyper::create(
+        client.clone(), build_wal_config(tf.uri()),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+    ).await.expect("create");
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+    assert_eq!(wal_object_count(&client, tf.uri()).await, 0, "nothing written yet");
+
+    // Data blocks and a hole, so both kinds are covered.
+    let mut blocks = Vec::new();
+    for i in 0..NB {
+        let b = AlignedDataBlockWrapper::new(i as u64, BLK, i == 7);
+        if i != 7 {
+            b.as_mut_slice().fill((i % 251) as u8);
+        }
+        blocks.push(b);
+    }
+    let n = fh.fh_write_aligned_batch(blocks).await.expect("batch write");
+    assert_eq!(n, NB * BLK);
+
+    let logged = wal_object_count(&client, tf.uri()).await;
+    assert!(logged > 0, "a batch write must reach the log, found {} objects", logged);
+    // Adjacent blocks share a record. This layout is two data runs split by a
+    // hole, so three records — not one per block, which is the cost the batch
+    // API exists to avoid.
+    assert_eq!(logged, 3,
+        "expected one record per run of adjacent same-kind blocks, got {}", logged);
+
+    let _ = fh.fh_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// And the guarantee `writes_durable_on_ack` reports holds for it: a batch
+/// write that returned `Ok` survives with no flush at all.
+///
+/// Same shape as `reactor_wal_writes_are_durable_on_ack_without_any_flush`,
+/// through the batch API, because that is the API a caller reaches for once it
+/// has measured the difference — and the guarantee cannot be true of one write
+/// path and false of another while a single method reports it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_batch_write_is_durable_on_ack() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const NB: usize = 8;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let config = {
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    // Exists, with an empty log.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let _ = fh.fh_release().await;
+    }
+
+    // Batch write, then die: no flush, no release.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("reopen");
+        assert!(hyper.writes_durable_on_ack(), "the log is configured");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let mut blocks = Vec::new();
+        for i in 0..NB {
+            let b = AlignedDataBlockWrapper::new(i as u64, BLK, false);
+            b.as_mut_slice().fill(0x40 + i as u8);
+            blocks.push(b);
+        }
+        let _ = fh.fh_write_aligned_batch(blocks).await.expect("batch write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    // Reopen: recovery must produce it.
+    {
+        let mut hyper = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("reopen after crash");
+        let st = hyper.fs_getattr().expect("getattr");
+        assert_eq!(st.st_size as usize, NB * BLK,
+            "the batch write returned Ok, so its size must survive");
+        for i in 0..NB {
+            let mut buf = vec![0u8; BLK];
+            let n = hyper.fs_read(i * BLK, &mut buf).await.expect("read");
+            assert_eq!(n, BLK);
+            assert!(buf.iter().all(|b| *b == 0x40 + i as u8),
+                "block {} did not survive: first byte {:#x}", i, buf[0]);
+        }
+        let _ = hyper.fs_release().await;
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// Crash, recover, crash again with no successful publish in between — and the
+/// container stays exactly what was acknowledged, and stays writable.
+///
+/// The ordering matters and is easy to lose: a consumer reported that a
+/// successful flush anywhere between the recovery and the crash hides the
+/// problem. So no round flushes. Recovery itself publishes, which is what makes
+/// "no publish *after* recovery" the interesting window.
+///
+/// Batch writes throughout, since that is the API the report came from.
+/// Deliberately small — a handful of blocks per round is enough to establish
+/// the invariant; volume belongs in a performance measurement, not here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_repeated_crash_without_publish_keeps_the_container_sound() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+    const PER_ROUND: usize = 4;
+
+    // Nothing may publish on its own, so every publish in this test is either
+    // recovery's or an explicit flush.
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let config = {
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    let batch = |round: usize| {
+        let mut blocks = Vec::new();
+        for i in 0..PER_ROUND {
+            let idx = (round * PER_ROUND + i) as u64;
+            let b = AlignedDataBlockWrapper::new(idx, BLK, false);
+            b.as_mut_slice().fill((0x10 * (round + 1) + i) as u8);
+            blocks.push(b);
+        }
+        blocks
+    };
+    let expected = |round: usize, i: usize| (0x10 * (round + 1) + i) as u8;
+
+    // Round 0: create, batch write, die. No flush.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let _ = fh.fh_write_aligned_batch(batch(0)).await.expect("batch 0");
+        drop(fh);
+        drop(reactor);
+    }
+
+    // Rounds 1..3: open (which recovers and publishes), write, die. Nothing
+    // between the recovery and the death publishes anything.
+    for round in 1..4usize {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.unwrap_or_else(|e| panic!("round {} reopen: {}", round, e));
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        // Everything acknowledged so far must be readable right after recovery.
+        for r in 0..round {
+            for i in 0..PER_ROUND {
+                let off = (r * PER_ROUND + i) * BLK;
+                let mut buf = vec![0u8; BLK];
+                let n = fh.fh_read(off, &mut buf).await
+                    .unwrap_or_else(|e| panic!("round {} read of round {} block {}: {}", round, r, i, e));
+                assert_eq!(n, BLK, "round {}: short read of round {} block {}", round, r, i);
+                assert!(buf.iter().all(|b| *b == expected(r, i)),
+                    "round {}: round {} block {} came back {:#x}, expected {:#x}",
+                    round, r, i, buf[0], expected(r, i));
+            }
+        }
+
+        let _ = fh.fh_write_aligned_batch(batch(round)).await
+            .unwrap_or_else(|e| panic!("round {} batch write: {}", round, e));
+        drop(fh);
+        drop(reactor);
+    }
+
+    // Final: everything is there, and the container still takes a write and a
+    // flush — a container that recovers but cannot be written to is the shape
+    // of the report this covers.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("final reopen");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        for r in 0..4usize {
+            for i in 0..PER_ROUND {
+                let off = (r * PER_ROUND + i) * BLK;
+                let mut buf = vec![0u8; BLK];
+                let n = fh.fh_read(off, &mut buf).await.expect("final read");
+                assert_eq!(n, BLK);
+                assert!(buf.iter().all(|b| *b == expected(r, i)),
+                    "round {} block {} lost: {:#x} != {:#x}", r, i, buf[0], expected(r, i));
+            }
+        }
+
+        let tail = AlignedDataBlockWrapper::new(64, BLK, false);
+        tail.as_mut_slice().fill(0xFE);
+        let _ = fh.fh_write_aligned_batch(vec![tail]).await
+            .expect("a recovered container must still be writable");
+        let _ = fh.fh_flush().await.expect("and flushable");
+
+        let mut buf = vec![0u8; BLK];
+        let _ = fh.fh_read(64 * BLK, &mut buf).await.expect("read tail");
+        assert!(buf.iter().all(|b| *b == 0xFE));
+
+        let _ = fh.fh_release().await;
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// The partial-block batch path logs too.
+///
+/// `write_batch` takes writes that do not reach a block boundary and is a
+/// separate implementation from the aligned one, so it needed the same fix and
+/// needs its own coverage: nothing under `wal` exercised it before.
+///
+/// A partial record cannot be joined to an adjacent one — its range stops
+/// mid-block — so this also checks the mixed case, where full blocks coalesce
+/// around a partial one that does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_partial_batch_write_is_durable_on_ack() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let config = {
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    // A base the partial write lands inside, published so the partial write has
+    // something to modify rather than create.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let _ = fh.fh_write(0, &vec![0x11u8; 4 * BLK]).await.expect("base write");
+        let _ = fh.fh_flush().await.expect("publish the base");
+        let _ = fh.fh_release().await;
+    }
+
+    // Full, partial, full — then die with no flush.
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+        ).await.expect("reopen");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        let full0 = BatchDataBlockWrapper::new(0, BLK, false);
+        full0.as_mut_slice().fill(0xA0);
+        let full1 = BatchDataBlockWrapper::new(1, BLK, false);
+        full1.as_mut_slice().fill(0xA1);
+        let part = BatchDataBlockWrapper::new_partial_block(2, BLK, 100, 200, false);
+        part.as_mut_slice().fill(0xBB);
+        let full3 = BatchDataBlockWrapper::new(3, BLK, false);
+        full3.as_mut_slice().fill(0xA3);
+
+        let _ = fh.fh_write_batch(vec![full0, full1, part, full3]).await.expect("batch write");
+        drop(fh);
+        drop(reactor);
+    }
+
+    // Reopen: recovery must reproduce all of it, the partial write included and
+    // the bytes around it untouched.
+    {
+        let mut hyper = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("reopen after crash");
+
+        for (blk, want) in [(0usize, 0xA0u8), (1, 0xA1), (3, 0xA3)] {
+            let mut buf = vec![0u8; BLK];
+            let n = hyper.fs_read(blk * BLK, &mut buf).await.expect("read");
+            assert_eq!(n, BLK);
+            assert!(buf.iter().all(|b| *b == want),
+                "block {} came back {:#x}, expected {:#x}", blk, buf[0], want);
+        }
+
+        let mut buf = vec![0u8; BLK];
+        let n = hyper.fs_read(2 * BLK, &mut buf).await.expect("read block 2");
+        assert_eq!(n, BLK);
+        assert!(buf[..100].iter().all(|b| *b == 0x11), "bytes before the partial write changed");
+        assert!(buf[100..300].iter().all(|b| *b == 0xBB), "the partial write did not survive");
+        assert!(buf[300..].iter().all(|b| *b == 0x11), "bytes after the partial write changed");
+
+        let _ = hyper.fs_release().await;
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
 }

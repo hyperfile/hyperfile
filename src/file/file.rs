@@ -1316,6 +1316,140 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         self.write_aligned_batch_locked(blocks, permit).await
     }
 
+    /// Write log records covering a batch that may hold partial blocks.
+    ///
+    /// Full blocks are coalesced into runs as in
+    /// [`Self::wal_log_aligned_batch`]. A partial block gets its own record at
+    /// its own offset and length, since nothing adjacent can be joined to a
+    /// range that does not reach a block boundary.
+    #[cfg(feature = "wal")]
+    async fn wal_log_batch(
+        &mut self,
+        merged: &BTreeMap<BlockIndex, (bool, Vec<BatchDataBlockWrapper>)>,
+        bs: usize,
+    ) -> Result<()> {
+        let seq = self.inode.get_last_seq();
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        let mut pending = Vec::new();
+
+        // (start_index, run_len) of consecutive full blocks.
+        let mut run: Option<(BlockIndex, Vec<u8>)> = None;
+        let mut run_end: BlockIndex = 0;
+
+        let flush_run = |run: &mut Option<(BlockIndex, Vec<u8>)>,
+                             bufs: &mut Vec<Vec<u8>>| -> Option<(usize, usize)> {
+            run.take().map(|(start, buf)| {
+                let off = start as usize * bs;
+                let len = buf.len();
+                bufs.push(buf);
+                (off, len)
+            })
+        };
+
+        for (blk_idx, (is_full, v)) in merged.iter() {
+            if *is_full {
+                let block = v.first().expect("a full block group holds one block");
+                match run.as_mut() {
+                    Some((_, buf)) if *blk_idx == run_end => {
+                        buf.extend_from_slice(block.as_slice());
+                        run_end = blk_idx + 1;
+                        continue;
+                    },
+                    _ => {},
+                }
+                if let Some((off, len)) = flush_run(&mut run, &mut bufs) {
+                    let buf_ref = &bufs[bufs.len() - 1][..len];
+                    let wal = self.wal.as_mut().expect("checked by the caller");
+                    pending.push(wal.write(seq, off, buf_ref));
+                }
+                run = Some((*blk_idx, block.as_slice().to_vec()));
+                run_end = blk_idx + 1;
+            } else {
+                if let Some((off, len)) = flush_run(&mut run, &mut bufs) {
+                    let buf_ref = &bufs[bufs.len() - 1][..len];
+                    let wal = self.wal.as_mut().expect("checked by the caller");
+                    pending.push(wal.write(seq, off, buf_ref));
+                }
+                for block in v.iter() {
+                    let off = *blk_idx as usize * bs + block.offset();
+                    let buf = block.as_slice()[..block.len()].to_vec();
+                    bufs.push(buf);
+                    let buf_ref = bufs.last().expect("just pushed").as_slice();
+                    let wal = self.wal.as_mut().expect("checked by the caller");
+                    pending.push(wal.write(seq, off, buf_ref));
+                }
+            }
+        }
+        if let Some((off, len)) = flush_run(&mut run, &mut bufs) {
+            let buf_ref = &bufs[bufs.len() - 1][..len];
+            let wal = self.wal.as_mut().expect("checked by the caller");
+            pending.push(wal.write(seq, off, buf_ref));
+        }
+
+        for res in futures::future::join_all(pending).await {
+            res?;
+        }
+        drop(bufs);
+        Ok(())
+    }
+
+    /// Write log records covering an aligned batch, coalescing adjacent
+    /// blocks of the same kind into one record each.
+    ///
+    /// A record's key encodes the range it covers, so one object can stand for
+    /// many consecutive blocks exactly as a multi-block `write_inner` does.
+    /// Without the coalescing a 24 MiB batch would be six thousand objects,
+    /// and the batch API exists because that cost was measured and rejected.
+    ///
+    /// The records go out concurrently. `WalReadWrite::write` hands back a
+    /// future that does not borrow the log, so they can be started and then
+    /// awaited together — but it aliases the buffer it was given without
+    /// owning it, so the buffers built here must outlive the join.
+    #[cfg(feature = "wal")]
+    async fn wal_log_aligned_batch(&mut self, blocks: &[AlignedDataBlockWrapper], bs: usize) -> Result<()> {
+        // (start_index, run_len, is_zero)
+        let mut runs: Vec<(BlockIndex, usize, bool)> = Vec::new();
+        for b in blocks.iter() {
+            match runs.last_mut() {
+                Some((start, n, zero))
+                    if *zero == b.is_zero() && b.index() == *start + *n as BlockIndex =>
+                {
+                    *n += 1;
+                },
+                _ => runs.push((b.index(), 1, b.is_zero())),
+            }
+        }
+
+        let seq = self.inode.get_last_seq();
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        let mut pending = Vec::new();
+        let mut at = 0usize;
+        for (start, n, is_zero) in runs {
+            let off = start as usize * bs;
+            if is_zero {
+                let wal = self.wal.as_mut().expect("checked by the caller");
+                pending.push(wal.write_zero(seq, off, n * bs));
+            } else {
+                let mut buf = Vec::with_capacity(n * bs);
+                for b in &blocks[at..at + n] {
+                    buf.extend_from_slice(b.as_slice());
+                }
+                bufs.push(buf);
+                let buf_ref = bufs.last().expect("just pushed");
+                let wal = self.wal.as_mut().expect("checked by the caller");
+                pending.push(wal.write(seq, off, buf_ref));
+            }
+            at += n;
+        }
+
+        for res in futures::future::join_all(pending).await {
+            res?;
+        }
+        // Held until every record is down, since the futures alias them.
+        drop(bufs);
+        Ok(())
+    }
+
     pub(crate) async fn write_aligned_batch_locked(&mut self, mut blocks: Vec<AlignedDataBlockWrapper>, permit: OwnedSemaphorePermit) -> Result<usize> {
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
@@ -1331,6 +1465,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         blocks.reverse();
 
         let data_block_size = self.config.meta.data_block_size;
+
+        // Log before touching any state, for the same reason `write_inner`
+        // does: the caller is told this write is durable when the call
+        // returns, and the flush path is allowed to answer before its upload
+        // lands *because* the log holds the data. A write path the log never
+        // saw breaks that argument rather than merely missing a feature — the
+        // flush is acknowledged while the bytes live only in memory.
+        //
+        // Runs of adjacent blocks are coalesced into one record. One record
+        // per block would be one object per block, which is the cost the
+        // batch API exists to avoid.
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() {
+            self.wal_log_aligned_batch(&blocks, data_block_size).await?;
+        }
 
         let mut bytes_write = 0;
         let mut new_blocks: usize = 0;
@@ -2489,6 +2638,14 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             merged.insert(blk_idx, m);
         }
 
+        // Logged before any state changes, for the reason given on
+        // `wal_log_aligned_batch`: a write path the log never saw is
+        // acknowledged while living only in memory, and the flush path is
+        // allowed to answer early on the strength of the log holding it.
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() {
+            self.wal_log_batch(&merged, data_block_size).await?;
+        }
 
         // write prepare
         let mut v_need_retrieve = Vec::new();
