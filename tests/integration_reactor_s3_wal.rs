@@ -1736,3 +1736,79 @@ async fn reactor_wal_open_reports_what_recovery_did() {
         cleanup_with_wal(&client, tf.uri()).await;
     }
 }
+
+/// With a log, sitting idle does not publish. Without one, it does.
+///
+/// A timer publish is pointless once a log makes the write durable on return,
+/// and it is worse than pointless for `WalRecoveryMode::Barrier`: the newest
+/// published checkpoint is what recovery has to reach, so if a timer can put one
+/// in the middle of the caller's own unit of work, then "reach the newest
+/// checkpoint" and "stop at a declared state" cannot both be satisfied.
+///
+/// The control half matters as much as the first: without a log the timer is the
+/// only thing bounding how long an acknowledged write sits in memory, so this
+/// also checks it was not switched off for everyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_time_alone_does_not_publish() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    // A short timer, and dirty thresholds far out of reach so that only time
+    // could trigger a publish.
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = 200;
+
+    for with_log in [true, false] {
+        let tf = TestFile::new(&client).await;
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let mut builder = HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_runtime_config(&runtime);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+        if with_log {
+            builder = builder.with_wal_config(&wal_config);
+        }
+        let config = builder.build();
+
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config,
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0xF1);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        let before = fh.fh_last_cno().await.expect("last cno");
+
+        // Well past the timer, with a write arriving after it to force the
+        // check — `need_flush` is consulted on the write path, not by a clock.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let b2 = AlignedDataBlockWrapper::new(1, BLK, false);
+        b2.as_mut_slice().fill(0xF2);
+        let _ = fh.fh_write_aligned_batch(vec![b2]).await.expect("second write");
+        let after = fh.fh_last_cno().await.expect("last cno");
+
+        if with_log {
+            assert_eq!(after, before,
+                "with a log, time alone must not publish: {} -> {}", before, after);
+        } else {
+            assert!(after > before,
+                "without a log the timer is the only bound on how long a write \
+                 sits in memory, and it must still fire: {} -> {}", before, after);
+        }
+
+        let _ = fh.fh_release().await;
+        if with_log {
+            cleanup_with_wal(&client, tf.uri()).await;
+        } else {
+            tf.cleanup(&client).await;
+        }
+    }
+}

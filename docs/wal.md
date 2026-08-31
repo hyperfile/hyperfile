@@ -120,6 +120,101 @@ remain under segid N - 1. This is the reason
 If you grep for `delete_segment`, this is the subtle detail to
 keep in mind.
 
+## Barriers: which log records belong together
+
+A flush seals the records it is about to publish by writing a **barrier** for
+that checkpoint. The barrier carries the `(seq, offset, len)` of every record it
+covers.
+
+It exists to answer a question the records cannot. A crash mid-flush leaves a
+partial set that is indistinguishable from a complete one by looking at the
+objects, and replaying it hands the layer above half of its own transaction.
+The manifest is a list rather than a count so that recovery can check it against
+what is stored without depending on a listing being complete or on the order the
+records went out in.
+
+Two orderings make it mean something:
+
+- **After** every record it covers is confirmed written, because it claims the
+  group is whole.
+- **Before** the segment is built, which is also before `get_next_seq()` moves
+  past the checkpoint the records are filed under.
+
+Together those give: *a barrier exists for this checkpoint* ⟹ *the group is
+complete and was never published*.
+
+Sealing nothing writes nothing. That is load-bearing rather than tidiness — an
+empty barrier would sit in front of records written afterwards under the same
+checkpoint, and recovery would drop them as out-of-manifest.
+
+The barrier object is named `barrier`, not `<seq>_<offset>_<len>`, so the record
+decoder rejects it and `list_chunks` cannot mistake it for data. Its body
+carries a magic and a version, and a body this build cannot parse reads as
+absent — which stops recovery rather than letting it vouch for a group it cannot
+check.
+
+## Recovery modes
+
+Where recovery stops is a choice, set by
+`HyperFileWalConfig::with_recovery_mode`:
+
+| | applies | landing point | `writes_durable_on_ack` |
+|---|---|---|---|
+| `Latest` (default) | whatever it can | may be mid-transaction | `true` |
+| `Barrier` | only sealed, complete groups | a declared state | **`false`** |
+
+`Latest` keeps every acknowledged write, which is what the durability contract
+promises, so it is the default. `Barrier` stops at the last seal, so it needs no
+repair — at the cost of everything acknowledged after that seal.
+
+Those two cannot both hold, and `Barrier` is the case the durability query was
+named for: a write with no flush behind it is in an unsealed group, so that mode
+discards it by design, and `writes_durable_on_ack` reports `false` there. A
+caller skipping flushes on the strength of it then degrades instead of losing
+data quietly. Making `Barrier` the default would have withdrawn a shipped
+guarantee silently on upgrade.
+
+Under `Barrier`, a group that is unsealed or incomplete **stops** the replay
+rather than being skipped. Skipping one and applying a later one would produce a
+state that never existed, which is worse than a torn one: that at least was some
+moment's truth.
+
+## What recovery reports
+
+```rust
+let r = hyper.wal_recovery_report();
+if !r.landed_on_barrier { /* repair */ }
+```
+
+`replayed`, `landed_on_barrier`, and `records_dropped`. The middle one decides
+whether a caller that can repair its own contents needs to: when it is true the
+contents are a state whoever wrote them declared consistent, so work
+proportional to the whole container can be skipped. Records counted as dropped
+are still in the log; nothing is deleted.
+
+"No recovery ran" reports `landed_on_barrier: true`, because a container that
+needed no replay is at its last published checkpoint and a publish only happens
+at a seal.
+
+## What may publish
+
+With a log configured, **time alone does not publish**. A timer's purpose
+without a log is to bound how long an acknowledged write sits only in memory,
+and a log already bounds that. All it would add is a checkpoint at a moment
+nobody declared — and since recovery has to reach the newest published
+checkpoint, one landing mid-transaction puts "reach the newest checkpoint" and
+"stop at a declared state" in conflict, which `Barrier` cannot satisfy.
+
+The memory bound stays. `data_cache_dirty_max_bytes_threshold` and
+`..._blocks_threshold` still publish when they are crossed, because dropping
+them would trade a bounded cache for an unbounded one. A caller that needs
+publishes only at its own boundaries raises those thresholds and knows it is
+choosing that.
+
+`data_cache_dirty_max_flush_interval` set to `0` does **not** disable the timer.
+`elapsed() >= Duration::from_millis(0)` is always true, so `0` publishes on
+every check. Without a log, raising it is how to slow the timer down.
+
 ## Recovery
 
 `HyperFile::do_open` checks the WAL on every open:
@@ -355,6 +450,19 @@ measure.
   flush does not pick up stale WAL.
 - `reactor_wal_delete_after_flush` — WAL objects are actually
   removed from S3 after a reactor flush.
+- `reactor_wal_flush_seals_the_group_it_publishes` — the barrier appears only
+  when a flush says so, and its manifest names exactly the records stored.
+- `reactor_wal_recovery_mode_decides_the_landing_point` — the two modes land in
+  different places, on a container each, and the durability query reports which.
+- `reactor_wal_open_reports_what_recovery_did` — the three outcomes a caller has
+  to tell apart.
+- `reactor_wal_time_alone_does_not_publish` — with a log, idling does not
+  publish; without one it still does.
+- `reactor_wal_batch_write_reaches_the_log` and
+  `reactor_wal_batch_write_is_durable_on_ack` — the batch write paths log, and
+  their records are coalesced across adjacent blocks.
+- `reactor_wal_repeated_crash_without_publish_keeps_the_container_sound` — crash,
+  recover, crash again with no publish in between.
 - `reactor_wal_writes_are_durable_on_ack_without_any_flush` — a
   write survives a simulated death with no flush of any kind, with
   publish thresholds out of reach and a no-log control that loses it.

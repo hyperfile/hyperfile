@@ -1849,8 +1849,36 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             false
         };
 
-        let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
-        let last_flush_expired = self.state.get_last_flush().elapsed() >= Duration::from_millis(max_flush_interval);
+        // Time alone does not publish when there is a log.
+        //
+        // Its purpose without one is to bound how long an acknowledged write
+        // sits only in memory. A log already bounds that — the write is durable
+        // when it returns — so all a timer adds is publishing at a moment
+        // nobody declared. That matters because the newest published checkpoint
+        // is what recovery must reach: if it can land in the middle of the
+        // caller's own unit of work, then "recover to at least the newest
+        // checkpoint" and "stop at a declared state" are in conflict, and
+        // `WalRecoveryMode::Barrier` cannot honour both.
+        //
+        // The memory bound stays: `threshold_flush` still publishes, because
+        // dropping it would trade a bounded cache for an unbounded one. A
+        // caller that needs publishes to happen only at its own boundaries has
+        // to raise those thresholds, and knows it is choosing that.
+        //
+        // Note `data_cache_dirty_max_flush_interval` set to 0 does not disable
+        // the timer: `elapsed() >= Duration::from_millis(0)` is always true, so
+        // 0 publishes on every check. Without a log, raising it is the way to
+        // slow the timer down.
+        #[cfg(feature = "wal")]
+        let last_flush_expired = self.wal.is_none() && {
+            let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
+            self.state.get_last_flush().elapsed() >= Duration::from_millis(max_flush_interval)
+        };
+        #[cfg(not(feature = "wal"))]
+        let last_flush_expired = {
+            let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
+            self.state.get_last_flush().elapsed() >= Duration::from_millis(max_flush_interval)
+        };
         if last_flush_expired || threshold_flush || immediate_flush {
             return true;
         }
