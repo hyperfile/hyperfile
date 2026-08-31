@@ -9,6 +9,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.15] - 2026-08-31
+
+### Fixed
+
+- **A session no longer writes into a checkpoint whose records recovery
+  declined.** `Barrier` recovery leaves what it will not apply in the log, and
+  the next session wrote its own records into the same checkpoint because nothing
+  moved the sequence past what was there.
+
+  Record keys are `<seq>_<offset>_<len>`, and a fresh session's counter starts at
+  zero while `last_seq` has not moved — so the first write lands on the key an
+  unapplied record already occupies, and the create-only PUT fails with 412.
+  Whether it collides needs the offset and length to match too, which replaying
+  a similar workload makes likely: a consumer saw a run get partway through and
+  then fail, and reported the data as appearing "partially in".
+
+  Worse, the two sets would have ended up in one group, and a later barrier would
+  have listed both and called the result complete — a seal vouching for work that
+  was deliberately set aside.
+
+- **Applying nothing is no longer read as a recovery failure.** Recovery returns
+  the checkpoint it reached, and zero when it reached none. The retry loop took
+  that zero for failure, spent its attempts, then set the fail-stop flag — after
+  which the container refused every write, having opened successfully, with the
+  error that explained it discarded by `do_open`.
+
+  Under `Barrier` that zero is the ordinary result, so the mode's most common
+  path ended in a read-only container. The outcome belongs in
+  `WalRecoveryReport`, which already carries it, so the return value no longer
+  has to. The test covering it went from 3.4 s to 0.3 s, which is the retries and
+  their backoff going away.
+
+- **In `Barrier` mode, only the caller publishes.** A dirty-data threshold could
+  still publish, and recovery cannot land earlier than the newest published
+  checkpoint — so a threshold crossing partway through the caller's own unit of
+  work put a checkpoint nobody declared beneath the floor, and what the mode
+  sells was gone. Whether that publish also sealed a barrier is beside the point;
+  publishing at all does it.
+
+  A write that would need a publish to make room is refused with `OutOfMemory`
+  instead. The memory bound stays — what changes is the action on crossing it,
+  from silently publishing a torn point to saying so. `Latest` is unchanged,
+  since there the bound is why the threshold exists.
+
+- **Recovery decides whether to run on the same basis the replay filters by.**
+  The trigger read `last_seq`, the replay filters by `last_ondisk_cno`. Two bases
+  for one question, which is how a group becomes unreachable — the trigger says
+  there is nothing to do while the filter would have found something.
+
+  They agreed until a session began advancing `last_seq` on its own (the first
+  fix above). After that an inode-only publish — an attribute change with no
+  dirty data, which a filesystem above does constantly — wrote the advanced
+  `last_seq` out, and the trigger then concluded there was nothing to recover
+  while the records sat there. So the promise that what `Barrier` sets aside a
+  later `Latest` open can take did not survive a `chmod`.
+
+### Added
+
+- **`publish_every`** on `HyperFileWalConfig`: how many flushes may be satisfied
+  by the log before one of them publishes a segment. Default 1, which is the
+  previous behaviour.
+
+  Publishing costs about the same however much was written — a consumer measured
+  0.21 to 0.26 seconds for 1 MiB and for 32 MiB alike, 93 to 99 per cent of their
+  fsync latency — so it is a fixed cost per flush, and this is how to stop paying
+  it on every one.
+
+  Durability is untouched: every write is in the log before its call returns
+  either way. What is deferred is the checkpoint, not the data, so a flush can
+  return with no checkpoint existing for what it flushed and a caller needing one
+  has to publish. Recovery replays each deferred group in turn, so a mount after
+  a crash pays what those flushes did not — the knob is a dial between flush
+  latency and mount latency.
+
+  Nothing is deferred inside a transaction, whose commit is a publish by
+  definition, or on release, where deferring is a bet that another flush is
+  coming.
+
+  Deleting superseded log prefixes was widened to match. A publish used to drop
+  one, which was right when it stood for one group; standing for N it has to drop
+  N, or the log grows in proportion to how often publishing was deferred and the
+  saving is only moved.
+
 ## [0.6.14] - 2026-08-31
 
 ### Fixed
