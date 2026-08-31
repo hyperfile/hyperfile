@@ -2698,3 +2698,73 @@ async fn reactor_wal_attr_change_after_a_decline_is_durable() {
     cleanup_with_wal(&client, tf.uri()).await;
 }
 
+/// A deferred publish does not defer an attribute change.
+///
+/// `publish_every` defers the checkpoint and not the data, and that reading is
+/// safe for data because the log carries it. It carries no attributes, so the
+/// same argument does not cover them: an attribute change has only the inode
+/// publish to make it durable, and a deferred flush publishes nothing.
+///
+/// It survives anyway, because `update_stat` publishes on its own — it calls
+/// `flush` directly, which is the synchronous path with no deferral in it — so
+/// an attribute change never reaches the deferring one. That is what this test
+/// pins: not that deferral handles attributes, but that attributes never get
+/// deferred in the first place. Routing `setattr` through a flush that can defer
+/// would lose it with nothing in the log to recover it from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_deferred_publish_still_publishes_an_attr_only_flush() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let tf = TestFile::new(&client).await;
+    let config_for = |uri: &str| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", uri))
+            .with_publish_every(4);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config_for(tf.uri()),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0xB1);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+
+        let mut stat = fh.fh_getattr().await.expect("getattr");
+        stat.st_mode = (stat.st_mode & libc::S_IFMT) | 0o640;
+        let _ = fh.fh_setattr(stat).await.expect("setattr");
+        let _ = fh.fh_flush().await.expect("flush the attr change");
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        drop(fh);
+        drop(reactor);
+    }
+
+    let mut hyper = Hyper::open(
+        client.clone(), config_for(tf.uri()),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+    let stat = hyper.fs_getattr().expect("getattr");
+    assert_eq!(stat.st_mode & 0o777, 0o640,
+        "the attr change was deferred along with the checkpoint, and the log has \
+         nothing to recover it from");
+    let _ = hyper.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
