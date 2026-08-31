@@ -1905,6 +1905,15 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     ///
     /// Users exercise this via `fs_flush` / `fh_flush`.
     pub async fn flush_with_rollback(&mut self) -> Result<SegmentId> {
+        // Refusals are settled before the rollback is on the table. A flush that
+        // was declined never touched anything, so rolling back would discard
+        // dirty data over a request that was simply not allowed — losing
+        // acknowledged writes by asking the wrong question at the wrong time.
+        //
+        // `flush` performs this check too, for the callers that do not come
+        // through here. It has to happen on both sides: there, so no caller can
+        // skip it; here, so its failure does not reach the rollback.
+        self.check_writable()?;
         match self.flush().await {
             Ok(segid) => Ok(segid),
             Err(e) => {
