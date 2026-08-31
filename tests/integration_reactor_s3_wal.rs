@@ -2086,6 +2086,15 @@ async fn reactor_wal_barrier_recovery_with_nothing_to_apply_stays_writable() {
         HyperFileFlags::from_flags(FileFlags::rdwr()),
     ).await.expect("reopen");
 
+    // Nothing was applied, so nothing should have been retried either: the
+    // report is where that outcome belongs, and it must not read as a failure.
+    // Asked before handing the file to the reactor, which is where a caller in
+    // this mode would ask it too.
+    let r = hyper.wal_recovery_report();
+    assert!(!r.replayed, "Barrier applied nothing: {:?}", r);
+    assert!(r.landed_on_barrier, "stopping at a seal is landing on one: {:?}", r);
+    assert!(r.records_dropped > 0, "and what it set aside is counted: {:?}", r);
+
     let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
 
     // The container must still take writes. Nothing failed — there was simply

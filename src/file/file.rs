@@ -2355,13 +2355,20 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let mut last_err = None;
         for attempt in 1..=DEFAULT_FLUSH_RETRIES {
             match self.do_wal_flush_recovery().await {
-                Ok(cno) if cno != 0 => {
+                // Applying nothing is an outcome, not a failure, and under
+                // `Barrier` it is the ordinary one: stopping at an unsealed
+                // group means there was nothing this mode was willing to take.
+                // Reading the zero as failure spent the retries and then set
+                // the fail-stop flag, leaving a container that opened fine and
+                // refused every write, with `do_open` discarding the only
+                // explanation. What happened is in the report; the return value
+                // does not have to say it as well.
+                Ok(cno) => {
                     self.flush_unlock(lock);
+                    if cno == 0 {
+                        debug!("wal_flush_recovery - nothing to apply");
+                    }
                     return Ok(cno);
-                },
-                Ok(_) => {
-                    warn!("wal_flush_recovery - attempt {}/{} returned cno 0",
-                        attempt, DEFAULT_FLUSH_RETRIES);
                 },
                 Err(e) => {
                     warn!("wal_flush_recovery - attempt {}/{} failed: {}",
