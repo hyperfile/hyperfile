@@ -77,6 +77,13 @@ impl S3Wal {
     }
 
     #[inline]
+    fn txn_key(&self, segid: SegmentId) -> String {
+        // Same reasoning as `barrier_key`: not `seq_offset_len`, so the record
+        // decoder rejects it.
+        format!("{}/{}/txn", self.root_path, Segment::segid_to_staging_file_id(segid))
+    }
+
+    #[inline]
     fn barrier_key(&self, segid: SegmentId) -> String {
         // Deliberately not `seq_offset_len`, so `decode` rejects it and
         // `list_chunks` cannot mistake it for a record.
@@ -178,6 +185,57 @@ impl WalReadWrite for S3Wal {
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
             }
+        })
+    }
+
+    fn next_seq_peek(&self, segid: SegmentId) -> usize {
+        if self.last_segid != segid {
+            // `encode` resets the counter when the checkpoint changes, so the
+            // first record under a new one starts from zero.
+            return 0;
+        }
+        self.seq.load(Ordering::SeqCst) as usize
+    }
+
+    fn write_txn_marker(&mut self, segid: SegmentId, from_seq: usize) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+        let key = self.txn_key(segid);
+        let body = (from_seq as u64).to_ne_bytes().to_vec();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        Box::pin(async move {
+            S3Ops::do_put_object(&client, &bucket, &key, &body, &None).await.and(Ok(()))
+        })
+    }
+
+    fn read_txn_marker(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Option<usize>>> + Send + '_>> {
+        let key = self.txn_key(segid);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        Box::pin(async move {
+            match S3Ops::do_get_object_speculative(&client, &bucket, &key, None, false).await {
+                Ok((bytes, _)) => {
+                    if bytes.len() != 8 {
+                        // Unreadable means "a transaction was open and this build
+                        // cannot say where it started", which has to be treated
+                        // as open from the beginning rather than ignored.
+                        return Ok(Some(0));
+                    }
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&bytes[..8]);
+                    Ok(Some(u64::from_ne_bytes(b) as usize))
+                },
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn delete_txn_marker(&mut self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+        let key = self.txn_key(segid);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        Box::pin(async move {
+            S3Ops::do_delete_object(&client, &bucket, &key, &None).await.and(Ok(()))
         })
     }
 

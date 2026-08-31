@@ -161,6 +161,33 @@ pub trait WalReadWrite {
     /// must treat as "this group was never sealed" rather than as an error.
     fn read_barrier(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Option<WalBarrier>>> + Send + '_>>;
 
+    /// The seq the next record written under `segid` would get.
+    ///
+    /// Needed so a transaction marker can name where it begins: records before
+    /// that seq are ordinary and must still be applied, records from it on
+    /// belong to the unit. Accounts for the counter resetting when the
+    /// checkpoint changes, so asking before the first record of a new
+    /// checkpoint gives the right answer rather than the previous one's.
+    fn next_seq_peek(&self, segid: SegmentId) -> usize;
+
+    /// Mark that a transaction is open under `segid`, starting at
+    /// `from_seq`.
+    ///
+    /// Records from that seq on belong to work the caller has declared to be
+    /// one unit. If the marker is still there at recovery time the unit did not
+    /// finish, and those records must not be applied — applying half of it is
+    /// what the transaction exists to prevent. Records *before* `from_seq` are
+    /// ordinary and unaffected.
+    fn write_txn_marker(&mut self, segid: SegmentId, from_seq: usize) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+    /// The open transaction's starting seq under `segid`, if one is open.
+    fn read_txn_marker(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Option<usize>>> + Send + '_>>;
+
+    /// Remove the marker. Cleanup rather than a correctness step: a barrier for
+    /// the same checkpoint already means the unit completed, and takes
+    /// precedence.
+    fn delete_txn_marker(&mut self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
     // list
     fn list_segments(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SegmentId>>> + Send + '_>>;
     fn list_chunks(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<BTreeMap<usize, WalChunkDesc>>> + Send + '_>>;

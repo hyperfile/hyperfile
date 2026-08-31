@@ -387,6 +387,10 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     #[cfg(feature = "wal")]
     fn wal_mut(&mut self) -> Option<&mut Box<dyn crate::wal::WalReadWrite + Send>>;
 
+    /// Whether an transaction is open. See `HyperFile::begin_txn`.
+    #[cfg(feature = "wal")]
+    fn in_txn_trait(&self) -> bool;
+
     // wal
     #[cfg(feature = "wal")]
     fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
@@ -1072,6 +1076,14 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // state, and a steady stream of them would keep the retry cycle
         // running for good.
         self.check_writable()?;
+        // Asking to publish inside an interval that asked for no publishing is
+        // a contradiction, and answering `Ok` to it would tell the caller its
+        // data is at a checkpoint when it is not.
+        #[cfg(feature = "wal")]
+        if self.in_txn_trait() {
+            return Err(Error::new(ErrorKind::ResourceBusy,
+                "a transaction is open, so publishing was asked not to happen; commit it to publish"));
+        }
         let policy = self.config().runtime.flush_conflict_policy;
 
         let mut retries = 0;

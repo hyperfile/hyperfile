@@ -1495,6 +1495,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // mode: publishing has failed for good, so accepting more data would
         // only pile it up behind a publish that is not happening.
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         let buf = req.buf;
         let len = buf.len();
         // O_APPEND: override caller-supplied offset to current
@@ -1573,6 +1575,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // mode: publishing has failed for good, so accepting more data would
         // only pile it up behind a publish that is not happening.
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         let len = req.len;
         // O_APPEND: same rule as spawn_write(). See the
         // corresponding comment there.

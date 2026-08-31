@@ -353,6 +353,47 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.block_placement_many(ranges).await
     }
 
+    /// Begin a transaction: the writes from here until [`Self::fs_commit_txn`]
+    /// are one unit, and nothing is published in between. See
+    /// [`HyperFile::begin_txn`](crate::file::file::HyperFile::begin_txn) for
+    /// what a transaction here does and does not provide — in particular that
+    /// it gives atomic publication and recovery but **no isolation**: writes
+    /// inside one are visible to readers immediately.
+    #[cfg(feature = "wal")]
+    pub async fn fs_begin_txn(&mut self) -> Result<()>
+    {
+        debug!("fs_begin_txn - ");
+        self.inner.begin_txn().await
+    }
+
+    /// Commit the open transaction, publishing it as one checkpoint. See
+    /// [`HyperFile::commit_txn`](crate::file::file::HyperFile::commit_txn).
+    #[cfg(feature = "wal")]
+    pub async fn fs_commit_txn(&mut self) -> Result<u64>
+    {
+        debug!("fs_commit_txn - ");
+        self.inner.commit_txn().await
+    }
+
+    /// Abandon the open transaction, discarding its writes. See
+    /// [`HyperFile::abort_txn`](crate::file::file::HyperFile::abort_txn).
+    ///
+    /// Not the same as never committing: that leaves the writes in memory until
+    /// the file is closed, and only a reopen discards them.
+    #[cfg(feature = "wal")]
+    pub async fn fs_abort_txn(&mut self) -> Result<()>
+    {
+        debug!("fs_abort_txn - ");
+        self.inner.abort_txn().await
+    }
+
+    /// Whether a transaction is open.
+    #[cfg(feature = "wal")]
+    pub fn fs_in_txn(&self) -> bool
+    {
+        self.inner.in_txn()
+    }
+
     /// What recovery did when this container was opened. See
     /// [`HyperFile::wal_recovery_report`](crate::file::file::HyperFile::wal_recovery_report).
     #[cfg(feature = "wal")]

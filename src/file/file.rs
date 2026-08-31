@@ -111,6 +111,14 @@ enum WalGroupState {
     Unsealed,
     /// Sealed, but records the barrier names are absent or the wrong shape.
     Incomplete { missing: usize },
+    /// No barrier, and a transaction was left open from `from_seq`.
+    ///
+    /// Records before that seq are ordinary and are applied; from it on they are
+    /// half of a unit the caller declared, and applying them is what the
+    /// interval exists to prevent. Unlike the other incomplete states this is
+    /// honoured in **both** recovery modes, because the caller asked for it
+    /// explicitly rather than it being a property of where the crash fell.
+    TxnOpen { from_seq: usize },
 }
 
 pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> {
@@ -159,6 +167,12 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     /// [`WalRecoveryReport`](crate::wal::WalRecoveryReport).
     #[cfg(feature = "wal")]
     pub(crate) wal_recovery_report: WalRecoveryReport,
+    /// Set while the caller has declared its writes to be one unit.
+    ///
+    /// Suppresses publishing, so that nothing half-done can become the
+    /// container's newest checkpoint. See [`Self::begin_txn`].
+    #[cfg(feature = "wal")]
+    pub(crate) txn_open: bool,
 }
 
 impl<T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> fmt::Display for HyperFile<'_, T, L, C> {
@@ -263,6 +277,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             flushing_segments: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "wal")]
             wal_recovery_report: WalRecoveryReport::default(),
+            #[cfg(feature = "wal")]
+            txn_open: false,
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -385,6 +401,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             flushing_segments: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "wal")]
             wal_recovery_report: WalRecoveryReport::default(),
+            #[cfg(feature = "wal")]
+            txn_open: false,
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -429,6 +447,168 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         self.cache.shutdown();
         self.bmap.get_node_cache().shutdown();
         Ok(segid)
+    }
+
+    /// Refuse a write that would take an open transaction past the memory bound.
+    ///
+    /// Inside a transaction nothing publishes, so the dirty set is the only place
+    /// the data can be — and the threshold that normally relieves it is
+    /// suppressed. Reporting the overflow is the honest outcome: publishing
+    /// would break what the interval promised, and growing without limit would
+    /// trade the memory bound away without saying so.
+    #[cfg(feature = "wal")]
+    pub(crate) fn check_txn_room(&self) -> Result<()> {
+        if !self.txn_open {
+            return Ok(());
+        }
+        let dirty = self.cache.dirty_count();
+        let bytes = dirty * self.config.meta.data_block_size;
+        if bytes > self.config.runtime.data_cache_dirty_max_bytes_threshold
+            || dirty > self.config.runtime.data_cache_dirty_max_blocks_threshold
+        {
+            return Err(Error::new(ErrorKind::OutOfMemory, format!(
+                "a transaction has reached {} dirty bytes in {} blocks, past the \
+                 configured limits; nothing can be published while it is open, so the \
+                 transaction is too large to hold", bytes, dirty)));
+        }
+        Ok(())
+    }
+
+    /// Begin a transaction: the writes from here until [`Self::commit_txn`] are
+    /// one unit, and nothing is published in between.
+    ///
+    /// For work whose midpoints are not states anyone should come up in — a
+    /// repair pass over the container's own contents is the case this exists
+    /// for. Such a pass can write far more than the dirty-data thresholds
+    /// allow, and a threshold crossing partway through would make a half-fixed
+    /// container the newest checkpoint, which the next open would take as its
+    /// baseline.
+    ///
+    /// # What it gives
+    ///
+    /// * **Atomic publication.** Nothing publishes until [`Self::commit_txn`],
+    ///   including the dirty-data thresholds.
+    /// * **Atomic recovery.** A marker in the log lets recovery tell an
+    ///   unfinished transaction from ordinary writes. If one is still open when
+    ///   the container is opened again its writes are **not** applied, in
+    ///   either recovery mode — half a unit is what this exists to keep out.
+    ///   Writes made before the transaction began are ordinary and unaffected,
+    ///   so an interrupted transaction costs redoing it rather than repairing
+    ///   the result of half of it.
+    ///
+    /// # What it does not give
+    ///
+    /// * **No isolation.** Writes inside the transaction are visible to readers
+    ///   of this container immediately, exactly as they would be outside one.
+    ///   The transaction governs what gets published and what survives a crash,
+    ///   not who can see what.
+    /// * **No implicit undo.** Dropping the file or never committing leaves the
+    ///   writes in memory and in the log; it is the *next open* that discards
+    ///   them. To undo within the same handle, call [`Self::abort_txn`].
+    ///
+    /// While one is open, a write that would take the dirty set past
+    /// `data_cache_dirty_max_bytes_threshold` fails rather than publishing, and
+    /// an explicit flush fails — asking to publish contradicts having asked not
+    /// to.
+    ///
+    /// Requires a log: without one there is nowhere to record that the unit was
+    /// left unfinished, and suppressing publishes would only mean losing the
+    /// writes on a crash.
+    #[cfg(feature = "wal")]
+    pub async fn begin_txn(&mut self) -> Result<()> {
+        if self.wal.is_none() {
+            return Err(Error::new(ErrorKind::Unsupported,
+                "a transaction needs a wal: without one there is nowhere to \
+                 record that the unit was left unfinished"));
+        }
+        if self.txn_open {
+            return Err(Error::new(ErrorKind::AlreadyExists, "a transaction is already open"));
+        }
+        let segid = self.inode().get_last_seq();
+        let from_seq = self.wal.as_ref().expect("checked above").next_seq_peek(segid);
+        let fut = match self.wal.as_mut() {
+            Some(wal) => wal.write_txn_marker(segid, from_seq),
+            None => unreachable!("checked above"),
+        };
+        fut.await?;
+        self.txn_open = true;
+        Ok(())
+    }
+
+    /// Close the interval opened by [`Self::begin_txn`] and publish it as
+    /// one checkpoint.
+    ///
+    /// The publish seals the whole interval, which is what makes it applicable
+    /// on a later open. The marker is then removed; that removal is cleanup
+    /// rather than a correctness step, since a barrier for the same checkpoint
+    /// already says the unit completed and takes precedence over a marker left
+    /// behind.
+    ///
+    /// On failure the interval stays open, so the caller can retry or abandon
+    /// it. Abandoning is safe: an unfinished transaction is not applied.
+    #[cfg(feature = "wal")]
+    pub async fn commit_txn(&mut self) -> Result<SegmentId> {
+        if !self.txn_open {
+            return Err(Error::new(ErrorKind::NotFound, "no transaction is open"));
+        }
+        let segid = self.inode().get_last_seq();
+        // Cleared first so the flush is allowed to publish; restored if it does
+        // not, so a failed close leaves the interval as it was.
+        self.txn_open = false;
+        let cno = match self.flush().await {
+            Ok(cno) => cno,
+            Err(e) => {
+                self.txn_open = true;
+                return Err(e);
+            },
+        };
+        let fut = self.wal.as_mut().map(|wal| wal.delete_txn_marker(segid));
+        if let Some(fut) = fut {
+            // A marker left behind is harmless: the barrier written by the
+            // flush above outranks it.
+            if let Err(e) = fut.await {
+                warn!("commit_txn - could not remove the transaction marker for {}: {}", segid, e);
+            }
+        }
+        Ok(cno)
+    }
+
+    /// Whether an transaction is open.
+    /// Abandon the open transaction, discarding its writes.
+    ///
+    /// Rolls the file back to what is persisted, so the writes made inside the
+    /// transaction are gone from this handle as well as from any later open.
+    /// That is the difference between this and simply never committing: the
+    /// latter leaves them in memory until the file is closed, and only a
+    /// reopen discards them.
+    ///
+    /// Writes made *before* the transaction began are not affected by the
+    /// transaction, but they are affected by the rollback: it returns the file
+    /// to its last published state. Publish before beginning a transaction if
+    /// there is unflushed work worth keeping.
+    #[cfg(feature = "wal")]
+    pub async fn abort_txn(&mut self) -> Result<()> {
+        if !self.txn_open {
+            return Err(Error::new(ErrorKind::NotFound, "no transaction is open"));
+        }
+        let segid = self.inode().get_last_seq();
+        self.txn_open = false;
+        self.rollback_from_persisted().await?;
+        let fut = self.wal.as_mut().map(|wal| wal.delete_txn_marker(segid));
+        if let Some(fut) = fut {
+            // A marker left behind costs nothing: the records it covers were
+            // rolled back, so recovery finds nothing of the transaction to
+            // apply either way.
+            if let Err(e) = fut.await {
+                warn!("abort_txn - could not remove the marker for {}: {}", segid, e);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn in_txn(&self) -> bool {
+        self.txn_open
     }
 
     /// What recovery did when this container was opened.
@@ -1158,6 +1338,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     pub async fn write(&mut self, off: usize, buf: &[u8]) -> Result<usize> {
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1249,6 +1431,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     pub async fn write_zero(&mut self, off: usize, len: usize) -> Result<usize> {
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1354,6 +1538,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// waiting on the handler task; see `HyperFile::try_lock`.
     pub(crate) async fn write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize> {
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.write_aligned_batch_locked(blocks, permit).await
     }
@@ -1741,6 +1927,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// dirty set without bound.
     pub async fn block_mut(&mut self, blk_idx: BlockIndex, create: bool) -> Result<Option<BlockMut<'_>>> {
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1869,6 +2057,14 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // the timer: `elapsed() >= Duration::from_millis(0)` is always true, so
         // 0 publishes on every check. Without a log, raising it is the way to
         // slow the timer down.
+        // An open transaction publishes nothing. The caller has said its
+        // writes are one unit, and a threshold crossing partway through would
+        // make half of that unit the container's newest checkpoint — which the
+        // next open would take as its baseline.
+        #[cfg(feature = "wal")]
+        if self.txn_open {
+            return false;
+        }
         #[cfg(feature = "wal")]
         let last_flush_expired = self.wal.is_none() && {
             let max_flush_interval = self.config.runtime.data_cache_dirty_max_flush_interval;
@@ -1914,6 +2110,11 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // through here. It has to happen on both sides: there, so no caller can
         // skip it; here, so its failure does not reach the rollback.
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        if self.txn_open {
+            return Err(Error::new(ErrorKind::ResourceBusy,
+                "a transaction is open, so publishing was asked not to happen; commit it to publish"));
+        }
         match self.flush().await {
             Ok(segid) => Ok(segid),
             Err(e) => {
@@ -2075,6 +2276,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Err(Error::new(ErrorKind::Unsupported, "wal is not configured"));
         };
         let Some(barrier) = wal.read_barrier(segid).await? else {
+            // No barrier, so nothing vouches for this group. A transaction marker
+            // says more than that: part of it is work the caller declared to be
+            // one unit and did not finish, and that part must not be applied in
+            // either mode.
+            if let Some(from_seq) = wal.read_txn_marker(segid).await? {
+                return Ok(WalGroupState::TxnOpen { from_seq });
+            }
             return Ok(WalGroupState::Unsealed);
         };
         let stored = wal.list_chunks(segid).await?;
@@ -2190,7 +2398,20 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // that cannot be answered afterwards because a replayed group's
             // objects are deleted once it lands.
             let state = self.wal_group_state(segid).await?;
-            if self.wal_recovery_mode() == WalRecoveryMode::Barrier {
+            // An interval the caller left open is honoured in both modes: it is
+            // an explicit declaration, not an inference about where the crash
+            // fell. Records before it are ordinary and still applied; from it on
+            // they are half a unit, and half is what the interval exists to
+            // keep out.
+            let mut upto: Option<usize> = None;
+            if let WalGroupState::TxnOpen { from_seq } = state {
+                warn!("do_wal_flush_recovery - checkpoint {} has an transaction \
+                      left open at seq {}; applying what came before it and stopping \
+                      there", segid, from_seq);
+                upto = Some(from_seq);
+                stopped_at = Some(segid);
+            }
+            if upto.is_none() && self.wal_recovery_mode() == WalRecoveryMode::Barrier {
                 match state {
                     WalGroupState::Complete => {},
                     WalGroupState::Unsealed => {
@@ -2205,10 +2426,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         stopped_at = Some(segid);
                         break;
                     },
+                    WalGroupState::TxnOpen { .. } => unreachable!("handled above"),
                 }
             }
             last_applied_sealed = state == WalGroupState::Complete;
-            match self.wal_replay_chunks(segid).await {
+            let stop_after_this = upto.is_some();
+            match self.wal_replay_chunks_upto(segid, upto).await {
                 Ok(c) => {
                     assert!(c == segid + 1);
                     cno = c;
@@ -2231,6 +2454,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     self.wal_spawn_delete_segment(segid);
                 },
                 Err(e) => return Err(e),
+            }
+            if stop_after_this {
+                // Everything past this point is inside the unfinished unit.
+                break;
             }
         }
 
@@ -2277,8 +2504,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     #[cfg(feature = "wal")]
     pub async fn wal_replay_chunks(&mut self, segid: SegmentId) -> Result<SegmentId> {
-        debug!("wal_replay_chunks - start to process {}", segid);
-        let map = self.wal_list_chunks(segid).await?;
+        self.wal_replay_chunks_upto(segid, None).await
+    }
+
+    /// Replay a checkpoint's records, optionally stopping before `upto`.
+    ///
+    /// The bound exists for a transaction left open: the records before it
+    /// are ordinary writes that must still be applied, and the ones from it on
+    /// are half of a declared unit that must not be.
+    #[cfg(feature = "wal")]
+    pub async fn wal_replay_chunks_upto(&mut self, segid: SegmentId, upto: Option<usize>) -> Result<SegmentId> {
+        debug!("wal_replay_chunks - start to process {} upto {:?}", segid, upto);
+        let mut map = self.wal_list_chunks(segid).await?;
+        if let Some(from_seq) = upto {
+            map.retain(|seq, _| *seq < from_seq);
+        }
 
         // take out wal to avoid write path exec into wal again
         let wal = self.wal.take();
@@ -2390,6 +2630,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// Blocking-acquire wrapper; see `HyperFile::try_lock`.
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.truncate_locked(new_size, permit).await
     }
@@ -2771,6 +3013,8 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     /// Blocking-acquire wrapper; see `HyperFile::try_lock`.
     pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
         self.check_writable()?;
+        #[cfg(feature = "wal")]
+        self.check_txn_room()?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.write_batch_locked(blocks, permit).await
     }
@@ -3089,6 +3333,11 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
     #[cfg(feature = "wal")]
     fn wal_mut(&mut self) -> Option<&mut Box<dyn crate::wal::WalReadWrite + Send>> {
         self.wal.as_mut()
+    }
+
+    #[cfg(feature = "wal")]
+    fn in_txn_trait(&self) -> bool {
+        self.txn_open
     }
 
     fn check_writable(&self) -> Result<()> {

@@ -1812,3 +1812,224 @@ async fn reactor_wal_time_alone_does_not_publish() {
         }
     }
 }
+
+/// An transaction publishes nothing until it closes, and an interval left
+/// open is not applied.
+///
+/// The case this exists for is work whose midpoints are not states anyone should
+/// come up in — a repair pass over the container's own contents. Such a pass can
+/// write past the dirty-data thresholds, and a threshold crossing partway through
+/// would make a half-fixed container the newest checkpoint, which the next open
+/// would take as its baseline.
+///
+/// Both halves matter. That nothing publishes is what protects the container
+/// while the work runs; that an unfinished transaction is not applied is what makes
+/// an interrupted pass cost redoing it rather than repairing the result of half
+/// of it. The second is honoured in `Latest` too, since the caller declared it
+/// rather than it being an accident of where the crash fell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_wal_atomic_interval_publishes_nothing_until_it_closes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+
+    // Thresholds low enough that the interval's writes would cross them.
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = 64 * BLK;
+    runtime.data_cache_dirty_max_blocks_threshold = 64;
+    runtime.data_cache_dirty_max_flush_interval = 200;
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    let mut h = Hyper::create(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+    ).await.expect("create");
+
+    // Ordinary work first, published, so there is a baseline to come back to.
+    let _ = h.fs_write(0, &vec![0xB0u8; BLK]).await.expect("baseline write");
+    let baseline_cno = h.fs_flush().await.expect("baseline flush");
+
+    // Inside the interval nothing may publish, and asking to is refused.
+    h.fs_begin_txn().await.expect("begin");
+    assert!(h.fs_in_txn());
+    assert!(h.fs_begin_txn().await.is_err(), "a second begin must be refused");
+
+    for i in 1..40usize {
+        let _ = h.fs_write(i * BLK, &vec![0xA5u8; BLK]).await
+            .unwrap_or_else(|e| panic!("interval write {}: {}", i, e));
+    }
+    assert_eq!(h.fs_last_cno(), baseline_cno,
+        "nothing may publish while the interval is open");
+
+    let before = h.fs_getattr().expect("getattr").st_size;
+    let err = h.fs_flush().await.expect_err("an explicit flush inside must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::ResourceBusy, "got {:?}: {}", err.kind(), err);
+    // A refusal must not discard anything. `fs_flush` rolls back when a flush
+    // fails, and a refusal reaching that path threw away every dirty block —
+    // acknowledged writes lost to a request that was merely not allowed.
+    assert_eq!(h.fs_getattr().expect("getattr").st_size, before,
+        "the refused flush discarded dirty data");
+
+    // Closing publishes it as one checkpoint.
+    let closed_cno = h.fs_commit_txn().await.expect("end");
+    assert!(closed_cno > baseline_cno, "closing must publish: {} -> {}", baseline_cno, closed_cno);
+    assert!(!h.fs_in_txn());
+    assert!(h.fs_commit_txn().await.is_err(), "closing twice must be refused");
+    let _ = h.fs_release().await.expect("release");
+
+    // And the whole unit is there afterwards.
+    {
+        let mut h = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("reopen");
+        let mut buf = vec![0u8; BLK];
+        let _ = h.fs_read(39 * BLK, &mut buf).await.expect("read the last block of the unit");
+        assert!(buf.iter().all(|b| *b == 0xA5), "the closed unit must be complete");
+        let _ = h.fs_release().await;
+    }
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// An interval left open is not applied, and what came before it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_wal_unfinished_atomic_interval_is_not_applied() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    // Both modes: the interval is the caller's declaration, so `Latest` must
+    // honour it too even though it otherwise applies whatever it finds.
+    for mode in [WalRecoveryMode::Latest, WalRecoveryMode::Barrier] {
+        let tf = TestFile::new(&client).await;
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()))
+            .with_recovery_mode(mode);
+        let config = HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build();
+
+        {
+            let mut h = Hyper::create(
+                client.clone(), config.clone(),
+                HyperFileFlags::from_flags(FileFlags::rdwr()),
+                HyperFileMode::from_mode(FileMode::default_file()),
+            ).await.expect("create");
+            // Published baseline.
+            let _ = h.fs_write(0, &vec![0xB0u8; BLK]).await.expect("baseline");
+            let _ = h.fs_flush().await.expect("flush");
+            // An ordinary unflushed write, which is not part of the unit.
+            let _ = h.fs_write(BLK, &vec![0xB1u8; BLK]).await.expect("ordinary write");
+            // Then a unit, left open.
+            h.fs_begin_txn().await.expect("begin");
+            let _ = h.fs_write(2 * BLK, &vec![0xA5u8; BLK]).await.expect("unit write");
+            let _ = h.fs_write(3 * BLK, &vec![0xA6u8; BLK]).await.expect("unit write");
+            // Die without closing it.
+            std::mem::forget(h);
+        }
+
+        let mut h = Hyper::open(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.unwrap_or_else(|e| panic!("{:?} reopen: {}", mode, e));
+
+        let mut buf = vec![0u8; BLK];
+        let _ = h.fs_read(0, &mut buf).await.expect("read baseline");
+        assert!(buf.iter().all(|b| *b == 0xB0), "{:?}: baseline lost", mode);
+
+        let st = h.fs_getattr().expect("getattr");
+        assert_eq!(st.st_size as usize, 2 * BLK,
+            "{:?}: the unit must be left out and the ordinary write kept — size says {}",
+            mode, st.st_size);
+
+        let mut buf1 = vec![0u8; BLK];
+        let _ = h.fs_read(BLK, &mut buf1).await.expect("read the ordinary write");
+        assert!(buf1.iter().all(|b| *b == 0xB1),
+            "{:?}: the write before the interval is ordinary and must survive", mode);
+
+        let r = h.wal_recovery_report();
+        assert!(r.records_dropped > 0,
+            "{:?}: the unit's records were set aside and must be counted: {:?}", mode, r);
+
+        let _ = h.fs_release().await;
+        cleanup_with_wal(&client, tf.uri()).await;
+    }
+}
+
+/// Aborting undoes the transaction on this handle, which is what separates it
+/// from never committing.
+///
+/// Never committing leaves the writes in memory until the file is closed, and
+/// only a reopen discards them — so a caller that gave up on a repair pass and
+/// carried on reading would still see its half-finished work. Aborting rolls the
+/// file back to what is published, so it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_wal_aborting_a_transaction_undoes_it_here_and_now() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    let mut h = Hyper::create(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+    ).await.expect("create");
+
+    let _ = h.fs_write(0, &vec![0xB0u8; BLK]).await.expect("baseline");
+    let published = h.fs_flush().await.expect("flush");
+
+    assert!(h.fs_abort_txn().await.is_err(), "aborting with none open must be refused");
+
+    h.fs_begin_txn().await.expect("begin");
+    let _ = h.fs_write(BLK, &vec![0xA5u8; BLK]).await.expect("write inside");
+    assert_eq!(h.fs_getattr().expect("getattr").st_size as usize, 2 * BLK,
+        "the write is visible while the transaction is open — there is no isolation");
+
+    h.fs_abort_txn().await.expect("abort");
+    assert!(!h.fs_in_txn());
+    assert_eq!(h.fs_getattr().expect("getattr").st_size as usize, BLK,
+        "aborting must undo the transaction on this handle, not just on a later open");
+    assert_eq!(h.fs_last_cno(), published, "aborting must not publish");
+
+    // And the file still works afterwards.
+    let _ = h.fs_write(BLK, &vec![0xC7u8; BLK]).await.expect("write after abort");
+    let _ = h.fs_flush().await.expect("flush after abort");
+    let mut buf = vec![0u8; BLK];
+    let _ = h.fs_read(BLK, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0xC7));
+    let _ = h.fs_release().await.expect("release");
+
+    cleanup_with_wal(&client, tf.uri()).await;
+}
