@@ -77,7 +77,33 @@ pub struct HyperFileWalConfig {
     /// Where recovery stops. See [`WalRecoveryMode`].
     #[serde(default)]
     pub recovery_mode: WalRecoveryMode,
+    /// How many flushes may be satisfied by the log alone before one of them
+    /// publishes a segment. `1`, the default, publishes on every flush.
+    ///
+    /// Publishing costs about the same however much was written — a consumer
+    /// measured 0.21 to 0.26 seconds for 1 MiB and for 32 MiB alike, which is
+    /// 93 to 99 per cent of their fsync latency. A flush that only seals the
+    /// log is one append, so raising this trades that fixed cost away.
+    ///
+    /// What it buys is paid for at recovery: the groups not yet published are
+    /// replayed on the next open after a crash, and each replay publishes. So
+    /// this is a dial between flush latency and mount latency after a crash,
+    /// and the sensible value depends on which one the caller is spending.
+    ///
+    /// It does not weaken durability. Every write is in the log before its call
+    /// returns either way, which is what `writes_durable_on_ack` reports; what
+    /// is deferred is the checkpoint, not the data. It does mean a flush can
+    /// return without a checkpoint existing for what it flushed, so a caller
+    /// that needs one — to open it by cno, say — has to publish.
+    ///
+    /// The dirty-data thresholds still apply, and are what bounds how much can
+    /// accumulate. Under `WalRecoveryMode::Barrier` crossing one is an error
+    /// rather than a publish, so there the bound is a hard one.
+    #[serde(default = "default_publish_every")]
+    pub publish_every: usize,
 }
+
+fn default_publish_every() -> usize { 1 }
 
 impl HyperFileWalConfig {
     /// Build a WAL config targeting the given S3 URI.
@@ -89,12 +115,20 @@ impl HyperFileWalConfig {
         Self {
             root_uri: uri.to_string(),
             recovery_mode: WalRecoveryMode::default(),
+            publish_every: default_publish_every(),
         }
     }
 
     /// Choose where recovery stops. See [`WalRecoveryMode`].
     pub fn with_recovery_mode(mut self, mode: WalRecoveryMode) -> Self {
         self.recovery_mode = mode;
+        self
+    }
+
+    /// How many flushes may be satisfied by the log before one publishes. See
+    /// [`Self::publish_every`]. Zero is treated as one.
+    pub fn with_publish_every(mut self, n: usize) -> Self {
+        self.publish_every = n.max(1);
         self
     }
 

@@ -167,6 +167,20 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     /// [`WalRecoveryReport`](crate::wal::WalRecoveryReport).
     #[cfg(feature = "wal")]
     pub(crate) wal_recovery_report: WalRecoveryReport,
+    /// Flushes satisfied by the log alone since the last publish.
+    ///
+    /// Counts toward `HyperFileWalConfig::publish_every`, and resets when a
+    /// segment is published. Also tells the publish how many log prefixes it
+    /// supersedes, which it has to delete — one per deferred flush plus its
+    /// own, since each of them sealed its own group.
+    #[cfg(feature = "wal")]
+    pub(crate) wal_deferred_barriers: usize,
+    /// Set when the next flush must publish regardless of `publish_every`.
+    ///
+    /// Used on the way out: deferring is a bet that another flush is coming, and
+    /// on close there is not one.
+    #[cfg(feature = "wal")]
+    pub(crate) wal_force_publish: bool,
     /// Set while the caller has declared its writes to be one unit.
     ///
     /// Suppresses publishing, so that nothing half-done can become the
@@ -279,6 +293,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             wal_recovery_report: WalRecoveryReport::default(),
             #[cfg(feature = "wal")]
             txn_open: false,
+            #[cfg(feature = "wal")]
+            wal_deferred_barriers: 0,
+            #[cfg(feature = "wal")]
+            wal_force_publish: false,
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -403,6 +421,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             wal_recovery_report: WalRecoveryReport::default(),
             #[cfg(feature = "wal")]
             txn_open: false,
+            #[cfg(feature = "wal")]
+            wal_deferred_barriers: 0,
+            #[cfg(feature = "wal")]
+            wal_force_publish: false,
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -488,6 +510,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let segid = if self.flags.is_rdonly() {
             self.inode().get_last_cno()
         } else {
+            // Closing publishes, whatever `publish_every` says. Deferring is a
+            // bet that another flush is coming; on the way out there is not
+            // one, and leaving the groups unpublished would put their cost on
+            // the next open instead.
+            #[cfg(feature = "wal")]
+            { self.wal_force_publish = true; }
             self.flush().await?
         };
         self.cache.shutdown();
@@ -2319,7 +2347,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // A lost delete here leaves storage slightly bloated —
         // recovery filters by last_ondisk_cno, so old entries are
         // still correct — and is not worth blocking the flush ack.
-        self.wal_spawn_delete_segment(segid.saturating_sub(1));
+        self.wal_drop_superseded_prefixes(segid);
         // restore cache limit
         self.restore_data_blocks_cache_limit();
         self.bmap_set_cache_limit(bmap_cache_limit);
@@ -3425,6 +3453,34 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
     #[cfg(feature = "wal")]
     fn in_txn_trait(&self) -> bool {
         self.txn_open
+    }
+
+    #[cfg(feature = "wal")]
+    fn wal_may_defer_publish(&self) -> bool {
+        // Never inside a transaction: its commit is a publish by definition,
+        // and deferring it would leave the unit unsealed with the caller told
+        // otherwise.
+        if self.txn_open || self.wal.is_none() || self.wal_force_publish {
+            return false;
+        }
+        let every = self.config.wal.publish_every.max(1);
+        self.wal_deferred_barriers + 1 < every
+    }
+
+    #[cfg(feature = "wal")]
+    fn wal_count_deferred_barrier(&mut self) {
+        self.wal_deferred_barriers += 1;
+    }
+
+    #[cfg(feature = "wal")]
+    fn wal_deferred_count(&self) -> usize {
+        self.wal_deferred_barriers
+    }
+
+    #[cfg(feature = "wal")]
+    fn wal_reset_deferred_count(&mut self) {
+        self.wal_deferred_barriers = 0;
+        self.wal_force_publish = false;
     }
 
     fn check_writable(&self) -> Result<()> {

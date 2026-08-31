@@ -391,6 +391,15 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     #[cfg(feature = "wal")]
     fn in_txn_trait(&self) -> bool;
 
+    /// Whether this flush may be satisfied by the log without publishing. See
+    /// `HyperFileWalConfig::publish_every`.
+    #[cfg(feature = "wal")]
+    fn wal_may_defer_publish(&self) -> bool;
+
+    /// Record that a flush was satisfied by the log.
+    #[cfg(feature = "wal")]
+    fn wal_count_deferred_barrier(&mut self);
+
     // wal
     #[cfg(feature = "wal")]
     fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
@@ -404,6 +413,30 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     /// so correctness is unaffected.
     #[cfg(feature = "wal")]
     fn wal_spawn_delete_segment(&self, segid: SegmentId);
+
+    /// Delete every log prefix this publish supersedes, and reset the deferred
+    /// count.
+    ///
+    /// One publish can stand for several groups: each deferred flush sealed its
+    /// own, and all of them are contained in the segment just written. Deleting
+    /// only the newest would leave the rest behind, so the log would grow in
+    /// proportion to how often publishing is deferred — which is the cost that
+    /// deferral is trying to avoid paying elsewhere.
+    #[cfg(feature = "wal")]
+    fn wal_drop_superseded_prefixes(&mut self, published: SegmentId) {
+        let deferred = self.wal_deferred_count();
+        for back in 1..=(deferred + 1) {
+            self.wal_spawn_delete_segment(published.saturating_sub(back as SegmentId));
+        }
+        self.wal_reset_deferred_count();
+    }
+
+    /// Flushes satisfied by the log since the last publish.
+    #[cfg(feature = "wal")]
+    fn wal_deferred_count(&self) -> usize;
+
+    #[cfg(feature = "wal")]
+    fn wal_reset_deferred_count(&mut self);
 
     // provided method
     fn bmap_get_raw(&self) -> BMapRawType {
@@ -785,7 +818,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // WAL flush.
         #[cfg(feature = "wal")]
         {
-            self.wal_spawn_delete_segment(segid.saturating_sub(1));
+            self.wal_drop_superseded_prefixes(segid);
         }
 
         Ok(self.inode().get_last_ondisk_cno())
@@ -802,6 +835,29 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         if let Err(e) = self.wal_seal_barrier().await {
             return Err((lock, e));
         }
+
+        // A flush may be satisfied by the log alone. The data is durable — each
+        // write made it so before returning — so what is deferred is the
+        // checkpoint, not the data.
+        //
+        // The sequence still has to move, or the next group's records would land
+        // under this checkpoint and the next barrier would overwrite this one's,
+        // claiming two groups as one.
+        //
+        // The dirty-data thresholds stay on, and they are what bounds how much
+        // can pile up here. Recovery replays each deferred group in turn, so a
+        // mount after a crash pays what these flushes did not.
+        if self.wal_may_defer_publish() {
+            let segid = self.inode().get_last_seq();
+            self.inode_mut().set_last_seq(segid + 1);
+            self.wal_count_deferred_barrier();
+            self.set_last_flush();
+            let last_cno = self.inode().get_last_cno();
+            self.flush_unlock(lock);
+            debug!("flush satisfied by the log, checkpoint deferred; last published {}", last_cno);
+            return Ok(last_cno);
+        }
+
         let (segid, dirty_data_blocks) = match self.flush_process_pre_build_segment().await {
             Ok((segid, dirty_data_blocks)) => (segid, dirty_data_blocks),
             Err(e) => return Err((lock, e)),

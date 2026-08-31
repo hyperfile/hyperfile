@@ -2285,3 +2285,129 @@ async fn reactor_wal_declined_records_survive_an_inode_only_publish() {
 
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// `publish_every` lets flushes be satisfied by the log, and the checkpoint that
+/// eventually happens covers all of them.
+///
+/// Publishing costs about the same however much was written — a consumer
+/// measured 0.21 to 0.26 seconds for 1 MiB and for 32 MiB alike, 93 to 99 per
+/// cent of their fsync latency — so it is a fixed cost per flush, and this is
+/// how to stop paying it on every one.
+///
+/// Three things have to hold together, and the third is the one that would
+/// quietly undo the point of it: fewer container objects, the data still
+/// recoverable after a crash with several groups outstanding, and the log not
+/// growing in proportion to how often publishing was deferred.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_deferred_publish_covers_every_group_it_skipped() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+    const FLUSHES: usize = 8;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let mut published = Vec::new();
+    let mut left_in_log = Vec::new();
+    for every in [1usize, 4] {
+        let tf = TestFile::new(&client).await;
+        let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()))
+            .with_publish_every(every);
+        let config = HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build();
+
+        {
+            let reactor = make_reactor();
+            let hyper = Hyper::create(
+                client.clone(), config.clone(),
+                HyperFileFlags::from_flags(FileFlags::rdwr()),
+                HyperFileMode::from_mode(FileMode::default_file()),
+            ).await.expect("create");
+            let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+            for i in 0..FLUSHES {
+                let b = AlignedDataBlockWrapper::new(i as u64, BLK, false);
+                b.as_mut_slice().fill(0x90 + i as u8);
+                let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+                let _ = fh.fh_flush().await.expect("flush");
+            }
+            // Counted here, not after closing. The delete that follows a publish
+            // is queued behind it, and tearing the handle down can outrun it —
+            // which costs one prefix per lost delete normally, and a whole
+            // deferred run's worth when publishing is deferred. That race is
+            // worth knowing about but it is not what this assertion is for.
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            left_in_log.push(wal_object_count(&client, tf.uri()).await);
+
+            // Closing publishes whatever is outstanding, so the file is whole
+            // without needing recovery.
+            let _ = fh.fh_release().await;
+        }
+
+        // Every flush's data is there.
+        {
+            let mut hyper = Hyper::open(
+                client.clone(), config.clone(),
+                HyperFileFlags::from_flags(FileFlags::rdonly()),
+            ).await.expect("reopen");
+            for i in 0..FLUSHES {
+                let mut buf = vec![0u8; BLK];
+                let n = hyper.fs_read(i * BLK, &mut buf).await.expect("read");
+                assert_eq!(n, BLK);
+                assert!(buf.iter().all(|b| *b == 0x90 + i as u8),
+                    "every={}: block {} came back {:#x}", every, i, buf[0]);
+            }
+            let _ = hyper.fs_release().await;
+        }
+
+        // Deletes are fire-and-forget, so let them land before counting;
+        // otherwise this measures the race rather than the property.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        published.push(count_container_objects(&client, tf.uri()).await);
+        cleanup_with_wal(&client, tf.uri()).await;
+    }
+
+    // Deferring publishes fewer segments. That is the whole point.
+    assert!(published[1] < published[0],
+        "publish_every=4 produced {} container objects against {} for 1",
+        published[1], published[0]);
+
+    // And it does not pay for them in log objects. A publish supersedes every
+    // group it skipped, so what is left over must not grow with how often
+    // publishing was deferred — otherwise the cost has just moved.
+    assert!(left_in_log[1] <= left_in_log[0] + 1,
+        "publish_every=4 left {} log objects against {} for 1, so deferred groups' \
+         prefixes are not being dropped", left_in_log[1], left_in_log[0]);
+}
+
+/// Objects under the container prefix, excluding the wal subtree.
+async fn count_container_objects(client: &aws_sdk_s3::Client, uri: &str) -> usize {
+    let bucket = test_bucket();
+    let root = uri.strip_prefix(&format!("s3://{}/", bucket)).expect("uri");
+    let prefix = format!("{}/", root);
+    let wal_prefix = format!("{}/wal/", root);
+    let mut n = 0;
+    let mut token = None;
+    loop {
+        let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+        if let Some(t) = token { req = req.continuation_token(t); }
+        let r = req.send().await.expect("list");
+        for o in r.contents() {
+            if let Some(k) = o.key() {
+                if !k.starts_with(&wal_prefix) { n += 1; }
+            }
+        }
+        match r.next_continuation_token() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    n
+}
