@@ -8,7 +8,7 @@ use aws_sdk_s3::Client;
 use crate::{segment::Segment, SegmentId};
 use crate::s3commons::S3Ops;
 use crate::s3uri::S3Uri;
-use super::{WalReadWrite, WalChunkDesc};
+use super::{WalReadWrite, WalChunkDesc, WalBarrier};
 
 pub(crate) struct S3Wal {
     pub(crate) client: Client,
@@ -19,6 +19,12 @@ pub(crate) struct S3Wal {
     pub(crate) data_block_size: usize,
     pub(crate) last_segid: SegmentId,
     pub(crate) seq: Arc<AtomicU64>,
+    /// `(seq, offset, len)` of the records written since the last barrier.
+    ///
+    /// Kept here rather than asked of the caller because this is the side that
+    /// assigns `seq`, so it is the only side that can state the group without
+    /// being told. Cleared when the barrier is written.
+    pub(crate) pending: Vec<(usize, usize, usize)>,
 }
 
 impl S3Wal {
@@ -43,6 +49,7 @@ impl S3Wal {
             data_block_size,
             last_segid,
             seq: Arc::new(AtomicU64::new(0)),
+            pending: Vec::new(),
         };
         Ok(Some(Box::new(s)))
     }
@@ -65,7 +72,15 @@ impl S3Wal {
             self.reset_seq();
         }
         let seq = self.next_seq();
+        self.pending.push((seq as usize, offset, len));
         format!("{}/{}/{}_{}_{}", self.root_path, seg_s, seq, offset, len)
+    }
+
+    #[inline]
+    fn barrier_key(&self, segid: SegmentId) -> String {
+        // Deliberately not `seq_offset_len`, so `decode` rejects it and
+        // `list_chunks` cannot mistake it for a record.
+        format!("{}/{}/barrier", self.root_path, Segment::segid_to_staging_file_id(segid))
     }
 
     #[inline]
@@ -127,6 +142,40 @@ impl WalReadWrite for S3Wal {
             let res = S3Ops::do_get_object(&client, &bucket, &key, &mut buf, None, false).await;
             match res {
                 Ok(_) => Ok(buf),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn write_barrier(&mut self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+        // Nothing written since the last barrier means nothing to seal, and
+        // writing an empty one would be worse than skipping it: records written
+        // after it under the same checkpoint would then sit behind a barrier
+        // claiming the group is empty, and recovery would drop them as
+        // out-of-manifest.
+        if self.pending.is_empty() {
+            return Box::pin(async { Ok(()) });
+        }
+        let key = self.barrier_key(segid);
+        let body = WalBarrier::new(std::mem::take(&mut self.pending)).encode();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        Box::pin(async move {
+            S3Ops::do_put_object(&client, &bucket, &key, &body, &None).await.and(Ok(()))
+        })
+    }
+
+    fn read_barrier(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Option<WalBarrier>>> + Send + '_>> {
+        let key = self.barrier_key(segid);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        Box::pin(async move {
+            match S3Ops::do_get_object_speculative(&client, &bucket, &key, None, false).await {
+                // A body this build cannot parse is reported as absent, so
+                // recovery stops rather than applying a group it cannot vouch
+                // for.
+                Ok((bytes, _)) => Ok(WalBarrier::decode(&bytes)),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
             }
         })
@@ -234,6 +283,7 @@ mod tests {
             data_block_size: 4096,
             last_segid,
             seq: Arc::new(AtomicU64::new(0)),
+            pending: Vec::new(),
         }
     }
 

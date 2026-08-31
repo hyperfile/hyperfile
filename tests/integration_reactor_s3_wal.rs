@@ -35,7 +35,7 @@ use hyperfile::file::flags::HyperFileFlags;
 use hyperfile::file::mode::HyperFileMode;
 use hyperfile::config::{HyperFileConfig, HyperFileConfigBuilder};
 use hyperfile::staging::config::StagingConfig;
-use hyperfile::wal::config::HyperFileWalConfig;
+use hyperfile::wal::config::{HyperFileWalConfig, WalRecoveryMode};
 use hyperfile::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 
 /// Build a HyperFileConfig with WAL pointing at `<uri>/wal/`.
@@ -1438,4 +1438,193 @@ async fn reactor_wal_partial_batch_write_is_durable_on_ack() {
     }
 
     cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// List the record names and whether a barrier exists, for one checkpoint
+/// prefix. Returns `(record_names, barrier_body)`.
+async fn wal_segid_contents(
+    client: &aws_sdk_s3::Client, uri: &str, segid: u64,
+) -> (Vec<String>, Option<Vec<u8>>) {
+    let bucket = test_bucket();
+    let root = uri.strip_prefix(&format!("s3://{}/", bucket)).expect("uri");
+    let prefix = format!("{}/wal/{:010}/", root, segid);
+    let mut names = Vec::new();
+    let mut token = None;
+    loop {
+        let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+        if let Some(t) = token { req = req.continuation_token(t); }
+        let r = req.send().await.expect("list segid prefix");
+        for o in r.contents() {
+            if let Some(k) = o.key() {
+                names.push(k.trim_start_matches(&prefix).to_string());
+            }
+        }
+        match r.next_continuation_token() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    let barrier = match client.get_object().bucket(&bucket)
+        .key(format!("{}barrier", prefix)).send().await
+    {
+        Ok(o) => Some(o.body.collect().await.expect("collect").to_vec()),
+        Err(_) => None,
+    };
+    names.retain(|n| n != "barrier");
+    (names, barrier)
+}
+
+/// A flush seals the log group it is about to publish, and the barrier's
+/// manifest names exactly the records that are there.
+///
+/// The barrier answers the one question the records cannot: is this group
+/// whole? A crash mid-flush leaves a partial set that is indistinguishable from
+/// a complete one by looking at the objects, and applying it hands the layer
+/// above half a transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_flush_seals_the_group_it_publishes() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+
+    let reactor = make_reactor();
+    let hyper = Hyper::create(
+        client.clone(), build_wal_config(tf.uri()),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+    ).await.expect("create");
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+    // Records land under the checkpoint the flush is about to leave behind.
+    let segid = fh.fh_last_cno().await.expect("last cno");
+
+    let mut blocks = Vec::new();
+    for i in 0..6usize {
+        let b = AlignedDataBlockWrapper::new(i as u64, BLK, i == 3);
+        if i != 3 { b.as_mut_slice().fill(0x50 + i as u8); }
+        blocks.push(b);
+    }
+    let _ = fh.fh_write_aligned_batch(blocks).await.expect("batch write");
+
+    let (records_before, barrier_before) = wal_segid_contents(&client, tf.uri(), segid).await;
+    assert!(!records_before.is_empty(), "records must be there before the flush");
+    assert!(barrier_before.is_none(), "nothing is sealed until a flush says so");
+
+    let _ = fh.fh_flush().await.expect("flush");
+
+    let (records, barrier) = wal_segid_contents(&client, tf.uri(), segid).await;
+    let body = barrier.expect("a flush must seal the group it publishes");
+    let manifest = hyperfile::wal::WalBarrier::decode(&body)
+        .expect("the barrier must be readable by this build");
+
+    assert_eq!(manifest.entries.len(), records.len(),
+        "manifest lists {} entries, {} records are stored",
+        manifest.entries.len(), records.len());
+    for (seq, off, len) in manifest.entries.iter() {
+        let want = format!("{}_{}_{}", seq, off, len);
+        assert!(records.contains(&want),
+            "manifest names {} but no such record is stored; stored: {:?}", want, records);
+    }
+
+    let _ = fh.fh_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// The two recovery modes land in different places, and the durability
+/// guarantee reports which one it is.
+///
+/// `Latest` keeps every acknowledged write, which is what
+/// `writes_durable_on_ack` promises, so it is the default. `Barrier` stops at
+/// the last sealed group, so a write with no flush behind it is discarded by
+/// design — and the guarantee has to say so rather than keep claiming a
+/// property the mode has given up. A caller that skipped flushing on the
+/// strength of it would otherwise lose data silently, which is the whole reason
+/// that method is named for the guarantee and not for the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_recovery_mode_decides_the_landing_point() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let config_for = |uri: &str, mode: WalRecoveryMode| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", uri))
+            .with_recovery_mode(mode);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    // A container each, because opening recovers: whichever mode went first
+    // would publish and leave the other with nothing to decide about.
+    for mode in [WalRecoveryMode::Latest, WalRecoveryMode::Barrier] {
+        let tf = TestFile::new(&client).await;
+
+        // Sealed work, then unsealed work on top of it, then die.
+        {
+            let reactor = make_reactor();
+            let hyper = Hyper::create(
+                client.clone(), config_for(tf.uri(), mode),
+                HyperFileFlags::from_flags(FileFlags::rdwr()),
+                HyperFileMode::from_mode(FileMode::default_file()),
+            ).await.expect("create");
+            let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+            let sealed = AlignedDataBlockWrapper::new(0, BLK, false);
+            sealed.as_mut_slice().fill(0xE1);
+            let _ = fh.fh_write_aligned_batch(vec![sealed]).await.expect("sealed write");
+            let _ = fh.fh_flush().await.expect("flush seals it");
+
+            let unsealed = AlignedDataBlockWrapper::new(1, BLK, false);
+            unsealed.as_mut_slice().fill(0xE2);
+            let _ = fh.fh_write_aligned_batch(vec![unsealed]).await.expect("unsealed write");
+            drop(fh);
+            drop(reactor);
+        }
+
+        let mut hyper = Hyper::open(
+            client.clone(), config_for(tf.uri(), mode),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.unwrap_or_else(|e| panic!("open {:?}: {}", mode, e));
+
+        // Sealed work survives either way.
+        let mut buf0 = vec![0u8; BLK];
+        let n = hyper.fs_read(0, &mut buf0).await.expect("read the sealed block");
+        assert_eq!(n, BLK, "{:?}: sealed block missing", mode);
+        assert!(buf0.iter().all(|b| *b == 0xE1),
+            "{:?}: sealed block came back {:#x}", mode, buf0[0]);
+
+        let st = hyper.fs_getattr().expect("getattr");
+        match mode {
+            WalRecoveryMode::Latest => {
+                assert!(hyper.writes_durable_on_ack(),
+                    "Latest keeps acknowledged writes, so the guarantee holds");
+                assert_eq!(st.st_size as usize, 2 * BLK,
+                    "Latest must keep the unsealed write");
+                let mut buf1 = vec![0u8; BLK];
+                let _ = hyper.fs_read(BLK, &mut buf1).await.expect("read the unsealed block");
+                assert!(buf1.iter().all(|b| *b == 0xE2),
+                    "Latest must keep the write that had no flush behind it");
+            },
+            WalRecoveryMode::Barrier => {
+                assert!(!hyper.writes_durable_on_ack(),
+                    "Barrier discards unsealed work, so the guarantee must not be claimed");
+                assert_eq!(st.st_size as usize, BLK,
+                    "Barrier must stop at the seal, leaving the unsealed write out");
+            },
+        }
+
+        let _ = hyper.fs_release().await;
+        cleanup_with_wal(&client, tf.uri()).await;
+    }
 }

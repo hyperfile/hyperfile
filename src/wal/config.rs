@@ -42,12 +42,41 @@ use super::s3::S3Wal;
 ///
 /// See [`docs/wal.md`](../../docs/wal.md) for the full semantics,
 /// durability guarantees, and performance trade-offs.
+/// Where recovery should stop when it replays the log.
+///
+/// Both landing points are defensible and they trade different things, so this
+/// is a choice rather than a fixed behaviour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum WalRecoveryMode {
+    /// Apply every group that can be applied, sealed or not.
+    ///
+    /// Keeps every write that was acknowledged, which is what
+    /// [`writes_durable_on_ack`][crate::file::file::HyperFile::writes_durable_on_ack]
+    /// promises, so this is the default. The cost is that the landing point
+    /// need not be a state the layer above ever had: if the crash fell in the
+    /// middle of that layer's own transaction, the replay reproduces the middle
+    /// of it, and putting that right is the caller's problem.
+    #[default]
+    Latest,
+    /// Stop at the last group that was sealed and is complete.
+    ///
+    /// The landing point is one the layer above declared consistent, so it
+    /// needs no repair. The cost is everything acknowledged after that seal —
+    /// which is why `writes_durable_on_ack` reports `false` in this mode: a
+    /// write with no flush behind it is in an unsealed group, and this mode
+    /// discards those by design.
+    Barrier,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct HyperFileWalConfig {
     /// The S3 URI (`s3://bucket/key-prefix`) under which the WAL
     /// places per-segid subdirectories of `<seq>_<offset>_<len>`
     /// objects. Leave empty to disable WAL.
     pub root_uri: String,
+    /// Where recovery stops. See [`WalRecoveryMode`].
+    #[serde(default)]
+    pub recovery_mode: WalRecoveryMode,
 }
 
 impl HyperFileWalConfig {
@@ -59,7 +88,14 @@ impl HyperFileWalConfig {
     pub fn new(uri: &str) -> Self {
         Self {
             root_uri: uri.to_string(),
+            recovery_mode: WalRecoveryMode::default(),
         }
+    }
+
+    /// Choose where recovery stops. See [`WalRecoveryMode`].
+    pub fn with_recovery_mode(mut self, mode: WalRecoveryMode) -> Self {
+        self.recovery_mode = mode;
+        self
     }
 
     /// Construct the runtime WAL instance from this config.

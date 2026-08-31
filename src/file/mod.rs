@@ -383,6 +383,10 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     /// `State::publish_failed`.
     fn check_writable(&self) -> Result<()>;
 
+    /// The write-ahead log, if one is configured.
+    #[cfg(feature = "wal")]
+    fn wal_mut(&mut self) -> Option<&mut Box<dyn crate::wal::WalReadWrite + Send>>;
+
     // wal
     #[cfg(feature = "wal")]
     fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
@@ -683,10 +687,40 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         Ok((segwr, segid, raw_inode, dirty_meta_vec))
     }}
 
+    /// Seal the records written since the last barrier, naming the checkpoint
+    /// they belong to.
+    ///
+    /// Ordered deliberately: after every record is confirmed written, because a
+    /// barrier claims the group is whole; and before the segment is built,
+    /// because building it advances `last_seq` and the records are under the
+    /// old one. Together those two make "a barrier exists for this segid" mean
+    /// "the group is complete and was never published".
+    ///
+    /// Nothing to seal is not an error. A flush with no records behind it —
+    /// metadata only, or a replay, which takes the log out while it runs —
+    /// writes a barrier over an empty manifest, which recovery reads as a
+    /// complete group of nothing.
+    #[cfg(feature = "wal")]
+    fn wal_seal_barrier(&mut self) -> impl Future<Output = Result<()>> {async {
+        let segid = self.inode().get_last_seq();
+        let fut = match self.wal_mut() {
+            Some(wal) => wal.write_barrier(segid),
+            None => return Ok(()),
+        };
+        fut.await
+    }}
+
     fn flush_process(&mut self) -> impl Future<Output = Result<SegmentId>> {async move {
         let fn_start = Instant::now();
         debug!("flush started");
 
+        // Seal the log group before anything else: after every record is
+        // confirmed written, and before the segment build advances `last_seq`
+        // past the checkpoint those records are under. Sealing nothing is a
+        // no-op, so the case where this flush turns out to have nothing to
+        // publish costs nothing and writes no barrier.
+        #[cfg(feature = "wal")]
+        self.wal_seal_barrier().await?;
         let _start = Instant::now();
         let (segid, dirty_data_blocks) = self.flush_process_pre_build_segment().await?;
         self.flush_timing().pre_build_ns.fetch_add(
@@ -695,6 +729,9 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             self.flush_timing().flush_count.fetch_add(1, Ordering::Relaxed);
             return Ok(segid);
         }
+        // Seal the log group before the segment exists, so a crash between the
+        // two leaves a complete group to replay rather than an unpublished
+        // segment with no way to tell whether its records were all there.
         let _start = Instant::now();
         let (segwr, segid, raw_inode, dirty_meta_vec) = self.flush_process_build_segment(dirty_data_blocks).await?;
         self.flush_timing().build_segment_ns.fetch_add(
@@ -757,6 +794,10 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let fn_start = Instant::now();
         debug!("flush started");
 
+        // See `wal_seal_barrier`: after the records, before the segment.
+        if let Err(e) = self.wal_seal_barrier().await {
+            return Err((lock, e));
+        }
         let (segid, dirty_data_blocks) = match self.flush_process_pre_build_segment().await {
             Ok((segid, dirty_data_blocks)) => (segid, dirty_data_blocks),
             Err(e) => return Err((lock, e)),

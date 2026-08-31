@@ -40,6 +40,8 @@ use super::mode::HyperFileMode;
 use super::{HyperTrait, DirtyDataBlocks, FlushTiming, PlannedRead};
 #[cfg(feature = "wal")]
 use crate::{DEFAULT_FLUSH_RETRIES, DEFAULT_FLUSH_BACKOFF_SECS};
+#[cfg(feature = "wal")]
+use crate::wal::config::WalRecoveryMode;
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
 use super::state::State;
@@ -95,6 +97,18 @@ impl ReadOp {
             Self::Range { dst_len, .. } => *dst_len,
         }
     }
+}
+
+/// Whether a checkpoint's log group may be replayed.
+#[cfg(feature = "wal")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalGroupState {
+    /// Sealed, and every record the barrier names is stored.
+    Complete,
+    /// No barrier: the flush that would have written it did not get that far.
+    Unsealed,
+    /// Sealed, but records the barrier names are absent or the wrong shape.
+    Incomplete { missing: usize },
 }
 
 pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> {
@@ -435,7 +449,12 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub fn writes_durable_on_ack(&self) -> bool {
         #[cfg(feature = "wal")]
         {
-            self.wal.is_some()
+            // `Barrier` recovery discards everything after the last seal, and a
+            // write with no flush behind it is in an unsealed group — so in
+            // that mode an acknowledged write is not recoverable on its own and
+            // this must say so. Reporting the guarantee rather than the
+            // mechanism is what lets it.
+            self.wal.is_some() && self.wal_recovery_mode() == WalRecoveryMode::Latest
         }
         #[cfg(not(feature = "wal"))]
         {
@@ -1978,6 +1997,41 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         self.flush_unlock(lock);
     }
 
+    /// Where recovery stops. See [`WalRecoveryMode`].
+    #[cfg(feature = "wal")]
+    pub fn wal_recovery_mode(&self) -> WalRecoveryMode {
+        self.config.wal.recovery_mode
+    }
+
+    /// Whether a checkpoint's log group may be applied.
+    ///
+    /// The barrier's manifest is checked against what is stored rather than
+    /// trusted: it lists what was written so that this can be verified without
+    /// depending on a listing being complete or on the order the records went
+    /// out in.
+    #[cfg(feature = "wal")]
+    async fn wal_group_state(&self, segid: SegmentId) -> Result<WalGroupState> {
+        let Some(ref wal) = self.wal else {
+            return Err(Error::new(ErrorKind::Unsupported, "wal is not configured"));
+        };
+        let Some(barrier) = wal.read_barrier(segid).await? else {
+            return Ok(WalGroupState::Unsealed);
+        };
+        let stored = wal.list_chunks(segid).await?;
+        let missing = barrier.entries.iter()
+            .filter(|(seq, off, len)| {
+                match stored.get(seq) {
+                    Some(desc) => desc.offset != *off || desc.len != *len,
+                    None => true,
+                }
+            })
+            .count();
+        if missing > 0 {
+            return Ok(WalGroupState::Incomplete { missing });
+        }
+        Ok(WalGroupState::Complete)
+    }
+
     // starting wal flush recovery process by reloading inode from backend storage
     // everything should be clean or give a panic if unrecoverable
     #[cfg(feature = "wal")]
@@ -2049,6 +2103,29 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
         let mut cno = 0;
         for segid in segids {
+            // In `Barrier` mode only a sealed, complete group may be applied,
+            // and a group failing either test stops the replay rather than
+            // being skipped: skipping one and applying a later one would
+            // produce a state that never existed, which is worse than a torn
+            // one — that at least was some moment's truth.
+            //
+            // `Latest` mode applies what it can, which is what keeps every
+            // acknowledged write. It is the default for that reason.
+            if self.wal_recovery_mode() == WalRecoveryMode::Barrier {
+            match self.wal_group_state(segid).await? {
+                WalGroupState::Complete => {},
+                WalGroupState::Unsealed => {
+                    warn!("do_wal_flush_recovery - checkpoint {} was never sealed, \
+                          stopping here", segid);
+                    break;
+                },
+                WalGroupState::Incomplete { missing } => {
+                    warn!("do_wal_flush_recovery - checkpoint {} is sealed but {} of \
+                          its records are missing, stopping here", segid, missing);
+                    break;
+                },
+            }
+            }
             match self.wal_replay_chunks(segid).await {
                 Ok(c) => {
                     assert!(c == segid + 1);
@@ -2905,6 +2982,11 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
     /// `Ok`. See `State::publish_failed` for why the file stops accepting
     /// writes rather than continuing or panicking.
     #[inline]
+    #[cfg(feature = "wal")]
+    fn wal_mut(&mut self) -> Option<&mut Box<dyn crate::wal::WalReadWrite + Send>> {
+        self.wal.as_mut()
+    }
+
     fn check_writable(&self) -> Result<()> {
         #[cfg(feature = "wal")]
         if self.state.is_publish_failed() {
