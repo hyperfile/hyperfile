@@ -643,6 +643,18 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if !self.txn_open {
             return Err(Error::new(ErrorKind::NotFound, "no transaction is open"));
         }
+        // The flush lock may be travelling with a publish that is already in
+        // flight. Under the reactor its guard is handed to a spawned task and
+        // comes back as a callback to the handler task — the same task that runs
+        // this. Waiting for it here means the callback never gets processed, the
+        // guard never returns, and the handler is wedged for good. So report the
+        // conflict and let the caller's arm re-queue the request, which is what
+        // `release` has always done.
+        #[cfg(feature = "reactor")]
+        if self.state.is_flushing() {
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is in-progress"));
+        };
+
         let segid = self.inode().get_last_seq();
         // Cleared first so the flush is allowed to publish; restored if it does
         // not, so a failed close leaves the interval as it was.
@@ -683,6 +695,18 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if !self.txn_open {
             return Err(Error::new(ErrorKind::NotFound, "no transaction is open"));
         }
+        // The flush lock may be travelling with a publish that is already in
+        // flight. Under the reactor its guard is handed to a spawned task and
+        // comes back as a callback to the handler task — the same task that runs
+        // this. Waiting for it here means the callback never gets processed, the
+        // guard never returns, and the handler is wedged for good. So report the
+        // conflict and let the caller's arm re-queue the request, which is what
+        // `release` has always done.
+        #[cfg(feature = "reactor")]
+        if self.state.is_flushing() {
+            return Err(Error::new(ErrorKind::ResourceBusy, "flush is in-progress"));
+        };
+
         let segid = self.inode().get_last_seq();
         self.txn_open = false;
         self.rollback_from_persisted().await?;

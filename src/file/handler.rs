@@ -136,6 +136,19 @@ pub type FileRespFlush = Result<SegmentId>;
 pub type FileRespRelease = Result<SegmentId>;
 pub type FileRespLastCno = u64;
 
+/// See `Hyper::begin_txn`.
+#[cfg(feature = "wal")]
+pub type FileRespBeginTxn = Result<()>;
+/// See `Hyper::commit_txn`.
+#[cfg(feature = "wal")]
+pub type FileRespCommitTxn = Result<SegmentId>;
+/// See `Hyper::abort_txn`.
+#[cfg(feature = "wal")]
+pub type FileRespAbortTxn = Result<()>;
+/// See `Hyper::in_txn`.
+#[cfg(feature = "wal")]
+pub type FileRespInTxn = bool;
+
 /// Response carrier for a request handed off to the reactor
 /// handler.
 ///
@@ -179,6 +192,14 @@ pub enum FileResp {
     WalFlushRecovery,
     Release(oneshot::Sender<FileRespRelease>),
     LastCno(oneshot::Sender<FileRespLastCno>),
+    #[cfg(feature = "wal")]
+    BeginTxn(oneshot::Sender<FileRespBeginTxn>),
+    #[cfg(feature = "wal")]
+    CommitTxn(oneshot::Sender<FileRespCommitTxn>),
+    #[cfg(feature = "wal")]
+    AbortTxn(oneshot::Sender<FileRespAbortTxn>),
+    #[cfg(feature = "wal")]
+    InTxn(oneshot::Sender<FileRespInTxn>),
 }
 
 impl FileResp {
@@ -372,6 +393,38 @@ impl FileResp {
         match self {
             Self::Release(tx) => tx,
             _ => panic!("FileResp::to_release called on wrong variant"),
+        }
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn to_begin_txn(self) -> oneshot::Sender<FileRespBeginTxn> {
+        match self {
+            Self::BeginTxn(tx) => tx,
+            _ => panic!("FileResp::to_begin_txn called on wrong variant"),
+        }
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn to_commit_txn(self) -> oneshot::Sender<FileRespCommitTxn> {
+        match self {
+            Self::CommitTxn(tx) => tx,
+            _ => panic!("FileResp::to_commit_txn called on wrong variant"),
+        }
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn to_abort_txn(self) -> oneshot::Sender<FileRespAbortTxn> {
+        match self {
+            Self::AbortTxn(tx) => tx,
+            _ => panic!("FileResp::to_abort_txn called on wrong variant"),
+        }
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn to_in_txn(self) -> oneshot::Sender<FileRespInTxn> {
+        match self {
+            Self::InTxn(tx) => tx,
+            _ => panic!("FileResp::to_in_txn called on wrong variant"),
         }
     }
 
@@ -662,6 +715,29 @@ pub struct FileReqRelease<'a> {
 
 pub struct FileReqLastCno {}
 
+/// See `Hyper::begin_txn`. Nothing to carry: the interval lives in the handler
+/// task, because that is where the file does.
+#[cfg(feature = "wal")]
+pub struct FileReqBeginTxn {}
+
+/// See `Hyper::commit_txn`. Carries the channel so the arm can re-queue when a
+/// flush is in flight — committing publishes, and publishing needs the lock.
+#[cfg(feature = "wal")]
+pub struct FileReqCommitTxn<'a> {
+    pub fh: ChannelGroup<FileContext<'a>>,
+}
+
+/// See `Hyper::abort_txn`. Carries the channel for the same reason: the rollback
+/// reads back what is persisted, which must not race a publish.
+#[cfg(feature = "wal")]
+pub struct FileReqAbortTxn<'a> {
+    pub fh: ChannelGroup<FileContext<'a>>,
+}
+
+/// See `Hyper::in_txn`.
+#[cfg(feature = "wal")]
+pub struct FileReqInTxn {}
+
 pub enum FileReqOp {
     GetAttr,
     SetAttr,
@@ -695,6 +771,14 @@ pub enum FileReqOp {
     WalFlushRecovery,
     Release,
     LastCno,
+    #[cfg(feature = "wal")]
+    BeginTxn,
+    #[cfg(feature = "wal")]
+    CommitTxn,
+    #[cfg(feature = "wal")]
+    AbortTxn,
+    #[cfg(feature = "wal")]
+    InTxn,
     #[cfg(feature = "wal")]
     WriteWal,
     #[cfg(feature = "wal")]
@@ -730,6 +814,14 @@ pub union FileReqBody<'a> {
     flush: ManuallyDrop<FileReqFlush<'a>>,
     release: ManuallyDrop<FileReqRelease<'a>>,
     last_cno: ManuallyDrop<FileReqLastCno>,
+    #[cfg(feature = "wal")]
+    begin_txn: ManuallyDrop<FileReqBeginTxn>,
+    #[cfg(feature = "wal")]
+    commit_txn: ManuallyDrop<FileReqCommitTxn<'a>>,
+    #[cfg(feature = "wal")]
+    abort_txn: ManuallyDrop<FileReqAbortTxn<'a>>,
+    #[cfg(feature = "wal")]
+    in_txn: ManuallyDrop<FileReqInTxn>,
 }
 
 pub struct FileReq<'a> {
@@ -1153,6 +1245,78 @@ impl<'a> FileContext<'a> {
         };
         let resp = FileResp::Release(tx);
         (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    /// Open an atomic interval on the handler side. See `Hyper::begin_txn` for
+    /// what it does and does not promise — no isolation, no implicit undo.
+    ///
+    /// The interval belongs to the handler task, not the caller: every write
+    /// sent after this and before a commit falls inside it, whoever sent it.
+    #[cfg(feature = "wal")]
+    pub fn new_begin_txn() -> (Self, oneshot::Receiver<FileRespBeginTxn>) {
+        let (tx, rx) = oneshot::channel::<FileRespBeginTxn>();
+        let req = FileReq {
+            op: FileReqOp::BeginTxn,
+            body: FileReqBody { begin_txn: ManuallyDrop::new(FileReqBeginTxn {}), },
+        };
+        let resp = FileResp::BeginTxn(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    /// See `Hyper::commit_txn`.
+    #[cfg(feature = "wal")]
+    pub fn new_commit_txn(fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespCommitTxn>) {
+        let (tx, rx) = oneshot::channel::<FileRespCommitTxn>();
+        let req = FileReq {
+            op: FileReqOp::CommitTxn,
+            body: FileReqBody { commit_txn: ManuallyDrop::new(FileReqCommitTxn { fh, }), },
+        };
+        let resp = FileResp::CommitTxn(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    /// See `Hyper::abort_txn`.
+    #[cfg(feature = "wal")]
+    pub fn new_abort_txn(fh: ChannelGroup<FileContext<'a>>) -> (Self, oneshot::Receiver<FileRespAbortTxn>) {
+        let (tx, rx) = oneshot::channel::<FileRespAbortTxn>();
+        let req = FileReq {
+            op: FileReqOp::AbortTxn,
+            body: FileReqBody { abort_txn: ManuallyDrop::new(FileReqAbortTxn { fh, }), },
+        };
+        let resp = FileResp::AbortTxn(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    /// See `Hyper::in_txn`. Worth asking after an error: a commit that reported
+    /// one leaves the interval open, and the caller cannot tell from its own
+    /// side because the state is not there.
+    #[cfg(feature = "wal")]
+    pub fn new_in_txn() -> (Self, oneshot::Receiver<FileRespInTxn>) {
+        let (tx, rx) = oneshot::channel::<FileRespInTxn>();
+        let req = FileReq {
+            op: FileReqOp::InTxn,
+            body: FileReqBody { in_txn: ManuallyDrop::new(FileReqInTxn {}), },
+        };
+        let resp = FileResp::InTxn(tx);
+        (Self { req: Some(req), resp: Some(resp), }, rx)
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn reform_commit_txn(req: FileReqCommitTxn<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::CommitTxn,
+            body: FileReqBody { commit_txn: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
+    }
+
+    #[cfg(feature = "wal")]
+    pub fn reform_abort_txn(req: FileReqAbortTxn<'a>, resp: FileResp) -> Self {
+        let req = FileReq {
+            op: FileReqOp::AbortTxn,
+            body: FileReqBody { abort_txn: ManuallyDrop::new(req) },
+        };
+        Self { req: Some(req), resp: Some(resp) }
     }
 
     pub fn new_last_cno() -> (Self, oneshot::Receiver<FileRespLastCno>) {
@@ -1853,6 +2017,52 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 let _ = ManuallyDrop::into_inner(md);
                 let res = self.inner.last_cno();
                 let _ = resp.to_last_cno().send(res);
+            },
+            #[cfg(feature = "wal")]
+            FileReqOp::BeginTxn => {
+                let md = unsafe { req.body.begin_txn };
+                let _ = ManuallyDrop::into_inner(md);
+                let res = self.inner.begin_txn().await;
+                let _ = resp.to_begin_txn().send(res);
+            },
+            #[cfg(feature = "wal")]
+            FileReqOp::CommitTxn => {
+                let md = unsafe { req.body.commit_txn };
+                let req = ManuallyDrop::into_inner(md);
+                let res = self.inner.commit_txn().await;
+                match res {
+                    // Committing publishes, and the flush lock may be travelling
+                    // with a publish already in flight — see the `SetAttr` arm.
+                    // Re-queue rather than wait, or the callback carrying the
+                    // lock back can never be taken.
+                    Err(ref e) if e.kind() == ErrorKind::ResourceBusy => {
+                        let fh = req.fh.clone();
+                        let ctx = FileContext::reform_commit_txn(req, resp);
+                        let _ = fh.send_highprio(ctx);
+                    },
+                    _ => { let _ = resp.to_commit_txn().send(res); },
+                }
+            },
+            #[cfg(feature = "wal")]
+            FileReqOp::AbortTxn => {
+                let md = unsafe { req.body.abort_txn };
+                let req = ManuallyDrop::into_inner(md);
+                let res = self.inner.abort_txn().await;
+                match res {
+                    Err(ref e) if e.kind() == ErrorKind::ResourceBusy => {
+                        let fh = req.fh.clone();
+                        let ctx = FileContext::reform_abort_txn(req, resp);
+                        let _ = fh.send_highprio(ctx);
+                    },
+                    _ => { let _ = resp.to_abort_txn().send(res); },
+                }
+            },
+            #[cfg(feature = "wal")]
+            FileReqOp::InTxn => {
+                let md = unsafe { req.body.in_txn };
+                let _ = ManuallyDrop::into_inner(md);
+                let res = self.inner.in_txn();
+                let _ = resp.to_in_txn().send(res);
             },
         }
     }

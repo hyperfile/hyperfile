@@ -2769,6 +2769,157 @@ async fn reactor_wal_deferred_publish_still_publishes_an_attr_only_flush() {
     cleanup_with_wal(&client, tf.uri()).await;
 }
 
+/// Transactions are reachable from the handler, and a commit publishes once.
+///
+/// The interval lives in the handler task rather than on the caller's side,
+/// which is what makes it usable from a surface where each call is one round
+/// trip: everything sent between begin and commit is inside it.
+///
+/// A caller that uses hyperfile as a block device needs this for repair, where
+/// one pass rewrites structures whose midpoints must never become a checkpoint —
+/// a half-repaired filesystem is worse than a torn one, because the next open
+/// takes it as the new baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_txn_on_the_handler_publishes_once() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+    const ROUNDS: usize = 6;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let tf = TestFile::new(&client).await;
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    let cno_after;
+    let cno_before;
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        assert!(!fh.fh_in_txn().await.expect("in_txn"), "nothing open yet");
+
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0x51);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        cno_before = fh.fh_last_cno().await.expect("last_cno");
+
+        // Opened with a publish still in flight on purpose: the commit needs the
+        // flush lock, and that lock is travelling with the publish. It has to
+        // wait by going back on the queue, not by blocking the task that has to
+        // take the lock back.
+        fh.fh_begin_txn().await.expect("begin");
+        assert!(fh.fh_in_txn().await.expect("in_txn"), "the interval is open");
+
+        for i in 1..=ROUNDS {
+            let b = AlignedDataBlockWrapper::new(i as u64, BLK, false);
+            b.as_mut_slice().fill(0x51 + i as u8);
+            let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write inside");
+        }
+
+        let cno = fh.fh_commit_txn().await.expect("commit");
+        assert!(!fh.fh_in_txn().await.expect("in_txn"), "the interval closed");
+        assert!(cno > cno_before, "commit published {} against {} before", cno, cno_before);
+        cno_after = cno;
+
+        let _ = fh.fh_release().await;
+    }
+
+    // One checkpoint for the whole interval, not one per write in it.
+    assert!(cno_after - cno_before <= 2,
+        "the interval spanned {} checkpoints ({} -> {}), so its midpoints were \
+         published", cno_after - cno_before, cno_before, cno_after);
+
+    let mut hyper = Hyper::open(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+    for i in 0..=ROUNDS {
+        let mut buf = vec![0u8; BLK];
+        let _ = hyper.fs_read(i * BLK, &mut buf).await.expect("read");
+        assert!(buf.iter().all(|b| *b == 0x51 + i as u8),
+            "block {} came back {:#x}", i, buf[0]);
+    }
+    let _ = hyper.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
+/// Aborting from the handler discards the interval's writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_txn_abort_on_the_handler_discards() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+
+    let tf = TestFile::new(&client).await;
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+        let b = AlignedDataBlockWrapper::new(0, BLK, false);
+        b.as_mut_slice().fill(0x61);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        let _ = fh.fh_flush().await.expect("flush");
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        fh.fh_begin_txn().await.expect("begin");
+        let b = AlignedDataBlockWrapper::new(1, BLK, false);
+        b.as_mut_slice().fill(0x62);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write inside");
+        fh.fh_abort_txn().await.expect("abort");
+        assert!(!fh.fh_in_txn().await.expect("in_txn"), "the interval closed");
+        let _ = fh.fh_release().await;
+    }
+
+    let mut hyper = Hyper::open(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+    let mut buf = vec![0u8; BLK];
+    let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0x61), "published work must survive an abort");
+    let mut buf = vec![0u8; BLK];
+    let _ = hyper.fs_read(BLK, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b != 0x62), "the aborted write is still there");
+    let _ = hyper.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}
+
 /// A request whose work needs the flush lock must not wait for it on the handler
 /// task.
 ///

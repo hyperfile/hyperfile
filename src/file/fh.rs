@@ -757,6 +757,56 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
+    /// Open an atomic interval. See `Hyper::begin_txn` for the guarantee and
+    /// the two things it deliberately does not give — no isolation between
+    /// handles, and no implicit undo.
+    ///
+    /// The interval lives in the handler task, which is where the file lives, so
+    /// every write sent between this call and the commit falls inside it no matter
+    /// which caller sent it. Publishing is refused while it is open, including by
+    /// a dirty-data threshold: crossing one returns `OutOfMemory` rather than
+    /// publishing a midpoint. So an interval has to fit, and how much fits is the
+    /// dirty-data limit.
+    #[cfg(feature = "wal")]
+    pub async fn fh_begin_txn(&mut self) -> Result<()>
+    {
+        let (ctx, rx) = FileContext::new_begin_txn();
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// Close the interval and publish everything in it as one checkpoint.
+    /// See `Hyper::commit_txn`.
+    #[cfg(feature = "wal")]
+    pub async fn fh_commit_txn(&mut self) -> Result<u64>
+    {
+        let (ctx, rx) = FileContext::new_commit_txn(self.inner.clone());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// Abandon the interval, discarding its writes. See `Hyper::abort_txn` —
+    /// note that it rolls back to the last published state, so writes made
+    /// before the interval began go too.
+    #[cfg(feature = "wal")]
+    pub async fn fh_abort_txn(&mut self) -> Result<()>
+    {
+        let (ctx, rx) = FileContext::new_abort_txn(self.inner.clone());
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+    }
+
+    /// Whether an interval is open. Worth asking after a failed commit: that
+    /// leaves the interval as it was, and the state is in the handler task
+    /// rather than on the caller's side.
+    #[cfg(feature = "wal")]
+    pub async fn fh_in_txn(&self) -> Result<bool>
+    {
+        let (ctx, rx) = FileContext::new_in_txn();
+        self.inner.send(ctx)?;
+        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))
+    }
+
     pub async fn fh_last_cno(&self) -> Result<u64>
     {
         let (ctx, rx) = FileContext::new_last_cno();
