@@ -2825,3 +2825,61 @@ async fn reactor_wal_setattr_right_after_flush_does_not_wedge_the_handler() {
     let _ = fh.fh_release().await;
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// Aborting takes the writes out of later opens too, not just out of this handle.
+///
+/// Rolling back memory is half of it. The writes are in the log as well, and
+/// nothing about an abort seals them — so a later open finds unsealed records and
+/// `Latest` applies them, putting back exactly what was discarded. The test that
+/// covered the other half said as much in its own name and never reopened to
+/// check this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_wal_aborting_a_transaction_undoes_it_for_later_opens_too() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let staging_config = StagingConfig::new_s3_uri(tf.uri(), None);
+    let wal_config = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&staging_config)
+        .with_wal_config(&wal_config)
+        .with_runtime_config(&runtime)
+        .build();
+
+    {
+        let mut h = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let _ = h.fs_write(0, &vec![0x31u8; BLK]).await.expect("write");
+        let _ = h.fs_flush().await.expect("flush publishes it");
+
+        h.fs_begin_txn().await.expect("begin");
+        let _ = h.fs_write(BLK, &vec![0x32u8; BLK]).await.expect("write inside");
+        h.fs_abort_txn().await.expect("abort");
+        let _ = h.fs_release().await.expect("release");
+    }
+
+    let mut h = Hyper::open(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+    let mut buf = vec![0u8; BLK];
+    let _ = h.fs_read(0, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0x31), "published work must survive an abort");
+    let mut buf = vec![0u8; BLK];
+    let n = h.fs_read(BLK, &mut buf).await.expect("read");
+    assert!(n == 0 || buf.iter().all(|b| *b != 0x32),
+        "the aborted write came back on reopen: its records are still in the log, \
+         and nothing sealed them, so recovery replayed them");
+    let _ = h.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}

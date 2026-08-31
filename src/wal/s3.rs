@@ -117,6 +117,10 @@ impl S3Wal {
 }
 
 impl WalReadWrite for S3Wal {
+    fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+
     fn write(&mut self, segid: SegmentId, offset: usize, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
         let key = self.encode(segid, offset, buf.len());
         let buf_dup = unsafe {

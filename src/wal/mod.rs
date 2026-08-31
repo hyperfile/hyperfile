@@ -157,6 +157,14 @@ pub trait WalReadWrite {
     /// group.
     fn write_barrier(&mut self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 
+    /// Forget the records written since the last barrier, without sealing them.
+    ///
+    /// For a caller abandoning its own work: the records are being deleted, so a
+    /// later barrier must not list them. Sealing instead would vouch for a group
+    /// whose objects are on their way out, and recovery would then read it as a
+    /// complete group with records missing.
+    fn discard_pending(&mut self);
+
     /// The barrier for `segid`, or `None` if there is none — which recovery
     /// must treat as "this group was never sealed" rather than as an error.
     fn read_barrier(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<Option<WalBarrier>>> + Send + '_>>;

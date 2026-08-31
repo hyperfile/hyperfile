@@ -686,11 +686,33 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let segid = self.inode().get_last_seq();
         self.txn_open = false;
         self.rollback_from_persisted().await?;
+
+        // Rolling back memory is only half of it. The writes are also in the
+        // log, and nothing about an abort seals them — so the next open finds
+        // unsealed records and `Latest` applies them, which puts back exactly
+        // what the caller asked to discard. The promise is that they are gone
+        // from later opens too, so the records have to go.
+        //
+        // The whole group, and awaited rather than spawned. The rollback returns
+        // the file to its last published state, which discards any writes made
+        // before the interval opened as well — they are in this group too, and
+        // leaving them would replay a state the file is no longer in. Awaited
+        // because a lost delete here does not cost storage, it undoes the abort,
+        // and the caller is the only one who can decide what to do about that.
+        if let Some(ref mut wal) = self.wal {
+            wal.discard_pending();
+        }
+        let fut = self.wal.as_ref().map(|wal| wal.delete_segment(segid));
+        if let Some(fut) = fut {
+            fut.await?;
+        }
+
         let fut = self.wal.as_mut().map(|wal| wal.delete_txn_marker(segid));
         if let Some(fut) = fut {
-            // A marker left behind costs nothing: the records it covers were
-            // rolled back, so recovery finds nothing of the transaction to
-            // apply either way.
+            // Ordered after the records, and best-effort. A marker left behind
+            // names a group with nothing in it, which recovery reads as an
+            // unfinished unit of no records — the same outcome, reached the long
+            // way.
             if let Err(e) = fut.await {
                 warn!("abort_txn - could not remove the marker for {}: {}", segid, e);
             }
