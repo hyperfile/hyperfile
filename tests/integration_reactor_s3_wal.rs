@@ -1628,3 +1628,111 @@ async fn reactor_wal_recovery_mode_decides_the_landing_point() {
         cleanup_with_wal(&client, tf.uri()).await;
     }
 }
+
+/// Opening says what recovery did, which is what lets a caller skip work that
+/// costs the whole container.
+///
+/// The field that decides it is `landed_on_barrier`: true means the contents are
+/// a state whoever wrote them declared consistent, so a repair pass or a full
+/// verification can be skipped. Three cases, and they must be distinguishable —
+/// a report that said the same thing every time would be worse than none, since
+/// it would look like information.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_open_reports_what_recovery_did() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    runtime.data_cache_dirty_max_bytes_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_blocks_threshold = usize::MAX / 2;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let config_for = |uri: &str, mode: WalRecoveryMode| {
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let wal_config = HyperFileWalConfig::new(&format!("{}/wal", uri))
+            .with_recovery_mode(mode);
+        HyperFileConfigBuilder::new()
+            .with_staging_config(&staging_config)
+            .with_wal_config(&wal_config)
+            .with_runtime_config(&runtime)
+            .build()
+    };
+
+    // Case 1: clean stop. Nothing to replay, and the container sits at a
+    // published checkpoint, which is a seal.
+    {
+        let tf = TestFile::new(&client).await;
+        {
+            let reactor = make_reactor();
+            let hyper = Hyper::create(
+                client.clone(), config_for(tf.uri(), WalRecoveryMode::Latest),
+                HyperFileFlags::from_flags(FileFlags::rdwr()),
+                HyperFileMode::from_mode(FileMode::default_file()),
+            ).await.expect("create");
+            let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+            let b = AlignedDataBlockWrapper::new(0, BLK, false);
+            b.as_mut_slice().fill(0xC1);
+            let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+            let _ = fh.fh_flush().await.expect("flush");
+            let _ = fh.fh_release().await;
+        }
+        let mut hyper = Hyper::open(
+            client.clone(), config_for(tf.uri(), WalRecoveryMode::Latest),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("open");
+        let r = hyper.wal_recovery_report();
+        assert!(!r.replayed, "a clean stop leaves nothing to replay: {:?}", r);
+        assert!(r.landed_on_barrier, "a published checkpoint is a seal: {:?}", r);
+        assert_eq!(r.records_dropped, 0, "{:?}", r);
+        let _ = hyper.fs_release().await;
+        cleanup_with_wal(&client, tf.uri()).await;
+    }
+
+    // Case 2: Latest over unsealed work. It replays, and says the landing point
+    // is not a declared-consistent one — which is the caller's cue to repair.
+    // Case 3: the same container shape under Barrier, which stops at the seal
+    // and counts what it set aside.
+    for mode in [WalRecoveryMode::Latest, WalRecoveryMode::Barrier] {
+        let tf = TestFile::new(&client).await;
+        {
+            let reactor = make_reactor();
+            let hyper = Hyper::create(
+                client.clone(), config_for(tf.uri(), mode),
+                HyperFileFlags::from_flags(FileFlags::rdwr()),
+                HyperFileMode::from_mode(FileMode::default_file()),
+            ).await.expect("create");
+            let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+            let sealed = AlignedDataBlockWrapper::new(0, BLK, false);
+            sealed.as_mut_slice().fill(0xD1);
+            let _ = fh.fh_write_aligned_batch(vec![sealed]).await.expect("write");
+            let _ = fh.fh_flush().await.expect("flush");
+            let unsealed = AlignedDataBlockWrapper::new(1, BLK, false);
+            unsealed.as_mut_slice().fill(0xD2);
+            let _ = fh.fh_write_aligned_batch(vec![unsealed]).await.expect("write");
+            drop(fh);
+            drop(reactor);
+        }
+        let mut hyper = Hyper::open(
+            client.clone(), config_for(tf.uri(), mode),
+            HyperFileFlags::from_flags(FileFlags::rdonly()),
+        ).await.expect("open");
+        let r = hyper.wal_recovery_report();
+        match mode {
+            WalRecoveryMode::Latest => {
+                assert!(r.replayed, "Latest had unsealed work to apply: {:?}", r);
+                assert!(!r.landed_on_barrier,
+                    "the last group applied was unsealed, so this is not a declared \
+                     state: {:?}", r);
+                assert_eq!(r.records_dropped, 0, "Latest drops nothing: {:?}", r);
+            },
+            WalRecoveryMode::Barrier => {
+                assert!(r.landed_on_barrier, "Barrier stops at a seal: {:?}", r);
+                assert!(r.records_dropped > 0,
+                    "Barrier set the unsealed work aside and must say so: {:?}", r);
+            },
+        }
+        let _ = hyper.fs_release().await;
+        cleanup_with_wal(&client, tf.uri()).await;
+    }
+}

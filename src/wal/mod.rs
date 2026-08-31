@@ -88,6 +88,58 @@ impl WalBarrier {
     }
 }
 
+/// What recovery did when the container was opened.
+///
+/// A caller that can repair its own contents needs this to decide whether to:
+/// repairing is proportional to the whole container, so being able to skip it
+/// when the landing point is already a declared-consistent one is the point of
+/// reporting at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalRecoveryReport {
+    /// Whether any log group was applied.
+    ///
+    /// `false` means the log had nothing this container had not already
+    /// published — the ordinary case after a clean stop.
+    pub replayed: bool,
+    /// Whether the state the container came up in is one that was declared
+    /// consistent by whoever wrote it.
+    ///
+    /// True when every group applied was sealed and complete, and nothing
+    /// half-written was applied. That covers three cases: nothing needed
+    /// replaying, so the container is at a published checkpoint and a publish
+    /// only happens at a seal; `Barrier` recovery, which stops at a seal by
+    /// construction; and `Latest` recovery that happened to find every group
+    /// sealed.
+    ///
+    /// False means the last thing applied was an unsealed group — the writer
+    /// was interrupted partway through whatever it considered one unit of work,
+    /// and the contents are that midpoint.
+    pub landed_on_barrier: bool,
+    /// Records that were present but not applied.
+    ///
+    /// Non-zero only under `Barrier` recovery, which stops rather than
+    /// applying past a group it cannot vouch for. These records are still in
+    /// the log; nothing has been deleted.
+    pub records_dropped: usize,
+}
+
+impl Default for WalRecoveryReport {
+    /// "Recovery did not run", which is not all-false: a container that needed
+    /// no replay is sitting at its last published checkpoint, and a publish only
+    /// happens at a seal — so the landing point is a declared-consistent one.
+    ///
+    /// Worth being explicit about, because the ordinary case never reaches the
+    /// recovery path at all and so never sets this. Deriving `Default` here
+    /// would report every clean open as needing repair.
+    fn default() -> Self {
+        Self {
+            replayed: false,
+            landed_on_barrier: true,
+            records_dropped: 0,
+        }
+    }
+}
+
 pub trait WalReadWrite {
     // write
     fn write(&mut self, segid: SegmentId, offset: usize, buf: &[u8]) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;

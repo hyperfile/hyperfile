@@ -353,6 +353,14 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.block_placement_many(ranges).await
     }
 
+    /// What recovery did when this container was opened. See
+    /// [`HyperFile::wal_recovery_report`](crate::file::file::HyperFile::wal_recovery_report).
+    #[cfg(feature = "wal")]
+    pub fn wal_recovery_report(&self) -> crate::wal::WalRecoveryReport
+    {
+        self.inner.wal_recovery_report()
+    }
+
     /// True when a write that has returned `Ok` is already recoverable with no
     /// further flush.
     ///

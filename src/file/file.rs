@@ -42,6 +42,8 @@ use super::{HyperTrait, DirtyDataBlocks, FlushTiming, PlannedRead};
 use crate::{DEFAULT_FLUSH_RETRIES, DEFAULT_FLUSH_BACKOFF_SECS};
 #[cfg(feature = "wal")]
 use crate::wal::config::WalRecoveryMode;
+#[cfg(feature = "wal")]
+use crate::wal::WalRecoveryReport;
 #[cfg(feature = "range-lock")]
 use super::lock::RangeLock;
 use super::state::State;
@@ -153,6 +155,10 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     /// what it costs.
     #[cfg(feature = "wal")]
     pub(crate) flushing_segments: Arc<RwLock<HashMap<SegmentId, Weak<Pin<Box<Vec<u8>>>>>>>,
+    /// What recovery did when this file was opened. See
+    /// [`WalRecoveryReport`](crate::wal::WalRecoveryReport).
+    #[cfg(feature = "wal")]
+    pub(crate) wal_recovery_report: WalRecoveryReport,
 }
 
 impl<T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> fmt::Display for HyperFile<'_, T, L, C> {
@@ -255,6 +261,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             wal: wal,
             #[cfg(feature = "wal")]
             flushing_segments: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "wal")]
+            wal_recovery_report: WalRecoveryReport::default(),
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -375,6 +383,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             wal: wal,
             #[cfg(feature = "wal")]
             flushing_segments: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "wal")]
+            wal_recovery_report: WalRecoveryReport::default(),
             #[cfg(feature = "range-lock")]
             range_lock: range_lock,
         };
@@ -419,6 +429,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         self.cache.shutdown();
         self.bmap.get_node_cache().shutdown();
         Ok(segid)
+    }
+
+    /// What recovery did when this container was opened.
+    ///
+    /// Ask once after opening. The field a caller usually wants is
+    /// [`landed_on_barrier`](crate::wal::WalRecoveryReport::landed_on_barrier):
+    /// when it is true the contents are a state that was declared consistent by
+    /// whoever wrote them, so work proportional to the whole container — a
+    /// repair pass, a full verification — can be skipped. That is the reason
+    /// this is reported at all.
+    #[cfg(feature = "wal")]
+    pub fn wal_recovery_report(&self) -> WalRecoveryReport {
+        self.wal_recovery_report
     }
 
     /// True when a write that has returned `Ok` is already recoverable with no
@@ -2101,8 +2124,21 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         segids.sort();
         debug!("do_wal_flush_recovery - replay segments {:?}", segids);
 
+        // Nothing to replay leaves the container at its last published
+        // checkpoint, and a publish only happens at a seal — so that is a
+        // declared-consistent point, and the report says so.
+        self.wal_recovery_report = WalRecoveryReport {
+            replayed: false,
+            landed_on_barrier: true,
+            records_dropped: 0,
+        };
+
         let mut cno = 0;
+        let mut stopped_at: Option<SegmentId> = None;
+        let mut last_applied_sealed = true;
+        let mut remaining = segids.clone();
         for segid in segids {
+            remaining.retain(|id| *id != segid);
             // In `Barrier` mode only a sealed, complete group may be applied,
             // and a group failing either test stops the replay rather than
             // being skipped: skipping one and applying a later one would
@@ -2111,21 +2147,30 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             //
             // `Latest` mode applies what it can, which is what keeps every
             // acknowledged write. It is the default for that reason.
+            // Checked for every group, in both modes: `Barrier` acts on it,
+            // and `Latest` needs it for the report — a caller decides whether
+            // to repair by asking whether the landing point was sealed, and
+            // that cannot be answered afterwards because a replayed group's
+            // objects are deleted once it lands.
+            let state = self.wal_group_state(segid).await?;
             if self.wal_recovery_mode() == WalRecoveryMode::Barrier {
-            match self.wal_group_state(segid).await? {
-                WalGroupState::Complete => {},
-                WalGroupState::Unsealed => {
-                    warn!("do_wal_flush_recovery - checkpoint {} was never sealed, \
-                          stopping here", segid);
-                    break;
-                },
-                WalGroupState::Incomplete { missing } => {
-                    warn!("do_wal_flush_recovery - checkpoint {} is sealed but {} of \
-                          its records are missing, stopping here", segid, missing);
-                    break;
-                },
+                match state {
+                    WalGroupState::Complete => {},
+                    WalGroupState::Unsealed => {
+                        warn!("do_wal_flush_recovery - checkpoint {} was never sealed, \
+                              stopping here", segid);
+                        stopped_at = Some(segid);
+                        break;
+                    },
+                    WalGroupState::Incomplete { missing } => {
+                        warn!("do_wal_flush_recovery - checkpoint {} is sealed but {} \
+                              of its records are missing, stopping here", segid, missing);
+                        stopped_at = Some(segid);
+                        break;
+                    },
+                }
             }
-            }
+            last_applied_sealed = state == WalGroupState::Complete;
             match self.wal_replay_chunks(segid).await {
                 Ok(c) => {
                     assert!(c == segid + 1);
@@ -2151,6 +2196,28 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 Err(e) => return Err(e),
             }
         }
+
+        // What the caller needs in order to decide whether to repair.
+        //
+        // `Latest` applies whatever it finds, so the landing point is a
+        // declared-consistent one only if every group it applied happened to be
+        // sealed and complete. `Barrier` stops at one by construction, and what
+        // it left behind is counted so the caller knows work was set aside
+        // rather than lost — the records are still in the log.
+        let mut dropped = 0usize;
+        if let Some(segid) = stopped_at {
+            for id in std::iter::once(segid).chain(remaining.into_iter()) {
+                dropped += self.wal_list_chunks(id).await.map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        // Stopping happens only at a seal, so that landing point is one by
+        // construction. Otherwise it depends on the last group applied.
+        let all_sealed = stopped_at.is_some() || last_applied_sealed;
+        self.wal_recovery_report = WalRecoveryReport {
+            replayed: cno != 0,
+            landed_on_barrier: all_sealed,
+            records_dropped: dropped,
+        };
 
         Ok(cno)
     }
