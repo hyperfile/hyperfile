@@ -9,6 +9,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.14] - 2026-08-31
+
+### Fixed
+
+- **Batch writes did not reach the log, so the durability guarantee did not
+  cover them.** `write_inner` wrote a log record; neither batch path did.
+
+  Worse than a missing feature. A WAL flush answers before its upload lands, and
+  the reason it may is that the log already holds the data. For batch writes it
+  did not, so the flush cleared the dirty set and returned `Ok` over bytes that
+  were on no storage at all — not in a segment, since the upload had not
+  finished, and not in the log, since nothing wrote them there. A crash in that
+  window lost acknowledged writes. It also made `writes_durable_on_ack` report a
+  guarantee that held for one write path and not another, which is why the
+  partial-block batch path is fixed here too and not only the aligned one.
+
+  Records are coalesced across adjacent blocks of the same kind: one record per
+  block would be one object per block, and the batch API exists because that cost
+  was measured and rejected — a consumer moved an 8 MiB fsync from 69 s to 0.46 s
+  by switching to it. A 24-block batch with one hole writes three records.
+
+- **A refused flush rolled back.** `fs_flush` goes through
+  `flush_with_rollback`, which treats every error as "the flush failed partway,
+  put the file back" and discards the dirty set. Right for a storage failure,
+  wrong for a refusal: a flush declined before it started never touched
+  anything, so rolling back threw away acknowledged writes over a request that
+  was merely not allowed.
+
+- **Time alone no longer publishes when a log is configured.** A timer's purpose
+  without a log is to bound how long an acknowledged write sits only in memory,
+  and a log already bounds that. All it added was a checkpoint at a moment
+  nobody declared — and since recovery has to reach the newest published
+  checkpoint, one landing mid-transaction leaves `WalRecoveryMode::Barrier`
+  nothing sound to stop at. The dirty-data thresholds still publish, because
+  dropping them would trade a bounded cache for an unbounded one.
+
+  Note that `data_cache_dirty_max_flush_interval` set to `0` does not disable
+  the timer: `elapsed() >= Duration::from_millis(0)` is always true, so `0`
+  publishes on every check.
+
+- **`update_cache` warned about correct behaviour.** It logged "this is not by
+  design" whenever a block was clean in the read cache rather than dirty, which
+  happens routinely, and a consumer chasing a corruption report spent time on it
+  as a suspect. A whole-block write replaces every byte, so what was underneath
+  does not matter; only a *partial* write into an unprepared block indicates
+  anything, and only that warns now.
+
+### Added
+
+- **Barriers: which log records belong together.** A flush seals the records it
+  is about to publish, writing a barrier that carries the `(seq, offset, len)` of
+  every record it covers. Without one, a crash mid-flush leaves a partial record
+  set indistinguishable from a complete one, and replaying it hands the layer
+  above half of its own transaction. The manifest is a list rather than a count
+  so recovery can check it against what is stored without depending on a listing
+  being complete or on the order records went out in.
+
+  Two orderings make it mean something: after every record it covers is
+  confirmed written, and before the segment build moves past the checkpoint those
+  records are filed under. Together they give *a barrier exists* ⟹ *the group is
+  complete and was never published*.
+
+- **Recovery modes**, via `HyperFileWalConfig::with_recovery_mode`. `Latest`
+  (default) applies what it can and keeps every acknowledged write. `Barrier`
+  stops at the last sealed, complete group, so it needs no repair — at the cost
+  of everything acknowledged after that seal.
+
+  Those two cannot both keep the durability promise, and this is the case
+  `writes_durable_on_ack` was named for: under `Barrier` it answers `false`, so a
+  caller skipping flushes on the strength of it degrades instead of losing data
+  quietly. Making `Barrier` the default would have withdrawn a shipped guarantee
+  silently on upgrade.
+
+  A group that is unsealed or incomplete **stops** the replay rather than being
+  skipped. Skipping one and applying a later one produces a state that never
+  existed, which is worse than a torn one: that at least was some moment's truth.
+
+- **`wal_recovery_report`** — whether anything was replayed, whether the landing
+  point is a state whoever wrote it declared consistent, and how many records
+  were present but not applied. The middle one lets a caller that can repair its
+  own contents skip doing so, which is work proportional to the whole container.
+
+- **Transactions**: `begin_txn` / `commit_txn` / `abort_txn` / `in_txn`. For work
+  whose midpoints nobody should come up in — a repair pass can write far more
+  than the dirty-data thresholds allow, and a threshold crossing partway through
+  would make a half-fixed container the newest checkpoint.
+
+  Gives atomic publication and atomic recovery: a marker in the log means an
+  unfinished transaction is not applied, in *either* recovery mode, since it is
+  something the caller declared rather than an inference about where a crash
+  fell. Writes made before it began are ordinary and still applied, so an
+  interrupted transaction costs redoing it rather than repairing half of it.
+
+  Gives neither isolation — writes inside one are visible to readers
+  immediately — nor implicit undo: never committing leaves the writes in memory
+  until close, and `abort_txn` is what undoes one here and now. Both are stated
+  in the docs, because the name would otherwise promise them.
+
 ## [0.6.13] - 2026-08-28
 
 ### Added
