@@ -80,15 +80,28 @@ pub struct HyperFileWalConfig {
     /// How many flushes may be satisfied by the log alone before one of them
     /// publishes a segment. `1`, the default, publishes on every flush.
     ///
-    /// Publishing costs about the same however much was written — a consumer
-    /// measured 0.21 to 0.26 seconds for 1 MiB and for 32 MiB alike, which is
-    /// 93 to 99 per cent of their fsync latency. A flush that only seals the
-    /// log is one append, so raising this trades that fixed cost away.
+    /// What this buys is a smaller number of objects, not a shorter flush. A
+    /// consumer measured 11, 7, 5 and 4 container objects for 1, 2, 4 and 8 over
+    /// the same work — a factor of 2.75 — with flush latency flat across all
+    /// four (0.213, 0.210, 0.228, 0.197 seconds). So choose it for storage
+    /// economics: object count drives storage cost, the cost of listing, and how
+    /// much there is to prune later.
     ///
-    /// What it buys is paid for at recovery: the groups not yet published are
-    /// replayed on the next open after a crash, and each replay publishes. So
-    /// this is a dial between flush latency and mount latency after a crash,
-    /// and the sensible value depends on which one the caller is spending.
+    /// Flush latency does not move because publishing was never on its critical
+    /// path. A flush answers after one log append — the barrier sealing its
+    /// group — and hands the segment upload and the inode write to a spawned
+    /// task. Deferring an upload that nobody was waiting for saves nothing, and
+    /// an earlier version of this note claimed otherwise; see the correction in
+    /// the changelog for 0.6.16.
+    ///
+    /// The cost is at recovery, and only when a crash lands between publishes:
+    /// the groups not yet published are replayed on the next open, and each
+    /// replay publishes. A crash that lands on a publish boundary has nothing
+    /// outstanding and nothing to replay — which is what the same consumer
+    /// measured, flat at 1.05 to 1.21 seconds, because their run length was
+    /// divisible by every value they tried. So the mount cost is real by
+    /// construction and has not been measured; treat the worst case as `n - 1`
+    /// groups to replay.
     ///
     /// It does not weaken durability. Every write is in the log before its call
     /// returns either way, which is what `writes_durable_on_ack` reports; what

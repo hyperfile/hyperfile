@@ -9,6 +9,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.16] - 2026-08-31
+
+### Fixed
+
+- **A group nobody will apply no longer keeps the work above it out of reach.**
+  Declining an unsealed group is right, and leaving it in the log is right. What
+  was wrong is what happened next: the following session wrote on top of the same
+  checkpoint, sealed its own group, and recovery walked into the declined one
+  again and stopped there — never reaching the sealed group behind it.
+
+  Nothing lifts that. The group does not go away, and `last_ondisk_cno` does not
+  move until something publishes, so every later open stops in the same place. A
+  consumer saw three reopens in a row report the same checkpoint on disk while
+  their flushes returned higher ones each time, with acknowledged writes absent
+  afterwards. Arriving here takes nothing more than a crash in mid-flush, which
+  makes it the ordinary outcome of `Barrier` rather than a corner of it.
+
+  The comment justifying the stop said that skipping a group and applying a later
+  one would produce a state that never existed. True in general, false here: the
+  session that wrote the later group opened at the same checkpoint recovery lands
+  on, was told nothing had been applied, and wrote from there. Its group is a
+  delta on that checkpoint. The state that never existed would be one with the
+  declined group in it, and nothing proposes applying that.
+
+  So a group that is not whole is asked one more question before it may stop
+  anything: is there a barrier above it? A barrier above means a later session
+  sealed on top of a base that did not include this group. Under `Barrier` such a
+  group is set aside whole, including records before a transaction left open,
+  which the later session did not see either; `Latest` is unchanged except that
+  such a group no longer stops the replay. Records set aside are counted in the
+  report and not deleted.
+
+- **A request no longer waits for the flush lock on the handler task.** The
+  reactor's WAL flush hands the flush lock's guard to a spawned publish, and the
+  guard comes back as a callback — to the handler task, the same one that runs
+  every request. A request that waits for that lock stops the task from ever
+  taking the callback, so the guard never returns and the handle is wedged: no
+  error, no timeout, until the process goes away.
+
+  `setattr` did that, because it persists through a flush. `fsync` followed by
+  `chmod` wedged the handle whenever the second landed before the first one's
+  publish had finished — a window of a couple of object-store round trips, and a
+  pairing a filesystem above performs constantly.
+
+  `release` was already right about this, and completely: it reports the conflict
+  and its arm puts the request back on the queue rather than waiting. The
+  mechanism existed in one place and was never generalised.
+
+- **Aborting a transaction takes its records out of the log.** `abort_txn` rolled
+  back memory and removed the transaction marker, and left the writes themselves
+  in the log. Nothing about an abort seals them, so the next open found unsealed
+  records and `Latest` applied them — putting back exactly what was discarded.
+
+  Its own documentation promised the writes were gone from later opens too. The
+  test covering the other half said as much in its name and never reopened to
+  check this one, so the gap sat behind a test that looked like it covered it.
+
+  The whole group goes, not the interval's share of it: the rollback returns the
+  file to its last published state, which discards writes made before the
+  interval opened as well, and those are in the same group. Awaited rather than
+  spawned, unlike every other log delete here — a lost delete elsewhere costs a
+  little storage, a lost delete here undoes the abort.
+
+### Added
+
+- **Transactions on the handler**: `fh_begin_txn`, `fh_commit_txn`,
+  `fh_abort_txn`, `fh_in_txn`. They existed only on `Hyper`, and a caller that
+  hands its `Hyper` to a handler task can afterwards send only the request types
+  the context defines — so the feature was unreachable from the surface that needs
+  it most. Dropping to the direct API is not a trade a reader can make: those
+  methods take `&mut self`, so a read path that spawns its prefetch alongside the
+  read cannot use them.
+
+  The interval lives in the handler task, because that is where the file lives, so
+  every write sent between begin and commit falls inside it whoever sent it —
+  the only shape that works where each call is one round trip. `fh_in_txn` because
+  a failed commit leaves the interval as it was and the caller cannot tell from
+  its own side.
+
+  Commit and abort re-queue rather than wait when a flush is in flight, for the
+  reason above.
+
+### Corrected
+
+- **What `publish_every` buys.** Its documentation in 0.6.15 said publishing was
+  93 to 99 per cent of a consumer's fsync latency, and that raising the value
+  traded that cost away. That attribution was wrong, and the same consumer
+  falsified it by measuring: flush latency is flat across 1, 2, 4 and 8 (0.213,
+  0.210, 0.228, 0.197 seconds) while container objects fall from 11 to 4.
+
+  Publishing was never on the flush's critical path. A flush answers after one log
+  append — the barrier sealing its group — and hands the segment upload and the
+  inode write to a spawned task. Deferring an upload nobody waits for saves
+  nothing. The figure that was attributed to publishing is the synchronous part of
+  the path, which is the log writes.
+
+  So `publish_every` is a knob for object count, not for latency: fewer objects to
+  store, to list, and to prune. The recovery cost stated alongside it stands by
+  construction but is still unmeasured — a crash that lands on a publish boundary
+  has nothing outstanding, which is what the measurements above happened to
+  arrange, since their run length was divisible by every value tried.
+
 ## [0.6.15] - 2026-08-31
 
 ### Fixed
