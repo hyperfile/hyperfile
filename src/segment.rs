@@ -73,6 +73,12 @@ pub trait SegmentReadWrite {
     fn done_pieces(&self, segid: SegmentId, body: SegmentBody) -> impl Future<Output = Result<()>> + Send;
     fn remove(&self, segid: SegmentId) -> impl Future<Output = Result<()>>;
     // reader
+    /// Read a segment's summary.
+    ///
+    /// `segid` names an object. Given a bare checkpoint number — no part — and no
+    /// object of that name, the summary part is tried as well: a caller holding a
+    /// checkpoint number cannot know whether the container streams its checkpoints,
+    /// because that is recorded in the inode it is trying to reach.
     fn open(&self, segid: SegmentId) -> impl Future<Output = Result<SegmentSum>>;
     fn list(&self, segid: SegmentId) -> impl Future<Output = Result<Vec<SegmentId>>>;
     fn build_block_map(&self, segid: SegmentId) -> impl Future<Output = Result<Vec<(BlockIndex, BlockPtr)>>>;

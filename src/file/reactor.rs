@@ -49,7 +49,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
             // Only for a checkpoint written as one object; see the same guard on
             // the read path.
-            if !segid.is_parted() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
+            // Only the object a flush is uploading — its summary part — is held in
+            // memory; a partial is on storage before any pointer to it resolves.
+            if segid == segid.summary() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
@@ -1361,10 +1363,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // Already written out, so reading it means an object request.
             return Ok(false);
         }
-        if segid.is_parted() {
-            // A streamed checkpoint keeps no data in memory: its parts are on
-            // storage before any pointer to them resolves. See the same guard on
-            // the write path.
+        if segid != segid.summary() {
+            // A partial is on storage before any pointer to it resolves, so there is
+            // nothing pinned in memory for it. Only the object a flush is uploading
+            // — the summary part — is held. See the same test on the write path.
             return Ok(false);
         }
         let flushing_segments = self.flushing_segments.clone();

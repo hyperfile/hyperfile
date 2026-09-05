@@ -60,11 +60,21 @@ async fn write_one_segment_then_open(payload_len: usize) {
     let ss = staging.open(hyperfile::SegmentId::new_from_cno(1)).await
         .unwrap_or_else(|e| panic!("open segid 1 for a {payload_len}-byte payload: {e}"));
 
-    // The summary must describe the data we just wrote.
+    // Each object's summary describes its own blocks, so the checkpoint's list is
+    // the union across its parts. A payload larger than the dirty threshold is
+    // written out as partial segments before the flush completes it, which is why
+    // part 0 alone need not account for all of it.
     let block_size = 4096;
     let expect_blocks = (payload_len / block_size) as u32;
-    assert_eq!(ss.hdr.s_ndatablk, expect_blocks,
-        "summary should list {expect_blocks} data blocks");
+    let mut counted = ss.hdr.s_ndatablk;
+    let mut part = 1u16;
+    while let Ok(p) = staging.open_exact(hyperfile::SegmentId::with_part(1, part)).await {
+        counted += p.hdr.s_ndatablk;
+        assert_eq!(p.hdr.s_cno, 1, "part {} names the wrong checkpoint", part);
+        part += 1;
+    }
+    assert_eq!(counted, expect_blocks,
+        "the checkpoint's parts should account for {expect_blocks} data blocks");
     assert!(ss.hdr.s_bytes as usize >= std::mem::size_of_val(&ss.hdr),
         "s_bytes ({}) must cover at least the header", ss.hdr.s_bytes);
     assert_eq!(ss.hdr.s_cno, 1, "segment should report its own segid");

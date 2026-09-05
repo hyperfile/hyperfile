@@ -455,7 +455,13 @@ impl SegmentReadWrite for MemoryStaging {
     }
 
     async fn open(&self, segid: SegmentId) -> Result<SegmentSum> {
-        self.segment_sum(segid)
+        // See the S3 staging: a bare checkpoint number may name no object, because a
+        // container that streams its checkpoints keeps the summary in part 0.
+        match self.segment_sum(segid) {
+            Err(e) if e.kind() == ErrorKind::NotFound && segid.part_id().is_none() =>
+                self.segment_sum(segid.at_part(crate::segment::Segment::SUMMARY_PART)),
+            other => other,
+        }
     }
 
     async fn list(&self, segid: SegmentId) -> Result<Vec<SegmentId>> {

@@ -1457,7 +1457,11 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 // coalescing.
                 #[cfg(feature = "wal")]
                 let is_inflight = self.wal.is_some()
-                    && !segid.is_parted()
+                    // The pinned buffer holds the object a flush is uploading, which
+                    // is the checkpoint's summary part. A partial is never it: a
+                    // partial is uploaded before any pointer to it is assigned, so
+                    // its bytes are on storage by the time one resolves.
+                    && segid == segid.summary()
                     && self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()
                     && segid.as_cno() > self.inode().get_last_ondisk_cno();
                 #[cfg(not(feature = "wal"))]
@@ -3249,7 +3253,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             // its data parts on storage before any pointer to them resolves, and
             // the buffer held in memory for it carries the summary and metadata
             // only — copying data out of it would return the wrong bytes.
-            if !segid.is_parted() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
+            // Only the object a flush is uploading — its summary part — is held in
+            // memory. See the same test on the read path.
+            if segid == segid.summary() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
@@ -3299,7 +3305,9 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
             // its data parts on storage before any pointer to them resolves, and
             // the buffer held in memory for it carries the summary and metadata
             // only — copying data out of it would return the wrong bytes.
-            if !segid.is_parted() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
+            // Only the object a flush is uploading — its summary part — is held in
+            // memory. See the same test on the read path.
+            if segid == segid.summary() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };

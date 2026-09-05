@@ -27,7 +27,15 @@ const DEFAULT_DATA_BLOCK_SIZE: usize = MIN_DATA_BLOCK_SIZE;
 // got: `HyperFile::new` hardcoded it and ignored this config. Now that it
 // honours the config, the default has to name the same format or existing
 // callers would silently start writing a different one.
-const DEFAULT_BLOCK_PTR_FORMAT: BlockPtrFormat = BlockPtrFormat::MicroGroup;
+/// A checkpoint is written as `<segid>.<part>` objects, which is what lets memory
+/// pressure be answered with a partial segment instead of a checkpoint nobody asked
+/// for. See `HyperFileRuntimeConfig::parted_segment_enabled` for taking that
+/// behaviour back, and `BlockPtrFormat::PartedSegment` for the addressing.
+///
+/// A container carries its format for life, and an earlier build refuses one it does
+/// not know rather than misreading it — so a container created by this version is
+/// not readable by a `0.6` one.
+const DEFAULT_BLOCK_PTR_FORMAT: BlockPtrFormat = BlockPtrFormat::PartedSegment;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct HyperFileMetaConfig {

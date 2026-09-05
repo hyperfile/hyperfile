@@ -319,16 +319,21 @@ async fn separate_storage_does_not_leak_between_handles() {
 }
 /// `HyperFileMetaConfig::block_ptr_format` decides the format a new file
 /// uses. It used to be ignored — `HyperFile::new` hardcoded `MicroGroup` —
-/// so this pins that the config is what is honoured, and that its default
-/// still names the format files were already getting.
+/// so this pins that the config is what is honoured, and which format its default
+/// names.
+///
+/// The default moved to `PartedSegment` in 0.7.0, and moving it is a decision
+/// rather than an accident: a container carries its format for life and an earlier
+/// build refuses one it does not know. This assertion is where that decision is
+/// visible, so changing it back should be as deliberate as changing it was.
 #[tokio::test]
 async fn block_ptr_format_comes_from_the_config() {
     use hyperfile::meta_format::BlockPtrFormat;
 
     let _ = env_logger::try_init();
     assert_eq!(hyperfile::config::HyperFileMetaConfig::default().block_ptr_format,
-        BlockPtrFormat::MicroGroup,
-        "the default has to stay the format created files already used");
+        BlockPtrFormat::PartedSegment,
+        "the default format decides what every new container can and cannot be read by");
 
     // Ask for Flat explicitly and check a round trip works on it, which it
     // cannot if the setting is being ignored.

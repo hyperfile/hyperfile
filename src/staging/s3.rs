@@ -54,6 +54,16 @@ impl S3Staging {
 
     /// Which of the two names actually exists, or the best guess when neither
     /// answers — the caller reports the failure that follows.
+    /// Read exactly the object `segid` names, with no fallback.
+    ///
+    /// `SegmentReadWrite::open` resolves a bare checkpoint number to the summary
+    /// part when there is no object of that name. Use this to ask about one object,
+    /// which is what walking a checkpoint's parts needs.
+    pub async fn open_exact(&self, segid: SegmentId) -> Result<SegmentSum> {
+        let filename = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
+        Self::do_open(&self.client, &self.bucket, &filename).await
+    }
+
     async fn probe_summary_obj(&self, segid: SegmentId) -> SegmentId {
         let candidates = self.candidate_summary_objs(segid);
         for segid in candidates {
@@ -437,9 +447,20 @@ impl segment::SegmentReadWrite for S3Staging {
     }
 
     async fn open(&self, segid: SegmentId) -> Result<SegmentSum> {
-        let filename = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
-        Self::do_open(&self.client, &self.bucket, &filename).await
+        // A bare checkpoint number may name an object that does not exist, because
+        // a container that streams its checkpoints keeps the summary in part 0. Both
+        // are tried for the same reason `load_inode_from_segment` tries both.
+        let mut last = Err(Error::new(ErrorKind::NotFound, "no name tried"));
+        for obj in [segid, segid.at_part(Segment::SUMMARY_PART)] {
+            last = self.open_exact(obj).await;
+            match &last {
+                Err(e) if e.kind() == ErrorKind::NotFound && segid.part_id().is_none() => continue,
+                _ => break,
+            }
+        }
+        last
     }
+
 
     async fn list(&self, segid: SegmentId) -> Result<Vec<SegmentId>> {
         Self::do_list(&self.client, &self.bucket, &self.root_path_slash, segid).await

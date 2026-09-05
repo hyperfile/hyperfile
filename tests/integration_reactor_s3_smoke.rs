@@ -612,7 +612,13 @@ async fn reactor_read_reports_a_failed_staging_load() {
     for obj in listed.contents() {
         let key = obj.key().unwrap_or_default();
         let name = key.rsplit('/').next().unwrap_or_default();
-        if !name.is_empty() && name.len() == 10 && name.chars().all(|c| c.is_ascii_digit()) {
+        // A segment object is a padded checkpoint number, optionally with a part
+        // suffix for a container that streams its checkpoints. The inode object is
+        // the only other thing under this prefix.
+        let is_segment = !name.is_empty() && name != "inode"
+            && name.split('.').next().map(|c| c.len() == 10 && c.chars().all(|d| d.is_ascii_digit()))
+                   .unwrap_or(false);
+        if is_segment {
             client.delete_object().bucket(&bucket).key(key).send().await.expect("delete segment");
             deleted += 1;
         }
@@ -694,7 +700,10 @@ async fn reactor_write_reports_a_failed_read_modify_write() {
     for obj in listed.contents() {
         let key = obj.key().unwrap_or_default();
         let name = key.rsplit('/').next().unwrap_or_default();
-        if name.len() == 10 && name.chars().all(|c| c.is_ascii_digit()) {
+        // See the note on the other listing: a part suffix is part of the name.
+        if name.split('.').next()
+                .map(|c| c.len() == 10 && c.chars().all(|d| d.is_ascii_digit()))
+                .unwrap_or(false) {
             client.delete_object().bucket(&bucket).key(key).send().await.expect("delete segment");
             deleted += 1;
         }
