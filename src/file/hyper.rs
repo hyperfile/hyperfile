@@ -1,6 +1,7 @@
 use std::io::{ErrorKind, Result};
 use aws_sdk_s3::Client;
 use crate::config::HyperFileConfig;
+use crate::Cno;
 use crate::meta_loader::s3::S3BlockLoader;
 use crate::staging::{Staging, StagingIntercept, config::StagingConfig, s3::S3Staging};
 use crate::node_cache::localdisk::LocalDiskNodeCache;
@@ -100,7 +101,7 @@ impl<'a: 'static> Hyper<'a> {
     /// build.
     ///
     /// [`HyperFile::open_cno`]: crate::file::file::HyperFile::open_cno
-    pub async fn open_cno(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
+    pub async fn open_cno(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags, cno: Cno) -> Result<Self>
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
         let loader = staging.to_block_loader();
@@ -178,13 +179,13 @@ impl<'a: 'static> Hyper<'a> {
 
     /// Test-only: in-memory view of the last cno written to a segment.
     #[doc(hidden)]
-    pub fn in_memory_last_cno(&self) -> u64 {
+    pub fn in_memory_last_cno(&self) -> Cno {
         self.inner.in_memory_last_cno()
     }
 
     /// Test-only: in-memory view of the last cno persisted in the inode.
     #[doc(hidden)]
-    pub fn in_memory_last_ondisk_cno(&self) -> u64 {
+    pub fn in_memory_last_ondisk_cno(&self) -> Cno {
         self.inner.in_memory_last_ondisk_cno()
     }
 

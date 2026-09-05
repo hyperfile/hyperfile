@@ -30,6 +30,7 @@ use btree_ondisk::{bmap::BMap, BlockLoader, NodeValue, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::file::handler::ChannelGroup;
+use crate::Cno;
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::file::handler::FileContext;
 use crate::*;
@@ -452,9 +453,9 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     }
 
     // recover inode from segment
-    fn recover_partial_flush(&mut self, segid: u64, od_state: &Option<OnDiskState>) -> impl Future<Output = Result<()>> {async move {
+    fn recover_partial_flush(&mut self, cno: Cno, od_state: &Option<OnDiskState>) -> impl Future<Output = Result<()>> {async move {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        let _ = self.staging().load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), SegmentId::new_from_cno(segid)).await?;
+        let _ = self.staging().load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), SegmentId::new_from_cno(cno)).await?;
         let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), od_state, FlushInodeFlag::Update).await?;
         self.inode_mut().clear_attr_dirty();
         self.inode_mut().set_ondisk_state(od_state);

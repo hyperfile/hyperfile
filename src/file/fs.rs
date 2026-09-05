@@ -2,6 +2,7 @@ use std::io::{Result, Error, ErrorKind};
 use log::debug;
 use aws_sdk_s3::Client;
 use crate::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
+use crate::Cno;
 use crate::config::{HyperFileConfig, HyperFileConfigBuilder, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use crate::buffer::{AlignedDataBlockWrapper, BatchDataBlockWrapper};
 use crate::BlockIndex;
@@ -173,7 +174,7 @@ impl<'a: 'static> Hyper<'a> {
         ))
     }
 
-    pub async fn fs_release(&mut self) -> Result<u64>
+    pub async fn fs_release(&mut self) -> Result<Cno>
     {
         debug!("fs_release - ");
         // The public surface answers in checkpoint numbers: that is what a caller
@@ -372,7 +373,7 @@ impl<'a: 'static> Hyper<'a> {
     /// Commit the open transaction, publishing it as one checkpoint. See
     /// [`HyperFile::commit_txn`](crate::file::file::HyperFile::commit_txn).
     #[cfg(feature = "wal")]
-    pub async fn fs_commit_txn(&mut self) -> Result<u64>
+    pub async fn fs_commit_txn(&mut self) -> Result<Cno>
     {
         debug!("fs_commit_txn - ");
         // The public surface answers in checkpoint numbers: that is what a caller
@@ -438,7 +439,7 @@ impl<'a: 'static> Hyper<'a> {
         self.inner.write_batch(blocks).await
     }
 
-    pub async fn fs_flush(&mut self) -> Result<u64>
+    pub async fn fs_flush(&mut self) -> Result<Cno>
     {
         // The public surface answers in checkpoint numbers: that is what a caller
         // pins, logs, and hands back to `open_cno`. Inside, the same value is a
@@ -456,7 +457,7 @@ impl<'a: 'static> Hyper<'a> {
     /// Equivalent to `fs_flush` when there's data or bmap dirt;
     /// strictly cheaper when only attrs are dirty (no S3 PUT
     /// happens).
-    pub async fn fs_fdatasync(&mut self) -> Result<u64>
+    pub async fn fs_fdatasync(&mut self) -> Result<Cno>
     {
         debug!("fs_fdatasync - ");
         // The public surface answers in checkpoint numbers: that is what a caller
@@ -529,7 +530,7 @@ impl<'a: 'static> Hyper<'a> {
         return Self::update_stat_fast(client.clone(), file_config, &stat).await;
     }
 
-    pub fn fs_last_cno(&self) -> u64
+    pub fn fs_last_cno(&self) -> Cno
     {
         debug!("fs_last_cno -");
         self.inner.last_cno()

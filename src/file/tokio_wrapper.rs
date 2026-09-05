@@ -10,6 +10,7 @@ use tokio::sync::oneshot::error::TryRecvError as OneshotTryRecvError;
 use aws_sdk_s3::Client;
 use hyperfile_reactor::Reactor;
 use crate::file::handler::{ChannelGroup, build_channel_group};
+use crate::Cno;
 use crate::config::{HyperFileConfig, HyperFileMetaConfig, HyperFileRuntimeConfig};
 use super::hyper::Hyper;
 use super::flags::FileFlags;
@@ -140,13 +141,13 @@ impl<'a: 'static> HyperFileTokio<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
-    pub async fn last_cno(&self) -> Result<u64> {
+    pub async fn last_cno(&self) -> Result<Cno> {
         let (ctx, rx) = FileContext::new_last_cno();
         self.inner.send(ctx)?;
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))
     }
 
-    pub async fn flush_ext(&self) -> Result<u64> {
+    pub async fn flush_ext(&self) -> Result<Cno> {
         // The public surface answers in checkpoint numbers: that is what a caller
         // pins, logs, and hands back to `open_cno`. Inside, the same value is a
         // `SegmentId`, so it cannot be mistaken for a length or an offset.
@@ -160,7 +161,7 @@ impl<'a: 'static> HyperFileTokio<'a> {
     /// `Hyper::fs_fdatasync` for semantics. Provided as an
     /// extension method on top of the tokio AsyncWrite/AsyncRead
     /// surface.
-    pub async fn fdatasync_ext(&self) -> Result<u64> {
+    pub async fn fdatasync_ext(&self) -> Result<Cno> {
         // The public surface answers in checkpoint numbers: that is what a caller
         // pins, logs, and hands back to `open_cno`. Inside, the same value is a
         // `SegmentId`, so it cannot be mistaken for a length or an offset.

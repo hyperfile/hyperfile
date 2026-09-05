@@ -10,6 +10,7 @@ use std::io::{Error, ErrorKind, Result};
 use log::{debug, warn};
 #[cfg(all(feature = "wal", feature = "reactor"))]
 use crate::file::handler::ChannelGroup;
+use crate::Cno;
 use btree_ondisk::{bmap::BMap, BlockLoader, NodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
@@ -316,7 +317,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     }
 
     /// open a hyper file with cno for read-only
-    pub async fn open_cno(staging: T, meta_block_loader: L, node_cache: C, config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
+    pub async fn open_cno(staging: T, meta_block_loader: L, node_cache: C, config: HyperFileConfig, flags: HyperFileFlags, cno: Cno) -> Result<Self>
     {
         if !flags.is_rdonly() {
             return Err(Error::new(ErrorKind::ReadOnlyFilesystem, "write access is not allowed for open specific cno"));
@@ -324,7 +325,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         Self::do_open(staging, meta_block_loader, node_cache, config, flags, cno).await
     }
 
-    async fn do_open(staging: T, meta_block_loader: L, node_cache: C, mut config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
+    async fn do_open(staging: T, meta_block_loader: L, node_cache: C, mut config: HyperFileConfig, flags: HyperFileFlags, cno: Cno) -> Result<Self>
     {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let inode_state;
@@ -3035,7 +3036,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     // return last persistent cno on disk
     #[inline]
-    pub fn last_cno(&self) -> u64 {
+    pub fn last_cno(&self) -> Cno {
         #[cfg(not(feature = "wal"))]
         return self.inode.get_last_ondisk_cno();
         #[cfg(feature = "wal")]
@@ -3082,13 +3083,13 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     /// Test-only: last committed checkpoint number (in-memory value).
     #[doc(hidden)]
-    pub fn in_memory_last_cno(&self) -> u64 {
+    pub fn in_memory_last_cno(&self) -> Cno {
         self.inode.get_last_cno()
     }
 
     /// Test-only: last on-disk checkpoint number (in-memory tracking).
     #[doc(hidden)]
-    pub fn in_memory_last_ondisk_cno(&self) -> u64 {
+    pub fn in_memory_last_ondisk_cno(&self) -> Cno {
         self.inode.get_last_ondisk_cno()
     }
 

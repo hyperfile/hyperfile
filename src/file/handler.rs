@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 use tokio::sync::OwnedMutexGuard;
 use hyperfile_reactor::{Capacity, Channel, Task, TaskBuilder, TaskHandler};
 use crate::{SegmentId, BlockIndex};
+use crate::Cno;
 #[cfg(feature = "wal")]
 use crate::inode::OnDiskState;
 use crate::buffer::{DataBlock, AlignedDataBlockWrapper, BatchDataBlockWrapper};
@@ -134,7 +135,7 @@ pub type FileRespReadMany = Result<usize>;
 pub type FileRespReadOwned = Result<Bytes>;
 pub type FileRespFlush = Result<SegmentId>;
 pub type FileRespRelease = Result<SegmentId>;
-pub type FileRespLastCno = u64;
+pub type FileRespLastCno = Cno;
 
 /// See `Hyper::begin_txn`.
 #[cfg(feature = "wal")]

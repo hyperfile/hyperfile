@@ -33,6 +33,14 @@ pub type BlockIndex = u64;
 pub type BlockPtr = u64;
 pub type BlockOffset = usize;
 
+/// A checkpoint number.
+///
+/// What a caller pins, logs, and hands back to `open_cno`, and what the inode and
+/// the segment header persist. The public surfaces answer in these; inside, the
+/// same value travels as a [`SegmentId`] so it cannot be mistaken for a length or
+/// an offset.
+pub type Cno = u64;
+
 /// Which stored piece of the container a block lives in.
 ///
 /// `seq_id` is the checkpoint: ordered, incremented, and persisted as
@@ -102,7 +110,7 @@ impl SegmentId {
     /// the part, which those fields have no room for and no use for: they name a
     /// checkpoint, not one of its pieces.
     #[inline]
-    pub const fn as_cno(&self) -> u64 {
+    pub const fn as_cno(&self) -> Cno {
         self.seq_id as u64
     }
 
@@ -125,7 +133,7 @@ impl SegmentId {
 
     /// From a checkpoint number that came from a persisted field or a u64 API.
     #[inline]
-    pub fn new_from_cno(cno: u64) -> Self {
+    pub fn new_from_cno(cno: Cno) -> Self {
         Self::from(cno)
     }
 
@@ -150,12 +158,12 @@ impl SegmentId {
     }
 }
 
-impl From<u64> for SegmentId {
+impl From<Cno> for SegmentId {
     /// From a persisted checkpoint number. Refuses in debug what a pointer could
     /// not have named anyway.
     #[inline]
-    fn from(cno: u64) -> Self {
-        debug_assert!(cno <= u32::MAX as u64, "checkpoint {} is past what a pointer can name", cno);
+    fn from(cno: Cno) -> Self {
+        debug_assert!(cno <= u32::MAX as Cno, "checkpoint {} is past what a pointer can name", cno);
         Self::new(cno as u32)
     }
 }

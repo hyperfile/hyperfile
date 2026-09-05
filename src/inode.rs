@@ -2,6 +2,7 @@ use std::fmt;
 use std::time::SystemTime;
 use chrono::{Utc, TimeZone};
 use crate::SegmentId;
+use crate::Cno;
 use crate::ondisk::{InodeRaw, BMapRawType};
 use crate::config::HyperFileMetaConfig;
 use crate::file::mode::{HyperFileMode, FileMode};
@@ -48,10 +49,10 @@ pub struct Inode {
     i_nlink: u64,
     /// The checkpoint counter, as the on-disk inode holds it. A plain number:
     /// it is incremented and persisted, and a part has no place in it.
-    pub(crate) i_last_seq: u64,
-    pub(crate) i_last_cno: u64,
+    pub(crate) i_last_seq: Cno,
+    pub(crate) i_last_cno: Cno,
     // in memory only fields
-    pub(crate) i_last_ondisk_cno: u64, // tracking last cno ondisk
+    pub(crate) i_last_ondisk_cno: Cno, // tracking last cno ondisk
     pub(crate) i_ondisk_state: Option<OnDiskState>,
     pub(crate) i_attr_dirty: bool, // tracking any of attr modified
 }
@@ -411,22 +412,22 @@ impl Inode {
     }
 
     #[inline]
-    pub fn get_last_cno(&self) -> u64 {
+    pub fn get_last_cno(&self) -> Cno {
         self.i_last_cno
     }
 
     #[inline]
-    pub fn set_last_cno(&mut self, cno: u64) {
+    pub fn set_last_cno(&mut self, cno: Cno) {
         self.i_last_cno = cno;
     }
 
     #[inline]
-    pub fn get_last_ondisk_cno(&self) -> u64 {
+    pub fn get_last_ondisk_cno(&self) -> Cno {
         self.i_last_ondisk_cno
     }
 
     #[inline]
-    pub fn set_last_ondisk_cno(&mut self, cno: u64) {
+    pub fn set_last_ondisk_cno(&mut self, cno: Cno) {
         self.i_last_ondisk_cno = cno;
     }
 

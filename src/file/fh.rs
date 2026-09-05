@@ -3,6 +3,7 @@ use aws_sdk_s3::Client;
 use hyperfile_reactor::Reactor;
 use tokio::sync::oneshot;
 use crate::BlockIndex;
+use crate::Cno;
 use crate::file::handler::{ChannelGroup, build_channel_group, BlockAction, TimingOp, TimingValue};
 
 /// Stops a borrowed closure from running after the caller has gone.
@@ -158,7 +159,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
         Hyper::fs_rename(client, src_uri, dst_uri).await
     }
 
-    pub async fn fh_release(&mut self) -> Result<u64>
+    pub async fn fh_release(&mut self) -> Result<Cno>
     {
         // The public surface answers in checkpoint numbers: that is what a caller
         // pins, logs, and hands back to `open_cno`. Inside, the same value is a
@@ -263,7 +264,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.recv().await.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
     }
 
-    pub async fn fh_flush(&mut self) -> Result<u64>
+    pub async fn fh_flush(&mut self) -> Result<Cno>
     {
         // The public surface answers in checkpoint numbers: that is what a caller
         // pins, logs, and hands back to `open_cno`. Inside, the same value is a
@@ -277,7 +278,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// POSIX-`fdatasync` flavoured flush. See
     /// `Hyper::fs_fdatasync` for semantics. Skips the segment
     /// write entirely when only attrs are dirty.
-    pub async fn fh_fdatasync(&mut self) -> Result<u64>
+    pub async fn fh_fdatasync(&mut self) -> Result<Cno>
     {
         // The public surface answers in checkpoint numbers: that is what a caller
         // pins, logs, and hands back to `open_cno`. Inside, the same value is a
@@ -790,7 +791,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// Close the interval and publish everything in it as one checkpoint.
     /// See `Hyper::commit_txn`.
     #[cfg(feature = "wal")]
-    pub async fn fh_commit_txn(&mut self) -> Result<u64>
+    pub async fn fh_commit_txn(&mut self) -> Result<Cno>
     {
         // The public surface answers in checkpoint numbers: that is what a caller
         // pins, logs, and hands back to `open_cno`. Inside, the same value is a
@@ -823,7 +824,7 @@ impl<'a: 'static> HyperFileHandler<'a> {
         rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))
     }
 
-    pub async fn fh_last_cno(&self) -> Result<u64>
+    pub async fn fh_last_cno(&self) -> Result<Cno>
     {
         let (ctx, rx) = FileContext::new_last_cno();
         self.inner.send(ctx)?;
