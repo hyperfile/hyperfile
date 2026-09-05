@@ -37,7 +37,8 @@ fn parted_config(uri: &str, trigger_blocks: usize, min_bytes: usize, enabled: bo
     // it so the test's own boundary is the only one.
     runtime.data_cache_dirty_max_blocks_threshold = trigger_blocks;
     runtime.data_cache_dirty_max_bytes_threshold = trigger_blocks * BLK;
-    runtime.segment_buffer_size = usize::MAX / 2;
+    // `segment_buffer_size` is left alone: the WAL path preallocates it, and its
+    // default is far above what these tests write, so it never fires.
     runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
     HyperFileConfigBuilder::new()
         .with_staging_config(&StagingConfig::new_s3_uri(uri, None))
@@ -228,5 +229,128 @@ async fn a_crossing_below_the_floor_publishes_instead() {
         "below the floor a crossing must publish as before, {} -> {}",
         cno_before, hyper.fs_last_cno());
     let _ = hyper.fs_release().await;
+    tf.cleanup(&client).await;
+}
+
+/// A partial says so in its header, the consistency point does not, and every
+/// partial carries a populated inode.
+///
+/// The flag is for a reader that arrives with an object name rather than a
+/// checkpoint number — a cleaner, or a tool walking a listing. Resolving a
+/// checkpoint number never lands on a partial, because it only ever looks for the
+/// bare name or part 0; the flag is what protects everything that does not go
+/// through that resolution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn a_partial_is_marked_and_carries_its_own_inode() {
+    use hyperfile::segment::SegmentReadWrite;
+    use hyperfile::staging::s3::S3Staging;
+    use hyperfile::SegmentId;
+
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let config = parted_config(tf.uri(), 4, 2 * BLK, true);
+
+    {
+        let mut hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        for i in 0..20 {
+            let _ = hyper.fs_write(i * BLK, &vec![0xA0 + i as u8; BLK]).await.expect("write");
+        }
+        let _ = hyper.fs_flush().await.expect("flush");
+        let _ = hyper.fs_release().await;
+    }
+
+    let staging: S3Staging = S3Staging::from(
+        &client,
+        StagingConfig::new_s3_uri(tf.uri(), None),
+        HyperFileRuntimeConfig::default(),
+    ).await.expect("staging");
+
+    let names = object_names(&client, tf.uri()).await;
+    let mut partials = 0;
+    for n in &names {
+        let Some((_, part)) = n.split_once('.') else { continue };
+        let part: u16 = part.parse().expect("part index");
+        let ss = staging.open(SegmentId::with_part(1, part)).await
+            .unwrap_or_else(|e| panic!("open part {}: {}", part, e));
+        let marked = ss.hdr.s_flags & hyperfile::ondisk::SEGMENT_FLAG_PARTIAL != 0;
+        if part == 0 {
+            assert!(!marked, "part 0 is the checkpoint and must not be marked partial");
+        } else {
+            assert!(marked, "part {} is a partial and is not marked", part);
+            partials += 1;
+        }
+        // Every part carries the inode, so any of them can be parsed on its own.
+        assert_eq!(ss.hdr.s_cno, 1, "part {} names the wrong checkpoint", part);
+        assert!(ss.hdr.s_inode.i_size > 0,
+            "part {} carries an empty inode, so it cannot be parsed alone", part);
+        // And describes its own blocks, not the checkpoint's.
+        assert_eq!(ss.blocks.len(), ss.hdr.s_ndatablk as usize);
+    }
+    assert!(partials >= 2, "expected several partials among {:?}", names);
+
+    tf.cleanup(&client).await;
+}
+
+/// A checkpoint whose partials were written but whose consistency point never
+/// arrived is not openable, and does not become openable by having partials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn an_abandoned_checkpoint_is_not_openable() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    let config = parted_config(tf.uri(), 4, 2 * BLK, true);
+
+    {
+        let mut hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        // Publish one checkpoint so the container has a state to fall back to.
+        let _ = hyper.fs_write(0, &vec![0xC0; BLK]).await.expect("write");
+        let published = hyper.fs_flush().await.expect("flush");
+
+        // Now accumulate partials and walk away without asking for a checkpoint.
+        for i in 1..20 {
+            let _ = hyper.fs_write(i * BLK, &vec![0xD0 + i as u8; BLK]).await.expect("write");
+        }
+        let names = object_names(&client, tf.uri()).await;
+        let abandoned: Vec<&String> = names.iter()
+            .filter(|n| n.starts_with(&format!("{:0>10}", published + 1))).collect();
+        assert!(!abandoned.is_empty(), "no partials to abandon among {:?}", names);
+        assert!(!abandoned.iter().any(|n| n.ends_with(".0")),
+            "the abandoned checkpoint has a part 0: {:?}", abandoned);
+        std::mem::forget(hyper);
+    }
+
+    // The container opens at the checkpoint that was asked for, and the one that
+    // was not is absent rather than partly there.
+    let mut hyper = Hyper::open(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdonly()),
+    ).await.expect("reopen");
+    let mut buf = vec![0u8; BLK];
+    let _ = hyper.fs_read(0, &mut buf).await.expect("read");
+    assert!(buf.iter().all(|b| *b == 0xC0), "the published checkpoint did not survive");
+    let mut buf = vec![0u8; BLK];
+    let n = hyper.fs_read(BLK, &mut buf).await.expect("read");
+    assert!(n == 0 || buf.iter().all(|b| *b != 0xD1),
+        "an abandoned partial's data came back, so something referenced it");
+    let _ = hyper.fs_release().await;
+
+    // Opening the abandoned number by cno fails: resolution looks for part 0 and
+    // the bare name, and neither is there.
+    let res = Hyper::open_cno(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdonly()), 2).await;
+    assert!(res.is_err(), "an abandoned checkpoint opened as if it were complete");
+
     tf.cleanup(&client).await;
 }
