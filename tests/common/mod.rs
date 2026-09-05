@@ -434,3 +434,66 @@ impl StagingIntercept<S3Staging> for PanicOnFlushInode {
         Box::pin(async { Ok(()) })
     }
 }
+
+/// Holds the upload of a checkpoint's own object — the one a flush pins a buffer
+/// for — so a test can read while that buffer is live.
+///
+/// Only that object: a partial is uploaded on the write path and delaying it would
+/// stall the writer rather than widen the window this exists to widen.
+pub struct HoldTheCheckpointObject {
+    delay: std::time::Duration,
+    held: Arc<AtomicUsize>,
+}
+
+impl HoldTheCheckpointObject {
+    pub fn new(delay: std::time::Duration) -> Self {
+        Self { delay, held: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    /// How many uploads were held. Zero means the window never opened and whatever
+    /// the test concluded, it did not conclude it about this.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    pub fn handle(&self) -> Arc<AtomicUsize> {
+        self.held.clone()
+    }
+}
+
+impl StagingIntercept<S3Staging> for HoldTheCheckpointObject {
+    fn before_segment_done(
+        &self,
+        _staging: &S3Staging,
+        obj: hyperfile::SegmentId,
+        _buf: &[u8],
+        _len: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {
+        let delay = self.delay;
+        let held = self.held.clone();
+        let is_partial = obj.is_partial();
+        Box::pin(async move {
+            if !is_partial {
+                held.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn after_flush_inode(
+        &self,
+        _staging: &S3Staging,
+        _payload: &[u8],
+        _flag: FlushInodeFlag,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn after_remove_inode(
+        &self,
+        _staging: &S3Staging,
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {
+        Box::pin(async { Ok(()) })
+    }
+}

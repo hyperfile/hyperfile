@@ -9,6 +9,8 @@ use std::pin::Pin;
 #[cfg(not(feature = "wal"))]
 use bytes::Bytes;
 use crate::SegmentId;
+#[cfg(feature = "wal")]
+use crate::Cno;
 use crate::ondisk::{SegmentHeader, SegmentBlockEntryRaw};
 use crate::{BlockIndex, BlockPtr};
 use crate::config::HyperFileMetaConfig;
@@ -273,7 +275,7 @@ impl<T: SegmentReadWrite> Writer<T> {
             segid: if hyper_file_config.block_ptr_format.is_parted() {
                 segid.at_part(Segment::SUMMARY_PART)
             } else {
-                segid.whole()
+                segid.checkpoint()
             },
             ss: SegmentSum {
                 hdr: hdr,
@@ -465,8 +467,8 @@ impl<T: SegmentReadWrite> Writer<T> {
     }
 
     #[cfg(feature = "wal")]
-    pub fn get_weak_data(&self) -> (SegmentId, Weak<Pin<Box<Vec<u8>>>>) {
-        (self.segid.whole(), Arc::downgrade(&self.data))
+    pub fn get_weak_data(&self) -> (Cno, Weak<Pin<Box<Vec<u8>>>>) {
+        (self.segid.as_cno(), Arc::downgrade(&self.data))
     }
 }
 

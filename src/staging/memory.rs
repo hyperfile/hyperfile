@@ -309,7 +309,7 @@ impl Staging<MemoryBlockLoader<BlockPtr>> for MemoryStaging {
             let store = self.store.read().unwrap();
             let mut r = store.read_at(segid.at_part(crate::segment::Segment::SUMMARY_PART), inode_off, buf);
             if r.is_err() {
-                r = store.read_at(segid.whole(), inode_off, buf);
+                r = store.read_at(segid.checkpoint(), inode_off, buf);
             }
             r
         };
@@ -321,7 +321,7 @@ impl Staging<MemoryBlockLoader<BlockPtr>> for MemoryStaging {
     async fn load_segment_timestamp(&self, segid: SegmentId) -> Result<(i64, i64)> {
         let store = self.store.read().unwrap();
         let Some(ts) = store.timestamps.get(&segid.at_part(crate::segment::Segment::SUMMARY_PART))
-            .or_else(|| store.timestamps.get(&segid.whole())) else {
+            .or_else(|| store.timestamps.get(&segid.checkpoint())) else {
             return Err(Error::new(ErrorKind::NotFound,
                 format!("checkpoint {} does not exist in memory staging", segid)));
         };
@@ -472,7 +472,7 @@ impl SegmentReadWrite for MemoryStaging {
             // Checkpoint ids, so a streamed one counts once however many objects
             // it was written as.
             let mut v: Vec<SegmentId> = store.segments.keys()
-                .map(|o| o.whole()).filter(|s| *s >= segid.whole()).collect();
+                .map(|o| o.checkpoint()).filter(|s| *s >= segid.checkpoint()).collect();
             v.dedup();
             Ok(v)
         }

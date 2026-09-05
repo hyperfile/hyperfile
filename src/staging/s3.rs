@@ -49,7 +49,7 @@ impl S3Staging {
     /// and only on the two paths that read a checkpoint's header rather than its
     /// data: opening a specific checkpoint, and asking a checkpoint's timestamp.
     fn candidate_summary_objs(&self, segid: SegmentId) -> [SegmentId; 2] {
-        [segid.whole(), segid.at_part(crate::segment::Segment::SUMMARY_PART)]
+        [segid.checkpoint(), segid.at_part(crate::segment::Segment::SUMMARY_PART)]
     }
 
     /// Read exactly the object `segid` names, with no fallback.

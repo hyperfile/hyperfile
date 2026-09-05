@@ -417,9 +417,9 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
     // wal
     #[cfg(feature = "wal")]
-    fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
+    fn wal_set_mem_segment(&self, cno: Cno, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) -> impl Future<Output = ()>;
     #[cfg(feature = "wal")]
-    fn wal_clear_mem_segment(&self, mem_segid: SegmentId) -> impl Future<Output = ()>;
+    fn wal_clear_mem_segment(&self, cno: Cno) -> impl Future<Output = ()>;
     /// Fire-and-forget delete of the WAL objects for the given
     /// segid. Spawned so the caller (typically the flush path)
     /// doesn't block on the round trip. If the delete fails or

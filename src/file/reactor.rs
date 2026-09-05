@@ -66,7 +66,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     // there rather than treating a finished flush as a bug.
                     let copied = {
                         let lock = flushing_segments.read().await;
-                        match lock.get(&segid.whole()).and_then(|weak_data| weak_data.upgrade()) {
+                        match lock.get(&segid.as_cno()).and_then(|weak_data| weak_data.upgrade()) {
                             Some(data) => {
                                 let start_off = staging_off + offset;
                                 let end = start_off + data_buf.len();
@@ -378,7 +378,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 match op {
                     ReadOp::Cache { .. } | ReadOp::Zero { .. } => {},
                     #[cfg(feature = "wal")]
-                    ReadOp::Inmem { segid, s3_off, dst_len: _ } => ops.push((segid.whole(), s3_off, consumed, dst_len)),
+                    ReadOp::Inmem { segid, s3_off, dst_len: _ } => ops.push((segid, s3_off, consumed, dst_len)),
                     ReadOp::Range { segid, s3_off, dst_len: _ } => ops.push((segid, s3_off, consumed, dst_len)),
                 }
                 consumed += dst_len;
@@ -400,11 +400,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 joins.push(tokio::spawn(async move {
                     let mut buf = vec![0u8; span];
                     for (segid, src_off, dst_off, len) in ops {
+                        // The pinned buffer holds the one object a flush is
+                        // uploading. Asking for it by checkpoint alone answers for
+                        // any object of that checkpoint, and a partial is a different
+                        // object: the offset would be read out of the buffer holding
+                        // the summary and metadata, which is real data belonging to
+                        // somewhere else. So only a pointer that is not a partial may
+                        // be served from here — the same test the planner applies
+                        // when it decides an op is `Inmem` at all.
                         #[cfg(feature = "wal")]
-                        {
+                        if !segid.is_partial() {
                             let copied = {
                                 let lock = flushing_segments.read().await;
-                                match lock.get(&segid.whole()).and_then(|weak| weak.upgrade()) {
+                                match lock.get(&segid.as_cno()).and_then(|weak| weak.upgrade()) {
                                     Some(data) => {
                                         buf[dst_off..dst_off + len]
                                             .copy_from_slice(&data[src_off..src_off + len]);
@@ -528,7 +536,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             match op {
                 ReadOp::Cache { .. } | ReadOp::Zero { .. } => {},
                 #[cfg(feature = "wal")]
-                ReadOp::Inmem { segid, s3_off, dst_len: _ } => work.push((segid.whole(), s3_off, consumed, dst_len)),
+                ReadOp::Inmem { segid, s3_off, dst_len: _ } => work.push((segid, s3_off, consumed, dst_len)),
                 ReadOp::Range { segid, s3_off, dst_len: _ } => work.push((segid, s3_off, consumed, dst_len)),
             }
             consumed += dst_len;
@@ -549,12 +557,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             let mut buf = vec![0u8; span];
             let mut failed = None;
             for (segid, src_off, dst_off, len) in work.iter().copied() {
+                // The pinned buffer holds the one object a flush is uploading. Asking
+                // for it by checkpoint answers for any object of that checkpoint, and
+                // a partial is a different object already on storage — the offset
+                // would be read out of the buffer holding the summary and metadata,
+                // which is real data belonging somewhere else. Only a pointer that is
+                // not a partial may be served from here, which is the same test the
+                // planner applies when it decides an op is `Inmem` at all.
                 #[cfg(feature = "wal")]
-                {
+                if !segid.is_partial() {
                     // A segment still being written out is in memory.
                     let copied = {
                         let lock = flushing_segments.read().await;
-                        match lock.get(&segid.whole()).and_then(|weak| weak.upgrade()) {
+                        match lock.get(&segid.as_cno()).and_then(|weak| weak.upgrade()) {
                             Some(data) => {
                                 buf[dst_off..dst_off + len]
                                     .copy_from_slice(&data[src_off..src_off + len]);
@@ -771,7 +786,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         // it rather than treating a completed flush as a bug.
                         let copied = {
                             let lock = flushing_segments.read().await;
-                            match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                            match lock.get(&segid.as_cno()).and_then(|weak| weak.upgrade()) {
                                 Some(data) => {
                                     let end = s3_off + len;
                                     data_buf.copy_from_slice(&data[s3_off..end]);
@@ -783,7 +798,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         };
                         if !copied {
                             debug!("read - segid {} no longer held in memory, reading it from staging", segid);
-                            staging.load_range(segid.whole(), s3_off, data_buf).await?;
+                            staging.load_range(segid, s3_off, data_buf).await?;
                         }
                         Ok(len)
                     });
@@ -1370,7 +1385,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         }
         let flushing_segments = self.flushing_segments.clone();
         let lock = flushing_segments.read().await;
-        let Some(data) = lock.get(&segid.whole()).and_then(|weak| weak.upgrade()) else {
+        let Some(data) = lock.get(&segid.as_cno()).and_then(|weak| weak.upgrade()) else {
             // The upload finished and the buffer went with it.
             return Ok(false);
         };

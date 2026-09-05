@@ -3104,3 +3104,135 @@ async fn reactor_wal_partial_segments_still_recover_from_the_log() {
     let _ = hyper.fs_release().await;
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// A batched read over a partial segment must read the partial, not whatever the
+/// in-flight buffer happens to hold at that offset.
+///
+/// A flush pins a buffer of the object it is uploading so reads can carry on. That
+/// object is the checkpoint's own, and asking for it by checkpoint alone answers for
+/// *any* object of that checkpoint — including a partial, which is a different object
+/// already on storage. The offset then lands in a buffer holding the summary and the
+/// metadata, so the read comes back with real data belonging somewhere else: no error,
+/// no zeroes, and nothing downstream to notice.
+///
+/// A consumer found it through their device layer's prefetch: an ordinary read almost
+/// always hits the pinned buffer through an `Inmem` op, which is a different arm, so
+/// the path that mattered stayed cold until something asked for a range asynchronously.
+///
+/// `read_many` is the surface under test rather than `read_ahead`, though both carry
+/// the same mistake and the same fix. `read_many` hands the bytes to a closure, so what
+/// it read is observable; `read_ahead`'s answer is only visible once installed in the
+/// cache, and from one handle a block cannot be both absent from the cache and
+/// installable into it without eviction racing the prefetch. So the read-ahead site is
+/// argued from the code and from the consumer's measurement, not from a test here.
+///
+/// At this size the defect shows as a failure rather than as wrong bytes: the copy runs
+/// off the end of a buffer holding only a summary and metadata, the worker panics, and
+/// the panic arrives as an error. Wrong bytes need a checkpoint whose metadata is long
+/// enough for the offset to land inside it, which is what the consumer had.
+///
+/// The interceptor holds the checkpoint object's upload so the window is the test's to
+/// choose rather than a race to lose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn reactor_wal_read_many_over_a_partial_reads_the_partial() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+    const BLOCKS: usize = 40;
+
+    let tf = TestFile::new(&client).await;
+    let d = hyperfile::config::HyperFileMetaConfig::default();
+    let meta = hyperfile::config::HyperFileMetaConfig::new(
+        d.root_size, d.meta_block_size, BLK,
+        hyperfile::meta_format::BlockPtrFormat::PartedSegment);
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    // Partials every 4 blocks, so most of the file lives in them.
+    runtime.data_cache_dirty_max_blocks_threshold = 4;
+    runtime.data_cache_dirty_max_bytes_threshold = 4 * BLK;
+    runtime.data_cache_dirty_min_bytes_to_part = 2 * BLK;
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    // Nothing resident, so every block has to be fetched. `read_many` hands the bytes
+    // to a closure, so what it read is observable without a cache to hold it — which is
+    // why this is the surface under test rather than `read_ahead`, whose answer is only
+    // visible once installed and so is entangled with eviction.
+    runtime.data_cache_blocks = 0;
+    let wal = HyperFileWalConfig::new(&format!("{}/wal", tf.uri()));
+
+    let hold = HoldTheCheckpointObject::new(std::time::Duration::from_millis(1500));
+    let held = hold.handle();
+
+    // The whole pinned-buffer mechanism is WAL-only, so the entry point has to be the
+    // one that takes a file config. An earlier version of this test used one that takes
+    // only the meta and runtime configs, so it ran without a WAL, and every pinned
+    // lookup missed — it passed against the defect for that reason and for no other.
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&StagingConfig::new_s3_uri(tf.uri(), None))
+        .with_meta_config(&meta)
+        .with_wal_config(&wal)
+        .with_runtime_config(&runtime)
+        .build();
+
+    let reactor = make_reactor();
+    let hyper = Hyper::create_with_interceptor(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+        HyperFileMode::from_mode(FileMode::default_file()),
+        hold,
+    ).await.expect("create");
+    let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+
+    for i in 0..BLOCKS {
+        let b = AlignedDataBlockWrapper::new(i as u64, BLK, false);
+        b.as_mut_slice().fill(0x10 + i as u8);
+        let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+    }
+
+    // Ask for the checkpoint without waiting: its object's upload is held, so the
+    // pinned buffer is live for the whole read below.
+    let flush = { let mut f = fh.clone(); tokio::spawn(async move { f.fh_flush().await }) };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Ask for every block at once while the buffer is pinned. This is the path that
+    // read the wrong object.
+    let indices: Vec<u64> = (0..BLOCKS as u64).collect();
+    let mut wrong = Vec::new();
+    // The result is checked, not discarded. With the defect the copy runs off the end
+    // of the buffer it should never have been reading, the worker panics, and the panic
+    // arrives as an error — which an earlier version of this test threw away, and passed.
+    let served = fh.fh_read_many(&indices, |idx, bytes| {
+        let want = 0x10 + idx as u8;
+        match bytes {
+            Some(b) if b.iter().all(|v| *v == want) => {},
+            Some(b) => wrong.push((idx, b[0])),
+            None => wrong.push((idx, 0xFF)),
+        }
+    }).await;
+    let _ = flush.await.expect("flush task");
+    let served = served.expect("read_many while a flush was in flight");
+    assert_eq!(served, BLOCKS, "read_many served {} of {} blocks", served, BLOCKS);
+
+    assert!(held.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the checkpoint object's upload was never held, so the pinned buffer was never \
+         live and this run proves nothing");
+    // And the blocks read have to be in partials of the checkpoint that flush is
+    // completing, or the lookup this is about never had a partial to be asked with.
+    let bucket = test_bucket();
+    let root = tf.uri().strip_prefix(&format!("s3://{}/", bucket)).expect("uri");
+    let listed = client.list_objects_v2().bucket(&bucket)
+        .prefix(format!("{}/", root)).send().await.expect("list");
+    let partials: Vec<String> = listed.contents().iter().filter_map(|o| o.key())
+        .map(|k| k.rsplit('/').next().unwrap().to_string())
+        .filter(|n| n.split_once('.').and_then(|(_, p)| p.parse::<u16>().ok())
+                     .map(|p| p >= 1).unwrap_or(false))
+        .collect();
+    assert!(partials.len() >= 2,
+        "the file was not written as partials, so the prefetch had no partial to read: \
+         {:?}", partials);
+    assert!(wrong.is_empty(),
+        "read-ahead during a flush returned another object's bytes for {:?} \
+         (block, first byte)", wrong);
+
+    let _ = fh.fh_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}

@@ -123,10 +123,13 @@ impl SegmentId {
         self.seq_id as u64
     }
 
-    /// The same checkpoint without a part — its identity as a checkpoint rather
-    /// than as a stored object.
+    /// The checkpoint this object belongs to, as an id.
+    ///
+    /// For naming something that is per-checkpoint rather than per-object: the log's
+    /// own key space, a checkpoint list, the object holding a checkpoint's header.
+    /// [`Self::as_cno`] is the same thing as a number, for comparing and persisting.
     #[inline]
-    pub const fn whole(&self) -> Self {
+    pub const fn checkpoint(&self) -> Self {
         Self::new(self.seq_id)
     }
 

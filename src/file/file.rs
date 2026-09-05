@@ -165,7 +165,14 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     /// See [`docs/flush.md`](../../docs/flush.md) for the lifecycle and
     /// what it costs.
     #[cfg(feature = "wal")]
-    pub(crate) flushing_segments: Arc<RwLock<HashMap<SegmentId, Weak<Pin<Box<Vec<u8>>>>>>>,
+    /// Buffers of checkpoints being uploaded, so a read can be served while a flush
+    /// is outstanding.
+    ///
+    /// Keyed by checkpoint and not by object, because a flush pins exactly one — the
+    /// one it is writing. Saying so in the key type is deliberate: the alternative
+    /// let an object id be reduced to a checkpoint at the lookup, which is how a read
+    /// of a partial came to be answered out of the buffer holding another object.
+    pub(crate) flushing_segments: Arc<RwLock<HashMap<Cno, Weak<Pin<Box<Vec<u8>>>>>>>,
     /// What recovery did when this file was opened. See
     /// [`WalRecoveryReport`](crate::wal::WalRecoveryReport).
     #[cfg(feature = "wal")]
@@ -1094,7 +1101,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 ReadOp::Inmem { segid, s3_off, dst_len: _ } => {
                     let copied = {
                         let lock = self.flushing_segments.read().await;
-                        match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                        match lock.get(&segid.as_cno()).and_then(|weak| weak.upgrade()) {
                             Some(data) => {
                                 let e = s3_off + dst_len;
                                 buf[consumed..consumed + dst_len].copy_from_slice(&data[s3_off..e]);
@@ -1104,8 +1111,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         }
                     };
                     if !copied {
-                        // The flush landed, so the same bytes are on staging.
-                        self.staging.load_range(segid.whole(), s3_off, &mut buf[consumed..consumed + dst_len]).await?;
+                        // The flush landed, so the same bytes are on staging, in the
+                        // object the pointer named.
+                        self.staging.load_range(segid, s3_off,
+                            &mut buf[consumed..consumed + dst_len]).await?;
                         self.staging.read_timing().add_read_ahead_get(dst_len);
                     }
                     fetched.push((consumed, dst_len));
@@ -1204,7 +1213,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     // finishing is not a failure.
                     let copied = {
                         let lock = self.flushing_segments.read().await;
-                        match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                        match lock.get(&segid.as_cno()).and_then(|weak| weak.upgrade()) {
                             Some(data) => {
                                 let end = s3_off + this.len();
                                 this.copy_from_slice(&data[s3_off..end]);
@@ -1215,7 +1224,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     };
                     if !copied {
                         debug!("read - segid {} no longer held in memory, reading it from staging", segid);
-                        self.staging.load_range(segid.whole(), s3_off, this).await?;
+                        self.staging.load_range(segid, s3_off, this).await?;
                     }
                 }
                 ReadOp::Range { segid, s3_off, dst_len: _ } => {
@@ -1471,7 +1480,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     flush_range(&mut ops, &mut current_range);
                     #[cfg(feature = "wal")]
                     ops.push(ReadOp::Inmem {
-                        segid: segid.whole(),
+                        // What the pointer named, so a fallback to storage can find
+                        // the object. The pinned buffer is keyed by checkpoint, so the
+                        // lookups reduce it there rather than losing it here.
+                        segid,
                         s3_off: staging_off + block_off,
                         dst_len,
                     });
@@ -2481,7 +2493,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let last_cno = self.inode().get_last_cno();
         assert!(last_cno == segid.as_cno());
         self.inode_mut().set_last_ondisk_cno(last_cno);
-        self.wal_clear_mem_segment(segid).await;
+        self.wal_clear_mem_segment(segid.as_cno()).await;
         // Fire-and-forget delete of the persisted WAL objects.
         //
         // WAL chunks are written under the inode's last_seq at the
@@ -3261,7 +3273,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 };
                 let copied = {
                     let lock = self.flushing_segments.read().await;
-                    match lock.get(&segid.whole()).and_then(|weak_data| weak_data.upgrade()) {
+                    match lock.get(&segid.as_cno()).and_then(|weak_data| weak_data.upgrade()) {
                         Some(data) => {
                             let start_off = staging_off + offset;
                             let end = start_off + data_buf.len();
@@ -3313,7 +3325,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 };
                 let copied = {
                     let lock = self.flushing_segments.read().await;
-                    match lock.get(&segid.whole()).and_then(|weak_data| weak_data.upgrade()) {
+                    match lock.get(&segid.as_cno()).and_then(|weak_data| weak_data.upgrade()) {
                         Some(data) => {
                             let start_off = staging_off + offset;
                             let end = start_off + data_buf.len();
@@ -3614,7 +3626,7 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
         let next = written.part_id()
             .expect("a partial segment names a part")
             .saturating_add(1);
-        self.pending_parts = Some(PendingParts { segid: written.whole(), next_part: next });
+        self.pending_parts = Some(PendingParts { segid: written.checkpoint(), next_part: next });
     }
 
     fn pending_parts_clear(&mut self) {
@@ -3787,21 +3799,21 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
 
     // wal
     #[cfg(feature = "wal")]
-    async fn wal_set_mem_segment(&self, mem_segid: SegmentId, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) {
+    async fn wal_set_mem_segment(&self, cno: Cno, mem_segdata: Weak<Pin<Box<Vec<u8>>>>) {
         let mut lock = self.flushing_segments.write().await;
-        if let Some(_) = lock.insert(mem_segid, mem_segdata) {
-            panic!("wal set mem segment - segid {mem_segid} already exists in memory flushing segments");
+        if let Some(_) = lock.insert(cno, mem_segdata) {
+            panic!("wal set mem segment - segid {cno} already exists in memory flushing segments");
         }
     }
 
     #[cfg(feature = "wal")]
-    async fn wal_clear_mem_segment(&self, mem_segid: SegmentId) {
+    async fn wal_clear_mem_segment(&self, cno: Cno) {
         let mut lock = self.flushing_segments.write().await;
-        let Some(weak_mem_seg) = lock.remove(&mem_segid) else {
-            panic!("wal clear mem segment - segid {mem_segid} did not exists in memory flushing segments");
+        let Some(weak_mem_seg) = lock.remove(&cno) else {
+            panic!("wal clear mem segment - segid {cno} did not exists in memory flushing segments");
         };
         let Some(mem_seg) = weak_mem_seg.upgrade() else {
-            panic!("wal clear mem segment - segid {mem_segid} not be able to upgrade");
+            panic!("wal clear mem segment - segid {cno} not be able to upgrade");
         };
         unsafe { Arc::decrement_strong_count(Arc::as_ptr(&mem_seg)) };
         // end of mem segment life

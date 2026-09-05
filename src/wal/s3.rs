@@ -66,7 +66,7 @@ impl S3Wal {
 
     #[inline]
     fn encode(&mut self, segid: SegmentId, offset: usize, len: usize) -> String {
-        let seg_s = Segment::segid_to_staging_file_id(segid.whole());
+        let seg_s = Segment::segid_to_staging_file_id(segid.checkpoint());
         if self.last_segid != segid {
             self.last_segid = segid;
             self.reset_seq();
@@ -80,19 +80,19 @@ impl S3Wal {
     fn txn_key(&self, segid: SegmentId) -> String {
         // Same reasoning as `barrier_key`: not `seq_offset_len`, so the record
         // decoder rejects it.
-        format!("{}/{}/txn", self.root_path, Segment::segid_to_staging_file_id(segid.whole()))
+        format!("{}/{}/txn", self.root_path, Segment::segid_to_staging_file_id(segid.checkpoint()))
     }
 
     #[inline]
     fn barrier_key(&self, segid: SegmentId) -> String {
         // Deliberately not `seq_offset_len`, so `decode` rejects it and
         // `list_chunks` cannot mistake it for a record.
-        format!("{}/{}/barrier", self.root_path, Segment::segid_to_staging_file_id(segid.whole()))
+        format!("{}/{}/barrier", self.root_path, Segment::segid_to_staging_file_id(segid.checkpoint()))
     }
 
     #[inline]
     fn encode_static(&self, seq: usize, segid: SegmentId, offset: usize, len: usize) -> String {
-        let seg_s = Segment::segid_to_staging_file_id(segid.whole());
+        let seg_s = Segment::segid_to_staging_file_id(segid.checkpoint());
         format!("{}/{}/{}_{}_{}", self.root_path, seg_s, seq, offset, len)
     }
 
@@ -274,7 +274,7 @@ impl WalReadWrite for S3Wal {
     fn list_chunks(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<BTreeMap<usize, WalChunkDesc>>> + Send + '_>> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let wal_segment_root_path = format!("{}{}/", self.root_path_slash, Segment::segid_to_staging_file_id(segid.whole()));
+        let wal_segment_root_path = format!("{}{}/", self.root_path_slash, Segment::segid_to_staging_file_id(segid.checkpoint()));
         Box::pin(async move {
             let mut map = BTreeMap::new();
             let filter = |o: &aws_sdk_s3::types::Object| {
@@ -302,7 +302,7 @@ impl WalReadWrite for S3Wal {
     fn delete_segment(&self, segid: SegmentId) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let wal_segment_root_path = format!("{}{}/", self.root_path_slash, Segment::segid_to_staging_file_id(segid.whole()));
+        let wal_segment_root_path = format!("{}{}/", self.root_path_slash, Segment::segid_to_staging_file_id(segid.checkpoint()));
         Box::pin(async move {
             // Collect keys under the segid prefix, then batch-delete.
             let mut keys = Vec::new();
