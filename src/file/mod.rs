@@ -110,11 +110,17 @@ pub enum PlannedRead {
     /// from `len` bytes at `at` in segment `segid`.
     ///
     /// May cover many consecutive blocks: a request is extended while the
-    /// next block's location is adjacent in the same segment and the
+    /// next block's location is adjacent in the same object and the
     /// request stays under `read_get_max_bytes`.
     Get {
         off: u64,
         len: u64,
+        /// Which object this request hits — the checkpoint, and which of its
+        /// pieces when it was streamed as several.
+        ///
+        /// The whole identity, not just the checkpoint: a streamed checkpoint has
+        /// several places for a run of blocks to break, and two requests that look
+        /// adjacent by `at` alone are two requests when their objects differ.
         segid: crate::SegmentId,
         at: u64,
     },
@@ -426,7 +432,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn wal_drop_superseded_prefixes(&mut self, published: SegmentId) {
         let deferred = self.wal_deferred_count();
         for back in 1..=(deferred + 1) {
-            self.wal_spawn_delete_segment(published.saturating_sub(back as SegmentId));
+            self.wal_spawn_delete_segment(SegmentId::new_from_cno(published.as_cno().saturating_sub(back as u64)));
         }
         self.wal_reset_deferred_count();
     }
@@ -448,7 +454,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     // recover inode from segment
     fn recover_partial_flush(&mut self, segid: u64, od_state: &Option<OnDiskState>) -> impl Future<Output = Result<()>> {async move {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        let _ = self.staging().load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), segid).await?;
+        let _ = self.staging().load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), SegmentId::new_from_cno(segid)).await?;
         let od_state = self.staging().flush_inode(raw_inode.as_u8_slice(), od_state, FlushInodeFlag::Update).await?;
         self.inode_mut().clear_attr_dirty();
         self.inode_mut().set_ondisk_state(od_state);
@@ -470,11 +476,11 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             debug!("try_recover_partial_flush - inode ondisk state: {:?}", inode_state);
 
             // test next segid
-            let next_segid = raw_inode.i_last_seq + 1;
+            let next_segid = SegmentId::new_from_cno(raw_inode.i_last_seq + 1);
             match self.staging().load_segment_timestamp(next_segid).await {
                 Ok((server_time, segment_lm)) => {
                     if server_time - segment_lm > DEFAULT_PARTIAL_FLUSH_TIMEOUT as i64 {
-                        self.recover_partial_flush(next_segid, &inode_state).await?;
+                        self.recover_partial_flush(next_segid.as_cno(), &inode_state).await?;
                     } else {
                         // sleep for a while for next check
                         Self::sleep(Duration::from_secs(DEFAULT_PARTIAL_FLUSH_CHECK_INTERVAL_SECS)).await;
@@ -500,10 +506,10 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let (raw_inode, inode_state) = self.try_recover_partial_flush().await?;
         let od_last_seq = raw_inode.i_last_seq;
 
-        if curr_segid == od_last_seq {
+        if curr_segid.as_cno() == od_last_seq {
             debug!("REFRESH_BMAP - quit due: current segid {} == on disk segid {}", curr_segid, od_last_seq);
             return Ok(curr_segid);
-        } else if curr_segid > od_last_seq {
+        } else if curr_segid.as_cno() > od_last_seq {
             warn!("REFRESH_BMAP - current segid {} is ahead of on disk segid {}", curr_segid, od_last_seq);
             return Ok(curr_segid);
         }
@@ -551,7 +557,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         Ok(self.inode().get_last_seq())
     }}
 
-    fn flush_process_pre_build_segment(&self) -> impl Future<Output = Result<(SegmentId, DirtyDataBlocks<'_>)>> {async {
+    fn flush_process_pre_build_segment(&self) -> impl Future<Output = Result<(u64, DirtyDataBlocks<'_>)>> {async {
         let dirty_data_blocks = self.get_data_blocks_dirty();
 
         if dirty_data_blocks.len() == 0 && !self.bmap_dirty() {
@@ -567,7 +573,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             }
             debug!("flush quit, NO dirty data blocks amd bmap is NOT dirty");
             let segid = self.inode().get_last_seq();
-            return Ok((segid, DirtyDataBlocks { inner: None, owned: None }));
+            return Ok((segid.as_cno(), DirtyDataBlocks { inner: None, owned: None }));
         }
         Ok((0, dirty_data_blocks))
     }}
@@ -638,7 +644,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // prepare inode
         let b = self.bmap_get_raw();
         let mut raw_inode = self.inode().to_raw(b);
-        raw_inode.i_last_cno = segid;
+        raw_inode.i_last_cno = segid.as_cno();
         // TODO: calc segment checksum
         segwr.realize_ss(0, &raw_inode);
 
@@ -764,7 +770,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if segid > 0 {
             self.flush_timing().flush_count.fetch_add(1, Ordering::Relaxed);
-            return Ok(segid);
+            return Ok(SegmentId::new_from_cno(segid));
         }
         // Seal the log group before the segment exists, so a crash between the
         // two leaves a complete group to replay rather than an unpublished
@@ -777,7 +783,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let _start = Instant::now();
         segwr.done().await?;
         // update last cno in memory after segment write out
-        self.inode_mut().set_last_cno(segid);
+        self.inode_mut().set_last_cno(segid.as_cno());
         self.flush_timing().segment_done_ns.fetch_add(
             _start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
@@ -821,7 +827,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             self.wal_drop_superseded_prefixes(segid);
         }
 
-        Ok(self.inode().get_last_ondisk_cno())
+        Ok(SegmentId::new_from_cno(self.inode().get_last_ondisk_cno()))
     }}
 
     #[cfg(all(feature = "wal", feature = "reactor"))]
@@ -849,13 +855,13 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // mount after a crash pays what these flushes did not.
         if self.wal_may_defer_publish() {
             let segid = self.inode().get_last_seq();
-            self.inode_mut().set_last_seq(segid + 1);
+            self.inode_mut().set_last_seq(segid.next());
             self.wal_count_deferred_barrier();
             self.set_last_flush();
             let last_cno = self.inode().get_last_cno();
             self.flush_unlock(lock);
             debug!("flush satisfied by the log, checkpoint deferred; last published {}", last_cno);
-            return Ok(last_cno);
+            return Ok(SegmentId::new_from_cno(last_cno));
         }
 
         let (segid, dirty_data_blocks) = match self.flush_process_pre_build_segment().await {
@@ -866,7 +872,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             // manually unlock
             self.set_last_flush();
             self.flush_unlock(lock);
-            return Ok(segid);
+            return Ok(SegmentId::new_from_cno(segid));
         }
         let (segwr, segid, raw_inode, dirty_meta_vec) = match self.flush_process_build_segment(dirty_data_blocks).await {
             Ok((segwr, segid, raw_inode, dirty_meta_vec)) => (segwr, segid, raw_inode, dirty_meta_vec),
@@ -902,7 +908,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
                 },
             }
         });
-        self.inode_mut().set_last_cno(segid);
+        self.inode_mut().set_last_cno(segid.as_cno());
         self.inode_mut().clear_attr_dirty();
 
         // start to cleanup
@@ -926,7 +932,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let _ = _start.elapsed();
         let _ = fn_start.elapsed();
         // return cno in inode memory instead cno on disk
-        Ok(self.inode().get_last_cno())
+        Ok(SegmentId::new_from_cno(self.inode().get_last_cno()))
     }}
 
     #[cfg(all(feature = "wal", feature = "blocking"))]
@@ -961,7 +967,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         let od_state = join.await??;
 
-        self.inode_mut().set_last_cno(segid);
+        self.inode_mut().set_last_cno(segid.as_cno());
         self.inode_mut().clear_attr_dirty();
         self.inode_mut().set_ondisk_state(od_state);
         let last_cno = self.inode().get_last_cno();
@@ -984,7 +990,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         let _ = _start.elapsed();
         let _ = fn_start.elapsed();
-        Ok(self.inode().get_last_ondisk_cno())
+        Ok(SegmentId::new_from_cno(self.inode().get_last_ondisk_cno()))
     }}
 
     // flush out dirty data
@@ -1008,8 +1014,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
                 self.inode_mut().set_last_ondisk_cno(last_cno);
             }
             debug!("flush quit, NO dirty data blocks amd bmap is NOT dirty");
-            let segid = self.inode().get_last_seq();
-            return Ok(segid);
+            return Ok(self.inode().get_last_seq());
         }
 
         // prepare for a segment
@@ -1075,7 +1080,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         // prepare inode
         let b = self.bmap_get_raw();
         let mut raw_inode = self.inode().to_raw(b);
-        raw_inode.i_last_cno = segid;
+        raw_inode.i_last_cno = segid.as_cno();
         // TODO: calc segment checksum
         segwr.realize_ss(0, &raw_inode);
 
@@ -1092,7 +1097,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         let _start = Instant::now();
         segwr.done().await?;
         // update last cno in memory after segment write out
-        self.inode_mut().set_last_cno(segid);
+        self.inode_mut().set_last_cno(segid.as_cno());
         let _ = _start.elapsed();
 
         // flush inode after writeout segment
@@ -1121,7 +1126,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         let _ = _start.elapsed();
         let _ = fn_start.elapsed();
-        Ok(self.inode().get_last_ondisk_cno())
+        Ok(SegmentId::new_from_cno(self.inode().get_last_ondisk_cno()))
     }}
 
     fn flush(&mut self) -> impl Future<Output = Result<SegmentId>> {async {

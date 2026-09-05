@@ -1924,7 +1924,7 @@ impl<'a: 'static> Task<FileContext<'a>> for Hyper<'a>
                 // is dirty) — fdatasync is allowed to skip.
                 if self.inner.dirty_block_count() == 0 && !self.inner.is_bmap_dirty() {
                     let cno = self.inner.in_memory_last_ondisk_cno();
-                    let _ = resp.to_flush().send(Ok(cno));
+                    let _ = resp.to_flush().send(Ok(SegmentId::new_from_cno(cno)));
                     return;
                 }
                 // Otherwise fdatasync collapses to fsync — we
@@ -2231,8 +2231,8 @@ mod tests {
             let (req, resp) = ctx.take();
             assert!(matches!(req.op, FileReqOp::Flush));
             let _body = ManuallyDrop::into_inner(unsafe { req.body.flush });
-            resp.to_flush().send(Ok(7)).unwrap();
-            assert_eq!(rx.await.unwrap().unwrap(), 7);
+            resp.to_flush().send(Ok(SegmentId::new(7))).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), SegmentId::new(7));
         });
     }
 
@@ -2246,8 +2246,8 @@ mod tests {
             let (req, resp) = ctx.take();
             assert!(matches!(req.op, FileReqOp::Release));
             let _body = ManuallyDrop::into_inner(unsafe { req.body.release });
-            resp.to_release().send(Ok(99)).unwrap();
-            assert_eq!(rx.await.unwrap().unwrap(), 99);
+            resp.to_release().send(Ok(SegmentId::new(99))).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), SegmentId::new(99));
         });
     }
 
@@ -2402,8 +2402,8 @@ mod tests {
             let (req2, resp2) = ctx2.take();
             assert!(matches!(req2.op, FileReqOp::Flush));
             let _body2 = ManuallyDrop::into_inner(unsafe { req2.body.flush });
-            resp2.to_flush().send(Ok(5)).unwrap();
-            assert_eq!(rx.await.unwrap().unwrap(), 5);
+            resp2.to_flush().send(Ok(SegmentId::new(5))).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), SegmentId::new(5));
         });
     }
 
@@ -2420,8 +2420,8 @@ mod tests {
             let (req2, resp2) = ctx2.take();
             assert!(matches!(req2.op, FileReqOp::Release));
             let _body2 = ManuallyDrop::into_inner(unsafe { req2.body.release });
-            resp2.to_release().send(Ok(11)).unwrap();
-            assert_eq!(rx.await.unwrap().unwrap(), 11);
+            resp2.to_release().send(Ok(SegmentId::new(11))).unwrap();
+            assert_eq!(rx.await.unwrap().unwrap(), SegmentId::new(11));
         });
     }
 

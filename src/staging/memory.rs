@@ -54,7 +54,8 @@ use crate::staging::{Staging, StagingIntercept};
 /// The bytes, shared by every clone of a handle.
 #[derive(Default, Debug)]
 struct MemoryStore {
-    /// Whole segment objects, keyed the way staging keys them.
+    /// Segment objects, keyed the way staging names them: a checkpoint written
+    /// as one object has `None`, and one streamed as several has a part each.
     segments: BTreeMap<SegmentId, Vec<u8>>,
     /// The inode object, absent until the first flush.
     inode: Option<Vec<u8>>,
@@ -292,7 +293,7 @@ impl Staging<MemoryBlockLoader<BlockPtr>> for MemoryStaging {
     }
 
     async fn load_inode_from_segment(&self, buf: &mut [u8], segid: SegmentId) -> Result<Option<OnDiskState>> {
-        if segid == 0 {
+        if segid.as_cno() == 0 {
             return self.load_inode(buf).await;
         }
         let inode_off = std::mem::offset_of!(SegmentHeader, s_inode);
@@ -302,7 +303,16 @@ impl Staging<MemoryBlockLoader<BlockPtr>> for MemoryStaging {
                 format!("inode read of {} bytes exceeds the {} an inode occupies", buf.len(), inode_bytes)));
         }
         let start = std::time::Instant::now();
-        let res = self.store.read().unwrap().read_at(segid, inode_off, buf);
+        // See the S3 staging: which name holds the inode is recorded in the
+        // inode, so both are tried.
+        let res = {
+            let store = self.store.read().unwrap();
+            let mut r = store.read_at(segid.at_part(crate::segment::Segment::SUMMARY_PART), inode_off, buf);
+            if r.is_err() {
+                r = store.read_at(segid.whole(), inode_off, buf);
+            }
+            r
+        };
         self.read_timing.add_inode_get(start.elapsed().as_nanos() as u64);
         res?;
         Ok(None)
@@ -310,9 +320,10 @@ impl Staging<MemoryBlockLoader<BlockPtr>> for MemoryStaging {
 
     async fn load_segment_timestamp(&self, segid: SegmentId) -> Result<(i64, i64)> {
         let store = self.store.read().unwrap();
-        let Some(ts) = store.timestamps.get(&segid) else {
+        let Some(ts) = store.timestamps.get(&segid.at_part(crate::segment::Segment::SUMMARY_PART))
+            .or_else(|| store.timestamps.get(&segid.whole())) else {
             return Err(Error::new(ErrorKind::NotFound,
-                format!("segment {} does not exist in memory staging", segid)));
+                format!("checkpoint {} does not exist in memory staging", segid)));
         };
         // Server time and last-modified are the same clock here, which is
         // the degenerate case of what S3 reports.
@@ -447,7 +458,14 @@ impl SegmentReadWrite for MemoryStaging {
         // Same contract as the S3 listing: segment ids at or above
         // `segid`, ascending. `BTreeMap` keeps them ordered already.
         let store = self.store.read().unwrap();
-        Ok(store.segments.keys().copied().filter(|s| *s >= segid).collect())
+        {
+            // Checkpoint ids, so a streamed one counts once however many objects
+            // it was written as.
+            let mut v: Vec<SegmentId> = store.segments.keys()
+                .map(|o| o.whole()).filter(|s| *s >= segid.whole()).collect();
+            v.dedup();
+            Ok(v)
+        }
     }
 
     async fn build_block_map(&self, segid: SegmentId) -> Result<Vec<(BlockIndex, BlockPtr)>> {

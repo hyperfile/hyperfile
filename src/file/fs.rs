@@ -176,7 +176,10 @@ impl<'a: 'static> Hyper<'a> {
     pub async fn fs_release(&mut self) -> Result<u64>
     {
         debug!("fs_release - ");
-        self.inner.release().await
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId` so it cannot be mistaken for a length or an offset.
+        Ok(self.inner.release().await?.as_cno())
     }
 
     /// Read `buf.len()` bytes from `off`, returning the number of
@@ -372,7 +375,10 @@ impl<'a: 'static> Hyper<'a> {
     pub async fn fs_commit_txn(&mut self) -> Result<u64>
     {
         debug!("fs_commit_txn - ");
-        self.inner.commit_txn().await
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId` so it cannot be mistaken for a length or an offset.
+        Ok(self.inner.commit_txn().await?.as_cno())
     }
 
     /// Abandon the open transaction, discarding its writes. See
@@ -434,8 +440,10 @@ impl<'a: 'static> Hyper<'a> {
 
     pub async fn fs_flush(&mut self) -> Result<u64>
     {
-        debug!("fs_flush - ");
-        self.inner.flush_with_rollback().await
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId`, so it cannot be mistaken for a length or an offset.
+        Ok(self.inner.flush_with_rollback().await?.as_cno())
     }
 
     /// POSIX-`fdatasync` flavoured flush. Persists pending data
@@ -451,7 +459,10 @@ impl<'a: 'static> Hyper<'a> {
     pub async fn fs_fdatasync(&mut self) -> Result<u64>
     {
         debug!("fs_fdatasync - ");
-        self.inner.flush_data().await
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId` so it cannot be mistaken for a length or an offset.
+        Ok(self.inner.flush_data().await?.as_cno())
     }
 
     pub async fn fs_truncate(&mut self, offset: usize) -> Result<()>

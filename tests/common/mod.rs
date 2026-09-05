@@ -22,7 +22,6 @@ use hyperfile::file::hyper::Hyper;
 use hyperfile::inode::FlushInodeFlag;
 use hyperfile::staging::StagingIntercept;
 use hyperfile::staging::s3::S3Staging;
-use hyperfile::SegmentId;
 
 pub fn test_bucket() -> String {
     std::env::var("HYPERFILE_TEST_BUCKET").unwrap_or_else(|_| {
@@ -245,7 +244,7 @@ impl StagingIntercept<S3Staging> for AlwaysFailSegmentDone {
     fn before_segment_done(
         &self,
         _staging: &S3Staging,
-        _segid: SegmentId,
+        _obj: hyperfile::SegmentId,
         _buf: &[u8],
         _len: usize,
     ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + '_ + Send>> {

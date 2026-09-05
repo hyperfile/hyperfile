@@ -97,7 +97,7 @@ async fn write_flush_reopen_round_trip() {
     assert_eq!(staging.segment_count(), 0, "no segment until the first flush");
 
     let segid = file.flush().await.expect("flush");
-    assert!(segid > 0, "flush should produce a segment id");
+    assert!(segid.as_cno() > 0, "flush should produce a segment id");
     assert!(staging.has_inode(), "the flush should have written an inode");
     assert_eq!(staging.segment_count(), 1, "one flush, one segment");
 

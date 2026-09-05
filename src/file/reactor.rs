@@ -5,7 +5,8 @@ use log::{debug, warn};
 use btree_ondisk::{BlockLoader, NodeCache};
 use tokio::task::JoinHandle;
 use tokio::sync::Semaphore;
-use crate::{BlockIndex, BlockPtr, BlockIndexIter, SegmentId};
+use crate::{BlockIndex, BlockPtr, BlockIndexIter};
+use crate::SegmentId;
 use crate::staging::Staging;
 use crate::segment::SegmentReadWrite;
 use crate::file::HyperTrait;
@@ -46,7 +47,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
-            if segid > self.inode().get_last_ondisk_cno() {
+            // Only for a checkpoint written as one object; see the same guard on
+            // the read path.
+            if !segid.is_parted() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
@@ -61,7 +64,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     // there rather than treating a finished flush as a bug.
                     let copied = {
                         let lock = flushing_segments.read().await;
-                        match lock.get(&segid).and_then(|weak_data| weak_data.upgrade()) {
+                        match lock.get(&segid.whole()).and_then(|weak_data| weak_data.upgrade()) {
                             Some(data) => {
                                 let start_off = staging_off + offset;
                                 let end = start_off + data_buf.len();
@@ -73,7 +76,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     };
                     let len = data_buf.len();
                     if !copied {
-                        debug!("write retrieve - segid {} no longer held in memory, reading it from staging", segid);
+                        debug!("write retrieve - checkpoint {} no longer held in memory, reading it from staging", segid.seq_id());
                         staging.load_data_block(segid, staging_off, offset, data_block_size, data_buf).await?;
                     }
                     Ok(len)
@@ -373,7 +376,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 match op {
                     ReadOp::Cache { .. } | ReadOp::Zero { .. } => {},
                     #[cfg(feature = "wal")]
-                    ReadOp::Inmem { segid, s3_off, dst_len: _ } => ops.push((segid, s3_off, consumed, dst_len)),
+                    ReadOp::Inmem { segid, s3_off, dst_len: _ } => ops.push((segid.whole(), s3_off, consumed, dst_len)),
                     ReadOp::Range { segid, s3_off, dst_len: _ } => ops.push((segid, s3_off, consumed, dst_len)),
                 }
                 consumed += dst_len;
@@ -399,7 +402,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         {
                             let copied = {
                                 let lock = flushing_segments.read().await;
-                                match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                                match lock.get(&segid.whole()).and_then(|weak| weak.upgrade()) {
                                     Some(data) => {
                                         buf[dst_off..dst_off + len]
                                             .copy_from_slice(&data[src_off..src_off + len]);
@@ -523,7 +526,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             match op {
                 ReadOp::Cache { .. } | ReadOp::Zero { .. } => {},
                 #[cfg(feature = "wal")]
-                ReadOp::Inmem { segid, s3_off, dst_len: _ } => work.push((segid, s3_off, consumed, dst_len)),
+                ReadOp::Inmem { segid, s3_off, dst_len: _ } => work.push((segid.whole(), s3_off, consumed, dst_len)),
                 ReadOp::Range { segid, s3_off, dst_len: _ } => work.push((segid, s3_off, consumed, dst_len)),
             }
             consumed += dst_len;
@@ -549,7 +552,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     // A segment still being written out is in memory.
                     let copied = {
                         let lock = flushing_segments.read().await;
-                        match lock.get(&segid).and_then(|weak| weak.upgrade()) {
+                        match lock.get(&segid.whole()).and_then(|weak| weak.upgrade()) {
                             Some(data) => {
                                 buf[dst_off..dst_off + len]
                                     .copy_from_slice(&data[src_off..src_off + len]);
@@ -778,7 +781,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                         };
                         if !copied {
                             debug!("read - segid {} no longer held in memory, reading it from staging", segid);
-                            staging.load_range(segid, s3_off, data_buf).await?;
+                            staging.load_range(segid.whole(), s3_off, data_buf).await?;
                         }
                         Ok(len)
                     });
@@ -1354,13 +1357,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Ok(false);
         }
         let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
-        if segid <= self.inode().get_last_ondisk_cno() {
+        if segid.as_cno() <= self.inode().get_last_ondisk_cno() {
             // Already written out, so reading it means an object request.
+            return Ok(false);
+        }
+        if segid.is_parted() {
+            // A streamed checkpoint keeps no data in memory: its parts are on
+            // storage before any pointer to them resolves. See the same guard on
+            // the write path.
             return Ok(false);
         }
         let flushing_segments = self.flushing_segments.clone();
         let lock = flushing_segments.read().await;
-        let Some(data) = lock.get(&segid).and_then(|weak| weak.upgrade()) else {
+        let Some(data) = lock.get(&segid.whole()).and_then(|weak| weak.upgrade()) else {
             // The upload finished and the buffer went with it.
             return Ok(false);
         };

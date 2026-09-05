@@ -160,9 +160,13 @@ impl<'a: 'static> HyperFileHandler<'a> {
 
     pub async fn fh_release(&mut self) -> Result<u64>
     {
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId`, so it cannot be mistaken for a length or an offset.
         let (ctx, rx) = FileContext::new_release(self.inner.clone());
         self.inner.send(ctx)?;
-        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+        Ok(rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+            "reactor handler task died"))??.as_cno())
     }
 
     /// Read `buf.len()` bytes from `off`, returning the number of
@@ -261,9 +265,13 @@ impl<'a: 'static> HyperFileHandler<'a> {
 
     pub async fn fh_flush(&mut self) -> Result<u64>
     {
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId`, so it cannot be mistaken for a length or an offset.
         let (ctx, rx) = FileContext::new_flush(self.inner.clone());
         self.inner.send(ctx)?;
-        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+        Ok(rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+            "reactor handler task died"))??.as_cno())
     }
 
     /// POSIX-`fdatasync` flavoured flush. See
@@ -271,9 +279,13 @@ impl<'a: 'static> HyperFileHandler<'a> {
     /// write entirely when only attrs are dirty.
     pub async fn fh_fdatasync(&mut self) -> Result<u64>
     {
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId`, so it cannot be mistaken for a length or an offset.
         let (ctx, rx) = FileContext::new_flush_data(self.inner.clone());
         self.inner.send(ctx)?;
-        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+        Ok(rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+            "reactor handler task died"))??.as_cno())
     }
 
     pub async fn fh_truncate(&mut self, offset: usize) -> Result<()>
@@ -780,9 +792,13 @@ impl<'a: 'static> HyperFileHandler<'a> {
     #[cfg(feature = "wal")]
     pub async fn fh_commit_txn(&mut self) -> Result<u64>
     {
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId`, so it cannot be mistaken for a length or an offset.
         let (ctx, rx) = FileContext::new_commit_txn(self.inner.clone());
         self.inner.send(ctx)?;
-        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+        Ok(rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+            "reactor handler task died"))??.as_cno())
     }
 
     /// Abandon the interval, discarding its writes. See `Hyper::abort_txn` —

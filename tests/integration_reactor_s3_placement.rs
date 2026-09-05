@@ -192,7 +192,7 @@ async fn a_run_longer_than_the_budget_splits() {
     // split only by the budget, which is what makes this case distinct.
     let gets_only: Vec<_> = plan.iter().filter(|e| e.is_get()).collect();
     if let [PlannedRead::Get { segid: s0, .. }, PlannedRead::Get { segid: s1, .. }] = gets_only[..2] {
-        assert_eq!(s0, s1, "one flush, so one segment");
+        assert_eq!(s0, s1, "one flush, so one object");
     }
 
     let mut buf = vec![0u8; SZ];

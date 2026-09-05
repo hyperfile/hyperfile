@@ -147,9 +147,13 @@ impl<'a: 'static> HyperFileTokio<'a> {
     }
 
     pub async fn flush_ext(&self) -> Result<u64> {
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId`, so it cannot be mistaken for a length or an offset.
         let (ctx, rx) = FileContext::new_flush(self.inner.clone());
         self.inner.send(ctx)?;
-        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+        Ok(rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+            "reactor handler task died"))??.as_cno())
     }
 
     /// POSIX-`fdatasync` flavoured flush — see
@@ -157,9 +161,13 @@ impl<'a: 'static> HyperFileTokio<'a> {
     /// extension method on top of the tokio AsyncWrite/AsyncRead
     /// surface.
     pub async fn fdatasync_ext(&self) -> Result<u64> {
+        // The public surface answers in checkpoint numbers: that is what a caller
+        // pins, logs, and hands back to `open_cno`. Inside, the same value is a
+        // `SegmentId`, so it cannot be mistaken for a length or an offset.
         let (ctx, rx) = FileContext::new_flush_data(self.inner.clone());
         self.inner.send(ctx)?;
-        rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reactor handler task died"))?
+        Ok(rx.await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+            "reactor handler task died"))??.as_cno())
     }
 
     pub async fn write_zero(&mut self, len: usize) -> Result<usize> {

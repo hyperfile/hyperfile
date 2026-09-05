@@ -83,6 +83,8 @@ pub(crate) enum ReadOp {
     /// Coalesced ranged GET against the staging segment. May
     /// cover multiple consecutive blocks.
     Range {
+        /// Which object. A request cannot span two, so this is part of what
+        /// decides whether consecutive blocks coalesce.
         segid: SegmentId,
         s3_off: usize,
         dst_len: usize,
@@ -329,7 +331,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let res_inode = if cno == 0 {
             staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await
         } else {
-            staging.load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), cno as SegmentId).await
+            staging.load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), SegmentId::new_from_cno(cno)).await
         };
         match res_inode {
             Ok(od_state) => {
@@ -451,7 +453,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 // a trigger reading it concludes there is nothing to recover
                 // while the records are still sitting there.
                 let last_ondisk = file.inode().get_last_ondisk_cno();
-                if wal_max_segid >= last_ondisk {
+                if wal_max_segid.as_cno() >= last_ondisk {
                     warn!("wal holds checkpoints up to {} at or beyond the last one \
                           on disk ({}), recovering", wal_max_segid, last_ondisk);
                     let lock = file.flush_lock().await;
@@ -481,7 +483,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 // which a session that published nothing does not advance.
                 let last_seq = file.inode().get_last_seq();
                 if wal_max_segid >= last_seq {
-                    let next = wal_max_segid + 1;
+                    let next = wal_max_segid.next();
                     warn!("wal holds checkpoints up to {} that were not applied; \
                           starting this session at {} so its records do not join \
                           them", wal_max_segid, next);
@@ -508,7 +510,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // safe but leaves no way to close such a handle cleanly — and rests on
         // a conflict being detected rather than on not writing.
         let segid = if self.flags.is_rdonly() {
-            self.inode().get_last_cno()
+            SegmentId::new_from_cno(self.inode().get_last_cno())
         } else {
             // Closing publishes, whatever `publish_every` says. Deferring is a
             // bet that another flush is coming; on the way out there is not
@@ -1050,7 +1052,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     };
                     if !copied {
                         // The flush landed, so the same bytes are on staging.
-                        self.staging.load_range(segid, s3_off, &mut buf[consumed..consumed + dst_len]).await?;
+                        self.staging.load_range(segid.whole(), s3_off, &mut buf[consumed..consumed + dst_len]).await?;
                         self.staging.read_timing().add_read_ahead_get(dst_len);
                     }
                     fetched.push((consumed, dst_len));
@@ -1160,7 +1162,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     };
                     if !copied {
                         debug!("read - segid {} no longer held in memory, reading it from staging", segid);
-                        self.staging.load_range(segid, s3_off, this).await?;
+                        self.staging.load_range(segid.whole(), s3_off, this).await?;
                     }
                 }
                 ReadOp::Range { segid, s3_off, dst_len: _ } => {
@@ -1340,8 +1342,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let mut current_range: Option<(SegmentId, usize, usize)> = None;
         let flush_range = |ops: &mut Vec<ReadOp>,
                            current_range: &mut Option<(SegmentId, usize, usize)>| {
-            if let Some((seg, off, len)) = current_range.take() {
-                ops.push(ReadOp::Range { segid: seg, s3_off: off, dst_len: len });
+            if let Some((segid, off, len)) = current_range.take() {
+                ops.push(ReadOp::Range { segid, s3_off: off, dst_len: len });
             }
         };
 
@@ -1402,8 +1404,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 // coalescing.
                 #[cfg(feature = "wal")]
                 let is_inflight = self.wal.is_some()
+                    && !segid.is_parted()
                     && self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()
-                    && segid > self.inode().get_last_ondisk_cno();
+                    && segid.as_cno() > self.inode().get_last_ondisk_cno();
                 #[cfg(not(feature = "wal"))]
                 let is_inflight = false;
 
@@ -1411,7 +1414,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     flush_range(&mut ops, &mut current_range);
                     #[cfg(feature = "wal")]
                     ops.push(ReadOp::Inmem {
-                        segid,
+                        segid: segid.whole(),
                         s3_off: staging_off + block_off,
                         dst_len,
                     });
@@ -1423,16 +1426,19 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 } else {
                     let s3_off = staging_off + block_off;
                     let extended = match &current_range {
-                        Some((cur_seg, cur_off, cur_len)) => {
-                            *cur_seg == segid
+                        // Same object, adjacent, and still under the cap. Two
+                        // parts of one checkpoint are two objects, so a range
+                        // never spans them however adjacent the offsets look.
+                        Some((cur_obj, cur_off, cur_len)) => {
+                            *cur_obj == segid
                                 && cur_off + cur_len == s3_off
                                 && cur_len + dst_len <= max_get
                         }
                         None => false,
                     };
                     if extended {
-                        let (seg, off, len) = current_range.take().unwrap();
-                        current_range = Some((seg, off, len + dst_len));
+                        let (segid, off, len) = current_range.take().unwrap();
+                        current_range = Some((segid, off, len + dst_len));
                     } else {
                         flush_range(&mut ops, &mut current_range);
                         current_range = Some((segid, s3_off, dst_len));
@@ -2302,7 +2308,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             // Inode may still be attr-dirty, but `fdatasync` is
             // explicitly allowed to skip persisting attr-only
             // changes. Return the last persisted cno unchanged.
-            return Ok(self.inode.get_last_ondisk_cno());
+            return Ok(SegmentId::new_from_cno(self.inode.get_last_ondisk_cno()));
         }
         self.flush_with_rollback().await
     }
@@ -2391,7 +2397,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub(crate) async fn wal_flush_done(&mut self, lock: OwnedMutexGuard<()>, segid: SegmentId, od_state: OnDiskState, bmap_cache_limit: usize) {
         self.inode_mut().set_ondisk_state(Some(od_state));
         let last_cno = self.inode().get_last_cno();
-        assert!(last_cno == segid);
+        assert!(last_cno == segid.as_cno());
         self.inode_mut().set_last_ondisk_cno(last_cno);
         self.wal_clear_mem_segment(segid).await;
         // Fire-and-forget delete of the persisted WAL objects.
@@ -2516,7 +2522,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                 // does not have to say it as well.
                 Ok(cno) => {
                     self.flush_unlock(lock);
-                    if cno == 0 {
+                    if cno.as_cno() == 0 {
                         debug!("wal_flush_recovery - nothing to apply");
                     }
                     return Ok(cno);
@@ -2554,7 +2560,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let v = self.wal_list_segments().await?;
         let last_ondisk = self.inode().get_last_ondisk_cno();
         // filter out candidate segment id to playback
-        let mut segids: Vec<_> = v.into_iter().filter(|id| *id >= last_ondisk).collect();
+        let mut segids: Vec<_> = v.into_iter().filter(|id| id.as_cno() >= last_ondisk).collect();
         segids.sort();
         debug!("do_wal_flush_recovery - replay segments {:?}", segids);
 
@@ -2567,7 +2573,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             records_dropped: 0,
         };
 
-        let mut cno = 0;
+        let mut cno = SegmentId::new(0);
         let mut stopped_at: Option<SegmentId> = None;
         let mut skipped: Vec<SegmentId> = Vec::new();
         let mut last_applied_sealed = true;
@@ -2677,7 +2683,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     //
                     // What has to be true is that the floor moved forward, or
                     // the next open finds the same work waiting.
-                    assert!(c > last_ondisk,
+                    assert!(c.as_cno() > last_ondisk,
                         "replay of {} produced {}, which is not past the floor \
                          recovery started from ({})", segid, c, last_ondisk);
                     cno = c;
@@ -2693,7 +2699,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
                     // and only the inode did not.
                     warn!("do_wal_flush_recovery - checkpoint {} is already on \
                           storage, skipping its replay: {}", segid, e);
-                    cno = segid + 1;
+                    cno = segid.next();
                     // The log entries for it are redundant now, exactly as
                     // they are after a replay that did the work. Without this
                     // every open would list them again and repeat the skip.
@@ -2730,7 +2736,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // construction. Otherwise it depends on the last group applied.
         let all_sealed = stopped_at.is_some() || last_applied_sealed;
         self.wal_recovery_report = WalRecoveryReport {
-            replayed: cno != 0,
+            replayed: cno.as_cno() != 0,
             landed_on_barrier: all_sealed,
             records_dropped: dropped,
         };
@@ -3161,13 +3167,17 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
-            if segid > self.inode().get_last_ondisk_cno() {
+            // Only for a checkpoint written as one object. A streamed one has
+            // its data parts on storage before any pointer to them resolves, and
+            // the buffer held in memory for it carries the summary and metadata
+            // only — copying data out of it would return the wrong bytes.
+            if !segid.is_parted() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
                 let copied = {
                     let lock = self.flushing_segments.read().await;
-                    match lock.get(&segid).and_then(|weak_data| weak_data.upgrade()) {
+                    match lock.get(&segid.whole()).and_then(|weak_data| weak_data.upgrade()) {
                         Some(data) => {
                             let start_off = staging_off + offset;
                             let end = start_off + data_buf.len();
@@ -3183,7 +3193,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 // The flush landed on the way here, so the pinned buffer is
                 // gone and the segment is on staging. Fall through and read
                 // it from there: a flush completing is not a failure.
-                debug!("segid {} no longer held in memory, reading it from staging", segid);
+                debug!("segment {} no longer held in memory, reading it from staging", segid.seq_id());
             }
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
@@ -3207,13 +3217,17 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         #[cfg(feature = "wal")]
         if self.wal.is_some() && BlockPtrFormat::is_on_staging(&blk_ptr) && (self.inode().get_last_cno() > self.inode().get_last_ondisk_cno()) {
             let (segid, staging_off) = self.blk_ptr_decode(&blk_ptr);
-            if segid > self.inode().get_last_ondisk_cno() {
+            // Only for a checkpoint written as one object. A streamed one has
+            // its data parts on storage before any pointer to them resolves, and
+            // the buffer held in memory for it carries the summary and metadata
+            // only — copying data out of it would return the wrong bytes.
+            if !segid.is_parted() && segid.as_cno() > self.inode().get_last_ondisk_cno() {
                 let data_buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
                 };
                 let copied = {
                     let lock = self.flushing_segments.read().await;
-                    match lock.get(&segid).and_then(|weak_data| weak_data.upgrade()) {
+                    match lock.get(&segid.whole()).and_then(|weak_data| weak_data.upgrade()) {
                         Some(data) => {
                             let start_off = staging_off + offset;
                             let end = start_off + data_buf.len();
@@ -3229,7 +3243,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
                 // The flush landed on the way here, so the pinned buffer is
                 // gone and the segment is on staging. Fall through and read
                 // it from there: a flush completing is not a failure.
-                debug!("segid {} no longer held in memory, reading it from staging", segid);
+                debug!("segment {} no longer held in memory, reading it from staging", segid.seq_id());
             }
         }
         if BlockPtrFormat::is_on_staging(&blk_ptr) {
@@ -3469,9 +3483,14 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
         } else if BlockPtrFormat::is_zero_block(blk_ptr) {
             return format!("[Zero Block]");
         } else if BlockPtrFormat::is_on_staging(blk_ptr) {
-            let (id, off) = self.blk_ptr_decode(blk_ptr);
-            let group_id = BlockPtrFormat::decode_micro_group_id(blk_ptr);
-            return format!("[Staging: id {} - offset {} - group {}]", id, off, group_id);
+            let (segid, off) = self.blk_ptr_decode(blk_ptr);
+            return match segid.part_id() {
+                Some(_) => format!("[Staging: id {} - offset {}]", segid, off),
+                None => {
+                    let group_id = BlockPtrFormat::decode_micro_group_id(blk_ptr);
+                    format!("[Staging: id {} - offset {} - group {}]", segid, off, group_id)
+                },
+            };
         } else {
             return format!("[Unkown: 0x{:x}]", blk_ptr);
         }

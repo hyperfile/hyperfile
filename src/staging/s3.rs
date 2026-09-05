@@ -36,6 +36,36 @@ pub struct S3Staging {
     pub read_timing: Arc<ReadTiming>,
 }
 
+impl S3Staging {
+    /// The object names a checkpoint's summary could carry, in the order to try.
+    ///
+    /// A streamed checkpoint keeps its summary in part 0; one written as a single
+    /// object has no part suffix at all. Which of the two a container uses is
+    /// recorded in the inode — so a reader looking *for* the inode cannot know
+    /// first, and has to try both.
+    ///
+    /// Unsuffixed comes first so that a container written before parting existed
+    /// costs exactly what it always did. A streamed one pays one extra request,
+    /// and only on the two paths that read a checkpoint's header rather than its
+    /// data: opening a specific checkpoint, and asking a checkpoint's timestamp.
+    fn candidate_summary_objs(&self, segid: SegmentId) -> [SegmentId; 2] {
+        [segid.whole(), segid.at_part(crate::segment::Segment::SUMMARY_PART)]
+    }
+
+    /// Which of the two names actually exists, or the best guess when neither
+    /// answers — the caller reports the failure that follows.
+    async fn probe_summary_obj(&self, segid: SegmentId) -> SegmentId {
+        let candidates = self.candidate_summary_objs(segid);
+        for segid in candidates {
+            let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
+            if self.client.head_object().bucket(&self.bucket).key(&key).send().await.is_ok() {
+                return segid;
+            }
+        }
+        candidates[0]
+    }
+}
+
 impl Staging<S3BlockLoader> for S3Staging {
     fn to_block_loader(&self) -> S3BlockLoader {
         S3BlockLoader::new(&self.client, &self.bucket, &self.root_path, self.read_timing.clone())
@@ -53,17 +83,29 @@ impl Staging<S3BlockLoader> for S3Staging {
     }
 
     async fn load_inode_from_segment(&self, buf: &mut [u8], segid: SegmentId) -> Result<Option<OnDiskState>> {
-        if segid == 0 {
+        if segid.as_cno() == 0 {
             // read from latest inode
             return self.load_inode(buf).await;
         }
 
-        let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
         let inode_off = std::mem::offset_of!(SegmentHeader, s_inode);
         let inode_bytes = std::mem::size_of::<InodeRaw>();
         let range = format!("bytes={}-{}", inode_off, inode_off + inode_bytes - 1);
         let start = std::time::Instant::now();
-        let res = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await;
+        // Which name holds the inode depends on whether the container streams its
+        // checkpoints, and that is recorded *in the inode being read* — so it
+        // cannot be known first. Both names are tried. The caller's configured
+        // format only decides which to try first, which is why a stale one costs
+        // a request and never a wrong answer.
+        let mut res = Err(Error::new(ErrorKind::NotFound, "no name tried"));
+        for segid in self.candidate_summary_objs(segid) {
+            let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
+            res = S3Ops::do_get_object(&self.client, &self.bucket, &key, buf, Some(&range), false).await;
+            match &res {
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                _ => break,
+            }
+        }
         self.read_timing.add_inode_get(start.elapsed().as_nanos() as u64);
         res
     }
@@ -108,7 +150,9 @@ impl Staging<S3BlockLoader> for S3Staging {
         }
 
         let server_datetime = Arc::new(Mutex::new(0));
-        let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
+        // See `load_inode_from_segment` for why both names are tried.
+        let key = format!("{}/{}", self.root_path,
+            Segment::segid_to_staging_file_id(self.probe_summary_obj(segid).await));
 
         match self.client
             .head_object()
@@ -219,7 +263,7 @@ impl Staging<S3BlockLoader> for S3Staging {
         self.remove_inode(&None).await?;
 
         let mut delete_keys = Vec::new();
-        let filter = |obj: &Object| delete_keys.push(obj.key().unwrap().to_string());
+        let filter = |o: &Object| delete_keys.push(o.key().unwrap().to_string());
         let _ = S3Ops::do_list_objects(&self.client, &self.bucket, &self.root_path_slash, filter).await?;
         debug!("unlink - found delete keys {:?}", delete_keys);
 
@@ -455,22 +499,22 @@ impl S3Staging {
     // if input segment id is 0, return all
     pub(crate) async fn do_list(client: &Client, bucket: &str, prefix: &str, segid: SegmentId) -> Result<Vec<SegmentId>> {
         let mut output = Vec::new();
-        let filter = |obj: &Object| {
-            let key = obj.key().unwrap();
+        let filter = |o: &Object| {
+            let key = o.key().unwrap();
             let filename = if let Some((_, f)) = key.rsplit_once('/') {
                 f
             } else {
                 key
             };
             if let Ok(id) = filename.parse::<u64>() {
-                if segid == 0 || id <= segid {
+                if segid.as_cno() == 0 || id <= segid.as_cno() {
                     output.push(id)
                 }
             }
         };
         let _ = S3Ops::do_list_objects(client, bucket, prefix, filter).await?;
         output.sort();
-        Ok(output)
+        Ok(output.into_iter().map(SegmentId::new_from_cno).collect())
     }
 
     pub async fn cli_list(client: &Client, bucket: &str, prefix: &str, segid: SegmentId) -> Result<Vec<SegmentId>> {

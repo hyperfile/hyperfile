@@ -52,8 +52,10 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
     async fn read(&self, v: BlockPtr, buf: &mut [u8], user_data: u32) -> Result<Vec<(BlockPtr, Vec<u8>)>> {
         let meta_block_size = buf.len();
         let ud = BMapUserData::from_u32(user_data);
-        let (this_segid, offset) = BlockPtrFormat::decode(&v, &ud.blk_ptr_format);
-        let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(this_segid));
+        // Metadata blocks are in the summary part, so a pointer to one carries
+        // that part and the key follows it.
+        let (segid, offset) = BlockPtrFormat::decode(&v, &ud.blk_ptr_format);
+        let key = format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(segid));
 
         debug!("read meta blocks chunk from s3://{}/{} from s3", self.bucket, &key);
         // The chunk fetch issues its own requests and counts them
@@ -82,14 +84,14 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
             if node.get_level() > BTREE_NODE_LEVEL_MIN {
                 for idx in 0..node.get_nchild() {
                     let blk_ptr = *node.get_val(idx);
-                    let (segid, _) = BlockPtrFormat::decode(&blk_ptr, &ud.blk_ptr_format);
-                    // segid could be eq or lower than this_segid
-                    v_nonleaf_meta_block_ptr.push((segid, *node.get_val(idx)));
+                    let (child, _) = BlockPtrFormat::decode(&blk_ptr, &ud.blk_ptr_format);
+                    // the child's checkpoint could be at or below this one's
+                    v_nonleaf_meta_block_ptr.push((child.as_cno(), *node.get_val(idx)));
                 }
             }
 
             // rebuild bloock ptr for myself
-            let block_ptr = BlockPtrFormat::encode(this_segid, file_off, block_seq, &ud.blk_ptr_format);
+            let block_ptr = BlockPtrFormat::encode(segid, file_off, block_seq, &ud.blk_ptr_format);
             output.push((block_ptr, meta_block));
             file_off += meta_block_size;
             block_seq += 1;
@@ -113,7 +115,7 @@ impl BlockLoader<BlockPtr> for S3BlockLoader {
         }
 
         // get back segid list of this segid in backlog
-        let this_segid_backlog: Option<HashSet<BlockPtr>> = lock.remove(&this_segid);
+        let this_segid_backlog: Option<HashSet<BlockPtr>> = lock.remove(&segid.as_cno());
 
         drop(lock);
 

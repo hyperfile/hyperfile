@@ -46,7 +46,9 @@ pub struct Inode {
     i_mode: u32,
     i_flags: u32,
     i_nlink: u64,
-    pub(crate) i_last_seq: SegmentId,
+    /// The checkpoint counter, as the on-disk inode holds it. A plain number:
+    /// it is incremented and persisted, and a part has no place in it.
+    pub(crate) i_last_seq: u64,
     pub(crate) i_last_cno: u64,
     // in memory only fields
     pub(crate) i_last_ondisk_cno: u64, // tracking last cno ondisk
@@ -390,11 +392,11 @@ impl Inode {
 
     pub fn get_next_seq(&mut self) -> SegmentId {
         self.i_last_seq += 1;
-        self.i_last_seq
+        SegmentId::new_from_cno(self.i_last_seq)
     }
 
     pub fn get_last_seq(&self) -> SegmentId {
-        self.i_last_seq
+        SegmentId::new_from_cno(self.i_last_seq)
     }
 
     /// Move the sequence forward, so records written from now on belong to a
@@ -403,8 +405,8 @@ impl Inode {
     /// Only moves forward: going back would put this session's records into a
     /// namespace another session already used.
     pub fn set_last_seq(&mut self, seq: SegmentId) {
-        if seq > self.i_last_seq {
-            self.i_last_seq = seq;
+        if seq.as_cno() > self.i_last_seq {
+            self.i_last_seq = seq.as_cno();
         }
     }
 
@@ -854,10 +856,10 @@ mod tests {
     #[test]
     fn get_next_seq_increments() {
         let mut inode = Inode::default_file();
-        assert_eq!(inode.get_last_seq(), 0);
-        assert_eq!(inode.get_next_seq(), 1);
-        assert_eq!(inode.get_next_seq(), 2);
-        assert_eq!(inode.get_last_seq(), 2);
+        assert_eq!(inode.get_last_seq(), SegmentId::new(0));
+        assert_eq!(inode.get_next_seq(), SegmentId::new(1));
+        assert_eq!(inode.get_next_seq(), SegmentId::new(2));
+        assert_eq!(inode.get_last_seq(), SegmentId::new(2));
     }
 
     #[test]

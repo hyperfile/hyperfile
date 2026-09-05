@@ -20,9 +20,33 @@ use crate::segment_body::SegmentBody;
 pub struct Segment;
 
 impl Segment {
+    /// The object name for one piece of a checkpoint.
+    ///
+    /// `None` is a checkpoint written as a single object, which is every format
+    /// before parting, and it keeps the bare name it has always had — a container
+    /// written by an older build has to stay readable. `Some(p)` names one object
+    /// of a streamed checkpoint.
+    ///
+    /// `None` and `Some(0)` are deliberately different keys rather than the same
+    /// one. Sharing a name would mean a parted container and an unparted one
+    /// disagreeing about what a bare name holds, and the disagreement would only
+    /// show up as a read of the wrong bytes.
     pub fn segid_to_staging_file_id(segid: SegmentId) -> String {
-        format!("{:0>10}", segid)
+        match segid.part_id() {
+            None => format!("{:0>10}", segid.seq_id()),
+            Some(p) => format!("{:0>10}.{}", segid.seq_id(), p),
+        }
     }
+
+    /// The part every checkpoint's summary, metadata blocks and inode live in.
+    ///
+    /// Written last, because until the data parts exist there is nothing to
+    /// describe. That ordering is what makes its presence mean the stream
+    /// finished.
+    pub const SUMMARY_PART: u16 = 0;
+
+    /// Where data blocks start. Part 0 is the summary's.
+    pub const FIRST_DATA_PART: u16 = 1;
 }
 
 pub trait SegmentReadWrite {
@@ -188,6 +212,11 @@ pub struct Writer<T> {
     #[cfg(feature = "wal")]
     data: Arc<Pin<Box<Vec<u8>>>>,
     offset: usize,
+    /// Which object this writer produces.
+    ///
+    /// Unparted for a checkpoint written as one object; part 0 for a streamed
+    /// one — the writer only ever builds that one, because the data parts are
+    /// uploaded straight from the flush as they fill and never pass through here.
     segid: SegmentId,
     ss: SegmentSum,
 }
@@ -206,7 +235,7 @@ impl<T: SegmentReadWrite> Writer<T> {
         hdr.s_data_blk_shift = hyper_file_config.data_block_size.checked_ilog2().unwrap() as u8;
         hdr.s_next = 0;
         hdr.s_ino = 0;
-        hdr.s_cno = segid;
+        hdr.s_cno = segid.as_cno();
 
         Self {
             ctx: ctx,
@@ -217,7 +246,11 @@ impl<T: SegmentReadWrite> Writer<T> {
             #[cfg(feature = "wal")]
             data: Arc::new(Box::pin(Vec::with_capacity(buf_size))),
             offset: 0,
-            segid: segid,
+            segid: if hyper_file_config.block_ptr_format.is_parted() {
+                segid.at_part(Segment::SUMMARY_PART)
+            } else {
+                segid.whole()
+            },
             ss: SegmentSum {
                 hdr: hdr,
                 blocks: Vec::new(),
@@ -372,7 +405,7 @@ impl<T: SegmentReadWrite> Writer<T> {
         });
         self.offset += len;
         // NOTE:
-        // call of self.ctx.append(self.segid, buf) is removed
+        // call of self.ctx.append(self.segid.seq_id(), buf) is removed
         Ok(join)
     }
 
@@ -409,7 +442,7 @@ impl<T: SegmentReadWrite> Writer<T> {
 
     #[cfg(feature = "wal")]
     pub fn get_weak_data(&self) -> (SegmentId, Weak<Pin<Box<Vec<u8>>>>) {
-        (self.segid, Arc::downgrade(&self.data))
+        (self.segid.whole(), Arc::downgrade(&self.data))
     }
 }
 
@@ -595,8 +628,17 @@ mod tests {
 
     #[test]
     fn segid_to_staging_file_id_format() {
-        assert_eq!(Segment::segid_to_staging_file_id(1), "0000000001");
-        assert_eq!(Segment::segid_to_staging_file_id(9999999999), "9999999999");
+        assert_eq!(Segment::segid_to_staging_file_id(SegmentId::new(1)), "0000000001");
+        // Ten digits is the padding width, and a checkpoint number is a u32, so
+        // the widest one is u32::MAX. A pointer can only name 30 bits of it, so
+        // the name has room the addressing does not.
+        assert_eq!(Segment::segid_to_staging_file_id(SegmentId::new(u32::MAX)), "4294967295");
+        // A streamed checkpoint's objects, and the summary part is not the same
+        // key as an unparted checkpoint's.
+        assert_eq!(Segment::segid_to_staging_file_id(SegmentId::with_part(1, 0)), "0000000001.0");
+        assert_eq!(Segment::segid_to_staging_file_id(SegmentId::with_part(1, 7)), "0000000001.7");
+        assert_ne!(Segment::segid_to_staging_file_id(SegmentId::with_part(1, 0)),
+                   Segment::segid_to_staging_file_id(SegmentId::new(1)));
     }
 
     #[test]

@@ -57,7 +57,7 @@ async fn write_one_segment_then_open(payload_len: usize) {
         HyperFileRuntimeConfig::default(),
     ).await.expect("staging");
 
-    let ss = staging.open(1).await
+    let ss = staging.open(hyperfile::SegmentId::new_from_cno(1)).await
         .unwrap_or_else(|e| panic!("open segid 1 for a {payload_len}-byte payload: {e}"));
 
     // The summary must describe the data we just wrote.
