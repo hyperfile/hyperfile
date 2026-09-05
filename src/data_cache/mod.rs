@@ -84,6 +84,17 @@ pub(crate) trait Cache {
     fn dirty_count(&self) -> usize;
     fn get_dirty(&self) -> DirtyDataBlocks<'_>;
     fn clear_dirty(&mut self);
+
+    /// Move just these blocks out of the dirty tier, leaving the rest dirty.
+    ///
+    /// For a partial segment, which writes out part of the dirty set and keeps
+    /// accumulating. [`Self::clear_dirty`] cannot serve: it empties the tier, and
+    /// blocks written after the partial was built have to stay dirty.
+    ///
+    /// A block not in the dirty tier is skipped rather than reported, because a
+    /// caller cannot hold the tier's borrow while asking for this and so cannot
+    /// know the set is still exactly what it saw.
+    fn demote_dirty(&mut self, indexes: &[BlockIndex]);
     fn clear_data_blocks_cache(&mut self);
     fn shutdown(&self);
 }

@@ -220,6 +220,19 @@ pub struct SegmentHeader {
     s_blocks: [SegmentBlockEntryRaw; 0], // array of block index for data blocks
 }
 
+/// `s_flags`: this segment is one piece of a checkpoint that is not complete at
+/// this object.
+///
+/// Zero means a checkpoint, which is what every container written before partial
+/// segments existed carries — so the bit marks the new thing rather than the old,
+/// and an older container stays readable.
+///
+/// A partial is a complete, parseable state: it has its own summary, its own
+/// metadata blocks, and the inode inline, so walking its bmap reaches every block
+/// it and its predecessors hold. What it is not is the checkpoint the caller asked
+/// for, and nothing that resolves a checkpoint number may land on one.
+pub const SEGMENT_FLAG_PARTIAL: u16 = 0x0001;
+
 impl SegmentHeader {
     pub fn new() -> Self {
         Self {

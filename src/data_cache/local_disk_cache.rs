@@ -545,6 +545,30 @@ impl Cache for LocalDiskCache {
         }
     }
 
+    fn demote_dirty(&mut self, indexes: &[BlockIndex]) {
+        for blk_idx in indexes {
+            let Some(block) = self.data_blocks_dirty.remove(blk_idx) else {
+                // Dirtied again since the partial was built, or evicted. Either
+                // way it is not this call's business — see the trait's note.
+                continue;
+            };
+            block.clear_dirty();
+            block.unlock();
+            if self.data_cache_blocks == 0 {
+                // Same reasoning as `clear_dirty`: these bytes live in the backing
+                // file, so the slot has to go back to the pool.
+                self.release(&block);
+                continue;
+            }
+            if let Some((old_blk_idx, old)) = self.data_blocks_cache.push(*blk_idx, block) {
+                if old_blk_idx == *blk_idx {
+                    panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
+                }
+                self.release(&old);
+            }
+        }
+    }
+
     fn clear_data_blocks_cache(&mut self) {
         if self.data_cache_blocks > 0 {
             while let Some((_, block)) = self.data_blocks_cache.pop_lru() {

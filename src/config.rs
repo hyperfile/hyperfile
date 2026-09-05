@@ -172,6 +172,38 @@ pub struct HyperFileRuntimeConfig {
     /// regions are split into this-sized sub-ranges.
     #[serde(default = "default_read_get_max_bytes")]
     pub read_get_max_bytes: usize,
+
+    /// Whether this container writes partial segments when memory pressure asks
+    /// for it, instead of publishing a checkpoint nobody asked for.
+    ///
+    /// On by default, which changes nothing for a container whose format is not
+    /// [`crate::meta_format::BlockPtrFormat::PartedSegment`] — a partial segment is
+    /// addressable only under that format, and the format is fixed when the
+    /// container is created. So asking for the format is asking for the behaviour,
+    /// and this exists to take it back: a container can be created with the format
+    /// and made to behave exactly as before by clearing this.
+    ///
+    /// What it changes: a dirty-data threshold, or the flush interval, writes the
+    /// dirty set out as a partial segment and keeps accumulating, rather than
+    /// publishing. Under a transaction or `WalRecoveryMode::Barrier`, where
+    /// crossing a threshold is refused with `OutOfMemory` because nothing may
+    /// publish, it writes a partial instead — which is the case this exists for.
+    ///
+    /// What it does not change: an explicit `flush`, `fdatasync`, `release` or
+    /// `commit_txn` still writes a consistency point, and with no partial
+    /// outstanding it writes exactly the single segment it always did.
+    #[serde(default = "default_parted_segment_enabled")]
+    pub parted_segment_enabled: bool,
+
+    /// Least dirty data worth writing as a partial segment. Below it, a threshold
+    /// crossing behaves as it always did.
+    ///
+    /// A partial segment costs an object and a break in what a sequential read can
+    /// coalesce, so a small one buys little memory for a lasting cost in
+    /// fragmentation. Defaults to `data_cache_dirty_max_bytes_threshold`'s own
+    /// default, which is the amount that triggers a write in the first place.
+    #[serde(default = "default_data_cache_dirty_min_bytes_to_part")]
+    pub data_cache_dirty_min_bytes_to_part: usize,
     /// Backpressure cap on in-flight S3 GETs spawned by a single
     /// `fs_read` / `fh_read` after Level-A coalescing.
     #[serde(default = "default_read_max_concurrency")]
@@ -184,6 +216,8 @@ pub struct HyperFileRuntimeConfig {
 }
 
 fn default_read_get_max_bytes() -> usize { DEFAULT_READ_GET_MAX_BYTES }
+fn default_parted_segment_enabled() -> bool { true }
+fn default_data_cache_dirty_min_bytes_to_part() -> usize { DEFAULT_MAX_DIRTY_DATA_BYTES_THRESHOLD }
 fn default_read_max_concurrency() -> usize { DEFAULT_READ_MAX_CONCURRENCY }
 
 /// Policy that controls how `flush` handles a concurrent modification
@@ -229,6 +263,8 @@ impl Default for HyperFileRuntimeConfig {
             node_cache_blocks: DEFAULT_NODE_CACHE_BLOCKS,
             flush_conflict_policy: FlushConflictPolicy::default(),
             read_get_max_bytes: DEFAULT_READ_GET_MAX_BYTES,
+            parted_segment_enabled: true,
+            data_cache_dirty_min_bytes_to_part: DEFAULT_MAX_DIRTY_DATA_BYTES_THRESHOLD,
             read_max_concurrency: DEFAULT_READ_MAX_CONCURRENCY,
         }
     }
@@ -249,6 +285,8 @@ impl HyperFileRuntimeConfig {
             node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
             flush_conflict_policy: FlushConflictPolicy::default(),
             read_get_max_bytes: DEFAULT_READ_GET_MAX_BYTES,
+            parted_segment_enabled: true,
+            data_cache_dirty_min_bytes_to_part: DEFAULT_MAX_DIRTY_DATA_BYTES_THRESHOLD,
             read_max_concurrency: DEFAULT_READ_MAX_CONCURRENCY,
         }
     }
@@ -267,6 +305,8 @@ impl HyperFileRuntimeConfig {
             node_cache_blocks: DEFAULT_MAX_NODE_CACHE_BLOCKS,
             flush_conflict_policy: FlushConflictPolicy::default(),
             read_get_max_bytes: DEFAULT_READ_GET_MAX_BYTES,
+            parted_segment_enabled: true,
+            data_cache_dirty_min_bytes_to_part: DEFAULT_MAX_DIRTY_DATA_BYTES_THRESHOLD,
             read_max_concurrency: DEFAULT_READ_MAX_CONCURRENCY,
         }
     }

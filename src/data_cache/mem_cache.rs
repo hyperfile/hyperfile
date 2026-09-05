@@ -297,6 +297,24 @@ impl Cache for MemCache {
         }
     }
 
+    fn demote_dirty(&mut self, indexes: &[BlockIndex]) {
+        for blk_idx in indexes {
+            let Some(block) = self.data_blocks_dirty.remove(blk_idx) else {
+                // Written by the partial and dirtied again since, or evicted.
+                // Either way it is not this call's business.
+                continue;
+            };
+            if !block.is_should_cache() || self.data_cache_blocks == 0 {
+                // Same reasoning as `clear_dirty`: the bytes are on storage, and
+                // the buffer is a plain allocation, so dropping it is the cleanup.
+                continue;
+            }
+            if let Some(_) = self.data_blocks_cache.put(*blk_idx, block) {
+                panic!("block already exists, failed to put back block index {} into data blocks cache", blk_idx);
+            }
+        }
+    }
+
     fn clear_data_blocks_cache(&mut self) {
         if self.data_cache_blocks > 0 {
             self.data_blocks_cache.clear();

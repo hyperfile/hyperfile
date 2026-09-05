@@ -170,6 +170,14 @@ pub struct HyperFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache
     /// [`WalRecoveryReport`](crate::wal::WalRecoveryReport).
     #[cfg(feature = "wal")]
     pub(crate) wal_recovery_report: WalRecoveryReport,
+    /// The checkpoint being accumulated out of partial segments, if any.
+    ///
+    /// Its number is taken when the first partial is written and reused by every
+    /// later partial and by the consistency point that completes it — a checkpoint
+    /// is one number however many objects it took. So the completion must not ask
+    /// for a fresh one.
+    pub(crate) pending_parts: Option<PendingParts>,
+
     /// Flushes satisfied by the log alone since the last publish.
     ///
     /// Counts toward `HyperFileWalConfig::publish_every`, and resets when a
@@ -209,6 +217,21 @@ impl<T: Send + Clone, L: BlockLoader<BlockPtr>, C: NodeCache<BlockPtr>> Drop for
             rt.shutdown_background();
         }
     }
+}
+
+/// A checkpoint part-way through being written out.
+///
+/// Partial segments accumulate under one checkpoint number, which is allocated
+/// when the first of them is written. Nothing is published until a consistency
+/// point completes it: until then a reader that opens the container normally sees
+/// the previous checkpoint, because the inode object still names it.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingParts {
+    /// The checkpoint every part of this stream belongs to.
+    pub segid: SegmentId,
+    /// The part index the next partial takes. Part 0 belongs to the consistency
+    /// point, so partials start at [`crate::segment::Segment::FIRST_DATA_PART`].
+    pub next_part: u16,
 }
 
 impl<'a, T, L, C> HyperFile<'a, T, L, C>
@@ -296,6 +319,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             wal_recovery_report: WalRecoveryReport::default(),
             #[cfg(feature = "wal")]
             txn_open: false,
+            pending_parts: None,
             #[cfg(feature = "wal")]
             wal_deferred_barriers: 0,
             #[cfg(feature = "wal")]
@@ -424,6 +448,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             wal_recovery_report: WalRecoveryReport::default(),
             #[cfg(feature = "wal")]
             txn_open: false,
+            pending_parts: None,
             #[cfg(feature = "wal")]
             wal_deferred_barriers: 0,
             #[cfg(feature = "wal")]
@@ -551,6 +576,31 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         self.txn_open || self.wal_recovery_mode() == WalRecoveryMode::Barrier
     }
 
+    /// Make room for a write that would otherwise be refused.
+    ///
+    /// Inside a transaction, or throughout `Barrier` recovery, nothing may publish
+    /// without the caller asking — so crossing a dirty-data limit has been a
+    /// refusal, and a unit of work larger than the limit simply could not be
+    /// written. A container that can write a partial segment has somewhere to put
+    /// the data that is not a checkpoint, so it writes one and the write proceeds.
+    ///
+    /// Falls back to the refusal when the container cannot, or when the dirty set
+    /// is too small for a partial to be worth its object.
+    #[cfg(feature = "wal")]
+    pub(crate) async fn make_txn_room(&mut self) -> Result<()> {
+        if self.check_txn_room().is_ok() {
+            return Ok(());
+        }
+        if self.parted_segment_enabled() && self.worth_a_partial_segment() {
+            let lock = self.flush_lock().await;
+            let res = self.write_partial_segment().await;
+            self.flush_unlock(lock);
+            let _ = res?;
+            return Ok(());
+        }
+        self.check_txn_room()
+    }
+
     #[cfg(feature = "wal")]
     pub(crate) fn check_txn_room(&self) -> Result<()> {
         if !self.publishes_on_request_only() {
@@ -564,7 +614,9 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
             return Err(Error::new(ErrorKind::OutOfMemory, format!(
                 "{} dirty bytes in {} blocks, past the configured limits, and nothing \
                  may publish without the caller asking — flush, or commit the \
-                 transaction, to make room", bytes, dirty)));
+                 transaction, to make room. A container with \
+                 `parted_segment_enabled` writes a partial segment here instead",
+                bytes, dirty)));
         }
         Ok(())
     }
@@ -1495,7 +1547,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub async fn write(&mut self, off: usize, buf: &[u8]) -> Result<usize> {
         self.check_writable()?;
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1588,7 +1640,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub async fn write_zero(&mut self, off: usize, len: usize) -> Result<usize> {
         self.check_writable()?;
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -1695,7 +1747,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub(crate) async fn write_aligned_batch(&mut self, blocks: Vec<AlignedDataBlockWrapper>) -> Result<usize> {
         self.check_writable()?;
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.write_aligned_batch_locked(blocks, permit).await
     }
@@ -1839,7 +1891,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         // batch arms call this directly, so a guard above it covers one surface
         // and not the other.
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -2089,7 +2141,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub async fn block_mut(&mut self, blk_idx: BlockIndex, create: bool) -> Result<Option<BlockMut<'_>>> {
         self.check_writable()?;
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -2244,11 +2296,22 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
 
     // try flush out dirty data if all threshold condition meet
     pub(crate) async fn try_flush(&mut self) -> Result<bool> {
-        if self.need_flush() {
-            let _ = self.flush().await?;
+        if !self.need_flush() {
+            return Ok(false);
+        }
+        // A threshold or the interval is not a consistency point, and publishing
+        // one here is what couples memory pressure to the checkpoint history. When
+        // the container can write a partial instead, it does, and the checkpoint
+        // stays open until the caller asks for one.
+        if self.parted_segment_enabled() && self.worth_a_partial_segment() {
+            let lock = self.flush_lock().await;
+            let res = self.write_partial_segment().await;
+            self.flush_unlock(lock);
+            let _ = res?;
             return Ok(true);
         }
-        Ok(false)
+        let _ = self.flush().await?;
+        Ok(true)
     }
 
     /// Explicit flush with rollback-on-failure semantics.
@@ -2329,6 +2392,10 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     /// function returns the error without attempting further recovery. The
     /// caller should propagate the original flush error regardless.
     pub(crate) async fn rollback_from_persisted(&mut self) -> Result<()> {
+        // Going back to what is persisted abandons any checkpoint part-way out.
+        // Its partials stay on storage, referenced by nothing, for the cleaner —
+        // the same shape of garbage a crash between a segment and its inode leaves.
+        self.pending_parts = None;
         // 1. reload persisted inode + rebuild bmap
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let inode_state = self.staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
@@ -2890,7 +2957,7 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
     pub async fn truncate(&mut self, new_size: usize) -> Result<()> {
         self.check_writable()?;
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.truncate_locked(new_size, permit).await
     }
@@ -3281,7 +3348,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
     pub async fn write_batch(&mut self, blocks: Vec<BatchDataBlockWrapper>) -> Result<usize> {
         self.check_writable()?;
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         self.write_batch_locked(blocks, permit).await
     }
@@ -3291,7 +3358,7 @@ impl<'a: 'static, T: Staging<L> + SegmentReadWrite + Send + Clone + 'static, L: 
         // batch arms call this directly, so a guard above it covers one surface
         // and not the other.
         #[cfg(feature = "wal")]
-        self.check_txn_room()?;
+        self.make_txn_room().await?;
         if !self.flags.is_writable() {
             return Err(Self::ebadf_bad_access_mode());
         }
@@ -3517,6 +3584,25 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
         self.cache.clear_dirty()
     }
 
+    fn demote_data_blocks_dirty(&mut self, indexes: &[BlockIndex]) {
+        self.cache.demote_dirty(indexes)
+    }
+
+    fn pending_parts_get(&self) -> Option<PendingParts> {
+        self.pending_parts
+    }
+
+    fn pending_parts_advance(&mut self, written: SegmentId) {
+        let next = written.part_id()
+            .expect("a partial segment names a part")
+            .saturating_add(1);
+        self.pending_parts = Some(PendingParts { segid: written.whole(), next_part: next });
+    }
+
+    fn pending_parts_clear(&mut self) {
+        self.pending_parts = None;
+    }
+
     async fn lock(&self) -> OwnedSemaphorePermit {
         let permit = self.sema.clone().acquire_owned().await.unwrap();
         permit
@@ -3623,6 +3709,13 @@ impl<T, L, C> HyperTrait<T, L, C, BlockPtr> for HyperFile<'_, T, L, C>
         // and deferring it would leave the unit unsealed with the caller told
         // otherwise.
         if self.txn_open || self.wal.is_none() || self.wal_force_publish {
+            return false;
+        }
+        // Never while a checkpoint is part-way out. Deferring says the log is
+        // enough and no checkpoint is needed; partials already on storage say a
+        // checkpoint was started. Completing it is cheap — its data is written —
+        // and leaving it open would let the sequence advance past its number.
+        if self.pending_parts.is_some() {
             return false;
         }
         let every = self.config.wal.publish_every.max(1);

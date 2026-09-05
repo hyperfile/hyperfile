@@ -358,6 +358,14 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     // dirty data
     fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_>;
     fn clear_data_blocks_dirty(&mut self);
+    /// Move just these blocks out of the dirty tier. See `DataCache::demote_dirty`.
+    fn demote_data_blocks_dirty(&mut self, indexes: &[BlockIndex]);
+    /// The checkpoint being accumulated out of partial segments, if any.
+    fn pending_parts_get(&self) -> Option<crate::file::file::PendingParts>;
+    /// Record that a partial landed, so the next one takes the following index.
+    fn pending_parts_advance(&mut self, written: SegmentId);
+    /// Forget the accumulated checkpoint. Its objects become unreferenced.
+    fn pending_parts_clear(&mut self);
     // lock
     fn lock(&self) -> impl Future<Output = OwnedSemaphorePermit>;
     fn unlock(&self, permit: OwnedSemaphorePermit);
@@ -561,7 +569,14 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
     fn flush_process_pre_build_segment(&self) -> impl Future<Output = Result<(u64, DirtyDataBlocks<'_>)>> {async {
         let dirty_data_blocks = self.get_data_blocks_dirty();
 
-        if dirty_data_blocks.len() == 0 && !self.bmap_dirty() {
+        // A checkpoint part-way out still has to be finished, and after its
+        // partials there is nothing dirty left to notice. Its part 0 — the summary
+        // naming every object, the metadata, the inode — is what makes it openable
+        // at all, so quitting here would leave the partials referenced by nothing
+        // and the flush would have done nothing while reporting success.
+        let complete_pending = self.pending_parts_get().is_some();
+
+        if !complete_pending && dirty_data_blocks.len() == 0 && !self.bmap_dirty() {
             if self.inode().is_attr_dirty() {
                 debug!("inode attr is dirty, flush inode ONLY");
                 let b = self.bmap_get_raw();
@@ -577,6 +592,138 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
             return Ok((segid.as_cno(), DirtyDataBlocks { inner: None, owned: None }));
         }
         Ok((0, dirty_data_blocks))
+    }}
+
+    /// Whether this container may answer memory pressure with a partial segment
+    /// instead of a checkpoint nobody asked for.
+    ///
+    /// Both halves are needed and neither is enough. The format decides whether a
+    /// partial is addressable at all and is fixed when the container is created;
+    /// the switch decides whether to use it, and can be left off on a container
+    /// whose format allows it.
+    fn parted_segment_enabled(&self) -> bool {
+        self.config().meta.block_ptr_format.is_parted()
+            && self.config().runtime.parted_segment_enabled
+    }
+
+    /// Whether there is enough dirty data for a partial segment to be worth the
+    /// object it costs and the read it breaks.
+    fn worth_a_partial_segment(&self) -> bool {
+        let dirty_bytes = self.get_data_blocks_dirty().len() * self.config().meta.data_block_size;
+        dirty_bytes >= self.config().runtime.data_cache_dirty_min_bytes_to_part
+    }
+
+    /// Write the dirty set out as one piece of a checkpoint that is not finished.
+    ///
+    /// For the moments that today force a publish nobody asked for: a dirty-data
+    /// threshold, the flush interval, or — under a transaction or `Barrier` — the
+    /// point at which a write is refused with `OutOfMemory` because nothing may
+    /// publish. None of those is a consistency point, so none of them should make
+    /// one; this writes the data and the metadata describing it, leaves the
+    /// checkpoint open, and keeps accumulating.
+    ///
+    /// The object has the same shape as any other segment — its own summary, the
+    /// inode inline, its metadata blocks, its data blocks — so anything that can
+    /// parse a segment can parse this. Since every currently dirty node is written,
+    /// the bmap root in that inode reaches every block the checkpoint holds so far,
+    /// which makes the partial a complete state and not a fragment.
+    ///
+    /// What it is not is durable. The inode *object* is untouched, so a reader that
+    /// opens the container normally still sees the previous checkpoint, and a crash
+    /// here leaves these objects referenced by nothing. Recovering to a partial
+    /// means opening it by name, which is a repair tool's business and not
+    /// `open`'s: the caller's flush is the consistency point, and reading past it
+    /// would take that away.
+    ///
+    /// Ordering, and one step of it is the whole safety argument:
+    ///
+    /// Metadata pointers are assigned before the nodes are serialized, because a
+    /// parent has to contain its children's pointers. So the data in the same
+    /// object cannot be uploaded before its pointers are assigned either.
+    ///
+    /// What protects a reader instead is that a block does not leave the dirty tier
+    /// until its upload has landed. Until then a read finds it in the cache and
+    /// never resolves the pointer; afterwards the pointer resolves to bytes that
+    /// are there. That is the last step, and moving it earlier would open exactly
+    /// the window the single-object path needs its pinned buffer for.
+    #[allow(clippy::type_complexity)]
+    fn write_partial_segment(&mut self) -> impl Future<Output = Result<SegmentId>> {async move {
+        let segid = match self.pending_parts_get() {
+            Some(p) => {
+                if p.next_part as usize >= segment::Segment::MAX_PARTS {
+                    return Err(Error::new(ErrorKind::OutOfMemory, format!(
+                        "checkpoint {} has already been written as {} partial segments, \
+                         which is all a pointer can name — flush to complete it",
+                        p.segid, p.next_part)));
+                }
+                p.segid.at_part(p.next_part)
+            },
+            None => {
+                // The number this whole stream belongs to, taken once.
+                let fresh = self.inode_mut().get_next_seq();
+                fresh.at_part(segment::Segment::FIRST_DATA_PART)
+            },
+        };
+
+        let dirty_meta_vec = self.bmap_lookup_dirty();
+        let dirty_data_blocks = self.get_data_blocks_dirty();
+        let ndatadirty = dirty_data_blocks.len();
+        debug!("writing partial segment {}: dirty meta nodes {}, dirty data blocks {}",
+            segid, dirty_meta_vec.len(), ndatadirty);
+
+        let mut segwr = self.staging().new_segwr_at(segid, &self.config().meta);
+        segwr.mark_partial();
+
+        let mut file_off = segment::Writer::<T>::calc_ss_aligned_bytes(ndatadirty);
+        let mut block_seq = 0;
+        for n in &dirty_meta_vec {
+            let blk_ptr = self.blk_ptr_encode(segid, file_off, block_seq);
+            let node_size = n.size();
+            self.bmap_assign_meta_node(blk_ptr, n.clone()).await?;
+            segwr.inc_metablk();
+            file_off += node_size;
+            block_seq += 1;
+        }
+
+        // Collected so the blocks can be demoted after the upload; the tier's
+        // borrow cannot be held across that.
+        let mut written: Vec<BlockIndex> = Vec::with_capacity(ndatadirty);
+        for (blk_idx, n) in dirty_data_blocks.data().iter() {
+            let blk_ptr = self.blk_ptr_encode(segid, file_off, block_seq);
+            let block_size = n.size();
+            self.bmap_assign_data_node(blk_idx, blk_ptr).await?;
+            segwr.inc_datablk(blk_idx, &blk_ptr);
+            written.push(*blk_idx);
+            file_off += block_size;
+            block_seq += 1;
+        }
+
+        let b = self.bmap_get_raw();
+        let mut raw_inode = self.inode().to_raw(b);
+        raw_inode.i_last_cno = segid.as_cno();
+        segwr.realize_ss(0, &raw_inode);
+        for n in &dirty_meta_vec {
+            let _ = segwr.append(n.as_slice())?;
+        }
+        for (_, n) in dirty_data_blocks.data().iter() {
+            let _ = segwr.append_data_block(n)?;
+        }
+        drop(dirty_data_blocks);
+
+        segwr.done().await?;
+
+        // The upload landed, so these are readable from storage and may leave the
+        // dirty tier. Nothing before this line may.
+        for n in dirty_meta_vec {
+            n.clear_dirty();
+        }
+        self.bmap_clear_dirty();
+        self.demote_data_blocks_dirty(&written);
+        self.pending_parts_advance(segid);
+        self.set_last_flush();
+
+        debug!("partial segment {} written, {} blocks left the dirty tier", segid, written.len());
+        Ok(segid)
     }}
 
     fn flush_process_build_segment(&self, dirty_data_blocks: DirtyDataBlocks<'_>)
@@ -606,7 +753,13 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
             dirty_meta_vec.len(), dirty_data_blocks.len());
 
-        let segid = self.inode_mut().get_next_seq();
+        // A checkpoint already part-way out keeps its number: it is one checkpoint
+        // however many objects it took, and asking for a fresh one here would
+        // orphan every partial written under it.
+        let segid = match self.pending_parts_get() {
+            Some(p) => p.segid,
+            None => self.inode_mut().get_next_seq(),
+        };
         let mut file_off = 0;
         let mut segwr = self.staging().new_segwr(segid, &self.config().meta);
 
@@ -810,6 +963,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         // clear dirty for bmap
         self.bmap_clear_dirty();
+        // The checkpoint is complete, so nothing is accumulating any more.
+        self.pending_parts_clear();
         // reset last flush
         self.set_last_flush();
 
@@ -927,6 +1082,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         // clear dirty for bmap
         self.bmap_clear_dirty();
+        // The checkpoint is complete, so nothing is accumulating any more.
+        self.pending_parts_clear();
         // reset last flush
         // defer set last flash in wal_flush_done
 
@@ -986,6 +1143,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         // clear dirty for bmap
         self.bmap_clear_dirty();
+        // The checkpoint is complete, so nothing is accumulating any more.
+        self.pending_parts_clear();
         // reset last flush
         self.set_last_flush();
 
@@ -1003,7 +1162,14 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         let dirty_data_blocks = self.get_data_blocks_dirty();
 
-        if dirty_data_blocks.len() == 0 && !self.bmap_dirty() {
+        // A checkpoint part-way out still has to be finished, and after its
+        // partials there is nothing dirty left to notice. Its part 0 — the summary
+        // naming every object, the metadata, the inode — is what makes it openable
+        // at all, so quitting here would leave the partials referenced by nothing
+        // and the flush would have done nothing while reporting success.
+        let complete_pending = self.pending_parts_get().is_some();
+
+        if !complete_pending && dirty_data_blocks.len() == 0 && !self.bmap_dirty() {
             if self.inode().is_attr_dirty() {
                 debug!("inode attr is dirty, flush inode ONLY");
                 let b = self.bmap_get_raw();
@@ -1042,7 +1208,13 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
         debug!("start to create a new segemtnt: dirty meta nodes {}, dirty data blocks {}",
             dirty_meta_vec.len(), dirty_data_blocks.len());
 
-        let segid = self.inode_mut().get_next_seq();
+        // A checkpoint already part-way out keeps its number: it is one checkpoint
+        // however many objects it took, and asking for a fresh one here would
+        // orphan every partial written under it.
+        let segid = match self.pending_parts_get() {
+            Some(p) => p.segid,
+            None => self.inode_mut().get_next_seq(),
+        };
         let mut file_off = 0;
         let mut segwr = self.staging().new_segwr(segid, &self.config().meta);
 
@@ -1122,6 +1294,8 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         // clear dirty for bmap
         self.bmap_clear_dirty();
+        // The checkpoint is complete, so nothing is accumulating any more.
+        self.pending_parts_clear();
         // reset last flush
         self.set_last_flush();
 

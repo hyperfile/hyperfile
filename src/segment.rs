@@ -45,8 +45,13 @@ impl Segment {
     /// finished.
     pub const SUMMARY_PART: u16 = 0;
 
-    /// Where data blocks start. Part 0 is the summary's.
+    /// Where a streamed checkpoint's first partial lands. Part 0 is the one the
+    /// consistency point writes, so the partials before it count up from here.
     pub const FIRST_DATA_PART: u16 = 1;
+
+    /// How many partials one checkpoint may accumulate before the part index runs
+    /// out of room in a pointer. Reaching it is refused, not wrapped.
+    pub const MAX_PARTS: usize = crate::meta_format::BLOCK_PTR_PARTED_MAX_PARTS;
 }
 
 pub trait SegmentReadWrite {
@@ -223,6 +228,19 @@ pub struct Writer<T> {
 
 // router stub to real impl of writer function in Staging
 impl<T: SegmentReadWrite> Writer<T> {
+    /// A writer aimed at exactly the object `segid` names.
+    pub fn new_at(ctx: T, buf_size: usize, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> Self {
+        let mut w = Self::new(ctx, buf_size, segid, hyper_file_config);
+        w.segid = segid;
+        w.ss.hdr.s_cno = segid.as_cno();
+        w
+    }
+
+    /// Mark what this writer produces as one piece of an unfinished checkpoint.
+    pub fn mark_partial(&mut self) {
+        self.ss.hdr.s_flags |= crate::ondisk::SEGMENT_FLAG_PARTIAL;
+    }
+
     pub fn new(ctx: T, buf_size: usize, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> Self {
         // _buf_size is intentionally unused on the non-WAL path:
         // we no longer pre-allocate one big segment buffer up

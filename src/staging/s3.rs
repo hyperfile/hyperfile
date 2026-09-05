@@ -244,6 +244,10 @@ impl Staging<S3BlockLoader> for S3Staging {
         segment::Writer::<S3Staging>::new(self.clone(), self.runtime_config.segment_buffer_size, segid, hyper_file_config)
     }
 
+    fn new_segwr_at(&self, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> segment::Writer<S3Staging> {
+        segment::Writer::<S3Staging>::new_at(self.clone(), self.runtime_config.segment_buffer_size, segid, hyper_file_config)
+    }
+
     fn dir_filename(&self) -> (&str, &str) {
         if let Some((dir, filename)) = self.root_path.rsplit_once('/') {
             return (dir, filename);
