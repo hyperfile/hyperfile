@@ -52,8 +52,6 @@ impl S3Staging {
         [segid.whole(), segid.at_part(crate::segment::Segment::SUMMARY_PART)]
     }
 
-    /// Which of the two names actually exists, or the best guess when neither
-    /// answers — the caller reports the failure that follows.
     /// Read exactly the object `segid` names, with no fallback.
     ///
     /// `SegmentReadWrite::open` resolves a bare checkpoint number to the summary
@@ -64,6 +62,8 @@ impl S3Staging {
         Self::do_open(&self.client, &self.bucket, &filename).await
     }
 
+    /// Which of the two names actually exists, or the best guess when neither
+    /// answers — the caller reports the failure that follows.
     async fn probe_summary_obj(&self, segid: SegmentId) -> SegmentId {
         let candidates = self.candidate_summary_objs(segid);
         for segid in candidates {
@@ -522,6 +522,17 @@ impl S3Staging {
 
     // list staging dir for all segments id <= input segid, skip anythig else
     // if input segment id is 0, return all
+    /// The checkpoints at or below `segid`, ascending, each counted once.
+    ///
+    /// Checkpoints, not objects: one written as several parts appears once, because
+    /// what a caller walking a container's history wants is its history and not its
+    /// storage layout.
+    ///
+    /// A checkpoint's objects are named by a padded number with an optional part
+    /// suffix, so the number is what comes before the first `.`. Parsing the whole
+    /// name as a number — which is what this did — skips every object of a container
+    /// that streams its checkpoints, and skipping them all is indistinguishable from
+    /// a container with no history.
     pub(crate) async fn do_list(client: &Client, bucket: &str, prefix: &str, segid: SegmentId) -> Result<Vec<SegmentId>> {
         let mut output = Vec::new();
         let filter = |o: &Object| {
@@ -531,7 +542,10 @@ impl S3Staging {
             } else {
                 key
             };
-            if let Ok(id) = filename.parse::<u64>() {
+            // The checkpoint number is the name up to the part suffix, if any. The
+            // inode object and anything else under the prefix parse as neither.
+            let number = filename.split('.').next().unwrap_or(filename);
+            if let Ok(id) = number.parse::<u64>() {
                 if segid.as_cno() == 0 || id <= segid.as_cno() {
                     output.push(id)
                 }
@@ -539,6 +553,7 @@ impl S3Staging {
         };
         let _ = S3Ops::do_list_objects(client, bucket, prefix, filter).await?;
         output.sort();
+        output.dedup();
         Ok(output.into_iter().map(SegmentId::new_from_cno).collect())
     }
 

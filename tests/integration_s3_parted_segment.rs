@@ -354,3 +354,66 @@ async fn an_abandoned_checkpoint_is_not_openable() {
 
     tf.cleanup(&client).await;
 }
+
+/// Listing a container's checkpoints counts each one once, however many objects it
+/// took to write.
+///
+/// The list is what a tool walking a container's history reads. Recognising a
+/// checkpoint by parsing the whole object name as a number stopped working the moment
+/// a name could carry a part suffix, and the failure is quiet: no error, an empty
+/// list, a container that looks like it has no history at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn listing_counts_each_checkpoint_once() {
+    use hyperfile::segment::SegmentReadWrite;
+    use hyperfile::staging::s3::S3Staging;
+    use hyperfile::SegmentId;
+
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    let tf = TestFile::new(&client).await;
+    // Small threshold so each round is written as partials plus a part 0.
+    let config = parted_config(tf.uri(), 4, 2 * BLK, true);
+    const ROUNDS: usize = 3;
+
+    {
+        let mut hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        for r in 0..ROUNDS {
+            for i in 0..10 {
+                let at = (r * 10 + i) * BLK;
+                let _ = hyper.fs_write(at, &vec![0xE0 + (r * 10 + i) as u8; BLK]).await.expect("write");
+            }
+            let _ = hyper.fs_flush().await.expect("flush");
+        }
+        let _ = hyper.fs_release().await;
+    }
+
+    let staging: S3Staging = S3Staging::from(
+        &client,
+        StagingConfig::new_s3_uri(tf.uri(), None),
+        HyperFileRuntimeConfig::default(),
+    ).await.expect("staging");
+
+    // Everything, which is what a history walk asks for.
+    let all = staging.list(SegmentId::new(0)).await.expect("list");
+    assert!(!all.is_empty(),
+        "listing a container written by this version returned nothing");
+    assert_eq!(all.len(), ROUNDS,
+        "{} flushes should list as {} checkpoints, got {:?} — a checkpoint written as \
+         several objects must still count once", ROUNDS, ROUNDS, all);
+    assert!(all.iter().all(|s| s.part_id().is_none()),
+        "a checkpoint list should name checkpoints, not their objects: {:?}", all);
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(all, sorted, "the list should be ascending: {:?}", all);
+
+    // Bounded: at or below the given checkpoint.
+    let upto = staging.list(all[1]).await.expect("list upto");
+    assert_eq!(upto.len(), 2, "listing up to {} gave {:?}", all[1], upto);
+
+    tf.cleanup(&client).await;
+}
