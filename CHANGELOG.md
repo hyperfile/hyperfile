@@ -9,6 +9,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.7.0] - 2026-09-05
+
+A checkpoint no longer has to be one object, which lets a container write data out
+under memory pressure without publishing a checkpoint nobody asked for.
+
+### Breaking changes
+
+- **A container created by this version cannot be read by a `0.6` one.** The default
+  block-pointer format is now `BlockPtrFormat::PartedSegment`, under which a
+  checkpoint is written as `<segid>.<part>` objects. A container carries its format
+  for life, and an earlier build refuses a format it does not know rather than
+  misreading it — a clean failure, but a one-way door.
+
+  The default moved because the behaviour the format enables is the reason it exists,
+  and leaving it opt-in would have left that behind a config change nobody finds. Set
+  `parted_segment_enabled` to `false` to keep the behaviour off; nothing turns the
+  format off after the container is created.
+
+  Containers created by `0.6` are read exactly as before, under the object names they
+  always had.
+
+- **`SegmentId` is a type, not an alias for `u64`.** It names a stored object: a
+  checkpoint number and, for a container that streams its checkpoints, which of
+  that checkpoint's objects.
+
+  ```rust
+  pub struct SegmentId { seq_id: u32, part_id: Option<u16> }
+  ```
+
+  Reaching the parts: `seq_id()`, `part_id()`, `as_cno()` for the checkpoint number
+  as the inode stores it. Building one: `SegmentId::new(seq)`,
+  `SegmentId::with_part(seq, part)`, `SegmentId::new_from_cno(cno)` from a persisted
+  number.
+
+  `seq_id` is a `u32` because that is what a block pointer can address — 30 bits of
+  it. The `u64` it replaces promised range the format cannot name.
+
+  Surfaces that change shape: `block_placement` and its batch form return
+  `Option<(SegmentId, u64)>`; `PlannedRead::Get` carries a `SegmentId` that names an
+  object rather than a checkpoint; every method of `Staging`, `SegmentReadWrite` and
+  `StagingIntercept` that took a segment id now takes one of these.
+
+  What does *not* change: `fs_flush`, `fh_flush`, `fdatasync`, `release`,
+  `commit_txn`, `last_cno` and `open_cno` still speak plain checkpoint numbers,
+  now under the name `Cno`. That is what a caller pins, logs and hands back.
+
+- **`DataCache` gained `demote_dirty`**, which moves named blocks out of the dirty
+  tier and leaves the rest. An external implementation has to provide it.
+
+- **A container created with `BlockPtrFormat::PartedSegment` cannot be read by an
+  earlier build.** The format byte is checked when the container is opened and an
+  unknown one is refused, so this is a clean failure rather than a wrong read.
+  Containers in every other format are unaffected, and are still written under the
+  object names they always had.
+
+### Added
+
+- **`BlockPtrFormat::PartedSegment`**, under which a checkpoint may be written as
+  several objects named `<segid>.<part>`. Now the default; see **Breaking changes**.
+
+  The part index goes where the micro-group index used to sit, a field that took no
+  part in addressing — `decode` ignored it and its only reader was a debug string.
+  So a part is addressable from the pointer alone with no bit growth and no loss of
+  range: 14 bits of part over an 18-bit in-part block index raises what one
+  checkpoint can hold from 1 GiB to 16 TiB rather than dividing the old ceiling.
+
+  A separate field rather than the high bits of the offset, because the offset
+  restarts at zero in each part — so a part cut short by memory pressure wastes no
+  address space, and the cut can fall wherever it needs to.
+
+- **Partial segments.** A dirty-data threshold has always published, which ties how
+  much a writer is holding to where the checkpoint history has a point in it. The
+  caller gets a checkpoint it never asked for, at a moment of its own work that it
+  did not choose.
+
+  Where nothing may publish the coupling is worse. Inside a transaction, and
+  throughout `WalRecoveryMode::Barrier`, a crossing is refused with `OutOfMemory` —
+  a checkpoint there would put a state nobody declared beneath the floor recovery
+  lands on. So a unit of work larger than the threshold could not be written at all.
+
+  A partial segment is somewhere to put that data which is not a checkpoint. On
+  either dirty-data threshold, the flush interval, or the point that used to be the
+  refusal, the dirty set goes out as one object and accumulation continues. The
+  checkpoint stays open until an explicit `flush`, `fdatasync`, `release` or
+  `commit_txn` asks for one — and with no partial outstanding that writes exactly
+  the single segment it always did. The ordinary case is unchanged, which is the
+  point of doing it this way round.
+
+  A partial has the shape of any other segment: its own summary, its own metadata
+  blocks, its own data blocks, and the inode inline. It writes *every* dirty node,
+  so the bmap root in that inode reaches every block the checkpoint holds so far — a
+  partial is a whole state, not a fragment, and its header says so through
+  `SEGMENT_FLAG_PARTIAL`.
+
+  **It is not a durability event.** The inode object is untouched, so a reader that
+  opens the container normally still sees the previous checkpoint, and a crash
+  leaves the partials referenced by nothing. Without a WAL the data in them is gone.
+  No flush returned, so no promise is broken, but "written out" must not be read as
+  "durable". With a WAL nothing changes, because the writes were durable before any
+  of this.
+
+  Two configuration values, both in `HyperFileRuntimeConfig`:
+  `parted_segment_enabled`, on by default and meaningless unless the format allows
+  parts, which exists to take the behaviour back; and
+  `data_cache_dirty_min_bytes_to_part`, defaulting to what the byte threshold
+  defaults to, because a partial smaller than the amount that triggers a write buys
+  little memory for a lasting cost in fragmented reads.
+
+  See [docs/flush.md](docs/flush.md#partial-segments-writing-out-without-a-consistency-point)
+  for the ordering that carries the safety argument, what partials cost, and the
+  interactions that each needed handling.
+
+- **`Cno`**, an alias for the checkpoint number a caller sees. An alias rather than
+  a newtype: a caller compares these, prints them, and hands them back to
+  `open_cno`, and the value that needs type safety is the one that names an object.
+
+### Fixed
+
+- **A read concurrent with a flush no longer goes to an object that is not there
+  yet.** A WAL flush returns before its upload lands and serves reads from a pinned
+  buffer meanwhile. The test for whether a pointer was covered by that buffer asked
+  whether the checkpoint was parted, on the grounds that a streamed checkpoint has
+  its data on storage before any pointer to it resolves. That is true of a partial
+  segment, which is uploaded before its pointers are assigned, and false of the
+  consistency point, which assigns first and uploads asynchronously.
+
+  Unreachable until the default format changed, because no pointer was parted. The
+  test is now `SegmentId::is_partial`, which names the distinction rather than leaving
+  it to be inferred — and carries a unit test, so the same mistake fails without
+  needing a concurrent read against a flush to find it.
+
+- **A batched read of a partial segment is no longer answered out of another object's
+  buffer.** A flush pins the buffer of the object it is uploading so reads can carry
+  on. The `read_many` and `read_ahead` workers consulted that buffer for every request,
+  reducing the pointer to its checkpoint to look it up — so a pointer into a partial
+  matched, and the offset was read out of the buffer holding the checkpoint's summary
+  and metadata. Real bytes, belonging somewhere else, with no error and nothing
+  downstream to notice.
+
+  The buffer holds one object, so only a pointer that is not a partial may be served
+  from it — the test the planner already applies when it decides a request is served
+  from memory at all.
+
+  `flushing_segments` is keyed by `Cno` rather than `SegmentId` now. The defect was an
+  object id reduced to a checkpoint at a lookup, and a key type that is a checkpoint
+  number cannot be handed an object id.
+
+- **The in-memory fallback names an object that exists.** When the pinned buffer has
+  gone, the read falls back to storage — and asked for the bare checkpoint name, which
+  in a container that streams its checkpoints is nobody's object. The request carries
+  what the pointer named now, and the lookups reduce it, which is the only arrangement
+  where both the buffer and storage are asked for what they hold.
+
+- **Listing a container's checkpoints recognises a part suffix.** `list` parsed a
+  whole object name as a number, and a name carrying a part suffix does not parse — so
+  every object of a container in this release's default format was skipped, which is
+  indistinguishable from a container with no history: no error, an empty list. A tool
+  walking the history of one would report zero checkpoints.
+
+  Each checkpoint is also counted once now. Its objects share its number, so
+  recognising them all listed it once per object. The memory staging already
+  deduplicated and the S3 one did not, so the same change had been made correctly in
+  one place and half-made in the other.
+
+  The same mistake as two tests recognising a segment object by "ten digits", which
+  failed and were noticed. This is product code with no caller in the test suite, and
+  `list` had no coverage at all — it does now.
+
+- **`SegmentReadWrite::open` resolves a checkpoint number.** It named an object
+  literally, and a caller holding a checkpoint number cannot know whether the
+  container streams its checkpoints — that is recorded in the inode it is trying to
+  reach. Given a bare number and no object of that name, the summary part is tried.
+  `S3Staging::open_exact` asks about exactly one object, which walking a checkpoint's
+  parts needs.
+
+- **A threshold crossing no longer restarts a flush already underway.** Recovery
+  replays acknowledged writes through the ordinary write path while holding the
+  flush lock, and a replay larger than the dirty threshold crossed it — asking for
+  that lock against the hold the same task already had. The process stopped there,
+  with no error.
+
+  Reachable before this release and not reached: every test that replays keeps its
+  thresholds above what it writes, so no replay ever crossed one.
+
+  `State::is_flushing` was gated on the reactor feature while the flag it reads was
+  set and cleared unconditionally. The deadlock is on the replay path, which has
+  nothing to do with a reactor, so the gate is gone.
+
 ## [0.6.16] - 2026-08-31
 
 ### Fixed
