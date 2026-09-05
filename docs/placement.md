@@ -1,7 +1,7 @@
 # Seeing where blocks are
 
 A read is served by one object request per stretch of blocks that adjoins
-within a single segment. So where a file's blocks landed decides what reading
+within a single object. So where a file's blocks landed decides what reading
 it costs — and a caller cannot see that decision, because it is made here.
 
 Two read-only queries expose it. Neither influences placement, and neither
@@ -59,8 +59,13 @@ let places = fh.fh_block_placement(0, n).await?;   // Vec<Option<(SegmentId, u64
 
 which is also `h.fs_block_placement(0, n)` on the direct API.
 
-`None` for a block in no segment: a hole, or one written and not yet flushed.
-The segment id is meaningful only for equality and ordering.
+`None` for a block in no object: a hole, or one written and not yet flushed.
+The `SegmentId` is meaningful only for equality and ordering, and it names an
+object rather than a checkpoint — `seq_id()` is the checkpoint and `part_id()`
+is which of its pieces, `None` when it is the only one. Two blocks in different
+parts of one checkpoint are in different objects, so comparing only the
+checkpoint would report them as together when a read has to fetch them
+separately.
 
 The plan says a read costs more than it should; this says what the cost is
 made of — how many distinct segments a file touches, whether its blocks are
@@ -69,17 +74,23 @@ in file order within them, how far apart they are.
 ## Why the two are not the same question
 
 A flush writes its blocks sorted by index and packed, so two file-consecutive
-blocks that are both in one segment are always adjacent within it. Two
+blocks that are both in one object are always adjacent within it. Two
 consequences follow, and they are worth knowing before reading a plan:
 
-- Requests break where the **segment** changes, which is a property of when
-  each block was last flushed, not of the file's own order. Overwriting one
-  block in the middle of a flushed run splits a read of that run into three
-  requests: the blocks before it, the new block in its new segment, the
-  blocks after it.
-- Two *consecutive* requests in the **same** segment can therefore only come
+- Requests break where the **object** changes, which is a property of when
+  each block was last written out, not of the file's own order. Overwriting one
+  block in the middle of a run splits a read of that run into three requests:
+  the blocks before it, the new block in its new object, the blocks after it.
+- Two *consecutive* requests in the **same** object can therefore only come
   from the request-size cap, `read_get_max_bytes`. A 20 MiB contiguous run
   reads as two requests under the 16 MiB default.
+
+The object is usually the checkpoint, and for a container that writes
+[partial segments](flush.md#partial-segments-writing-out-without-a-consistency-point)
+it need not be: memory pressure writes part of the dirty set out early, and
+where it cut is another place a run breaks. That is the cost side of the trade
+those buy — the blocks in one partial are still sorted and packed, so the break
+falls once per partial rather than anywhere.
 
 ## What asking costs
 

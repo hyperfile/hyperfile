@@ -145,12 +145,17 @@ what you call.
 ### What coalescing does, and how much it depends on the ask
 
 A read plans block by block and extends one request while the next block's
-location is **strictly adjacent** in the same segment and the request stays
+location is **strictly adjacent in the same object** and the request stays
 under `read_get_max_bytes`. It never jumps a gap: a block whose location is
 not adjacent starts a new request. So a read fetches nothing the caller did
 not ask for, and a layout where consecutive file blocks landed in
-consecutive segment positions costs one request however many blocks it
+consecutive positions of one object costs one request however many blocks it
 spans.
+
+Object rather than checkpoint, because a checkpoint is usually one object but
+does not have to be — see [partial segments](flush.md#partial-segments-writing-out-without-a-consistency-point).
+Two pieces of one checkpoint are two objects, so a request never spans them
+however adjacent the offsets look.
 
 The consequence worth knowing is that **how fragmented a file looks depends
 entirely on how much is asked for at a time.** A caller reading 4 MiB in one

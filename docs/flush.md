@@ -13,7 +13,9 @@ section there. For the WAL itself — layout, recovery, cleanup — see
 ## What a flush does
 
 A flush collects everything dirty, turns it into one segment, and writes
-that segment out:
+that segment out — which is what happens unless the container has already
+written part of the dirty set out under memory pressure, for which see
+[partial segments](#partial-segments-writing-out-without-a-consistency-point):
 
 1. Collect the dirty data blocks and the dirty meta (bmap) nodes.
 2. Serialize them into one contiguous segment buffer, allocating the next
@@ -186,6 +188,105 @@ blocks. These numbers come from a deliberately harsh shape — a writer
 looping on eight blocks with the data cache off — and are worth taking as
 the direction of the effect rather than its magnitude.
 
+## Partial segments: writing out without a consistency point
+
+A dirty-data threshold has always published. That ties two things that have
+nothing to do with each other: how much a writer is holding, and where the
+checkpoint history has a point in it. The caller gets a checkpoint it never
+asked for, at a moment of its own work that it did not choose.
+
+Where nothing may publish, the coupling is worse than untidy. Inside a
+transaction, and throughout `WalRecoveryMode::Barrier`, a crossing is refused
+with `OutOfMemory` — a checkpoint there would put a state nobody declared
+beneath the floor recovery lands on. So a unit of work larger than the
+threshold could not be written at all.
+
+A **partial segment** is somewhere to put the data that is not a checkpoint.
+
+### When one is written
+
+Only when all of these hold:
+
+- the container's format is `BlockPtrFormat::PartedSegment`, which is fixed
+  when it is created — a partial is addressable only under that format
+- `parted_segment_enabled`, which is on by default and exists to take the
+  behaviour back on a container whose format allows it
+- the dirty set is at least `data_cache_dirty_min_bytes_to_part`, because a
+  partial smaller than the amount that triggers a write buys little memory
+  for a lasting cost in fragmented reads
+- one of the four non-consistency triggers fires: either dirty-data threshold,
+  the flush interval, or the point that used to be an `OutOfMemory` refusal
+
+Miss any of them and the trigger behaves exactly as it always did.
+
+### What is written, and what is not
+
+The object has the shape of any other segment — its own summary, its own
+metadata blocks, its own data blocks, and the inode inline — so anything that
+can parse a segment can parse one. A partial writes *every* dirty node, so the
+bmap root in that inode reaches every block the checkpoint holds so far: a
+partial is a whole state, not a fragment. Its header carries
+`SEGMENT_FLAG_PARTIAL`, which is what tells a reader arriving with an object
+name rather than a checkpoint number.
+
+What is **not** written is the inode object. That write is the consistency
+point, and without it a reader that opens the container normally still sees the
+previous checkpoint.
+
+**A partial is not a durability event.** A crash leaves its objects referenced
+by nothing, and without a WAL the data in them is gone — no flush returned, so
+no promise is broken, but "written out" must not be read as "durable".
+Recovering to a partial means opening it by name, which belongs to a repair
+tool: the caller's flush is the consistency point, and reading past it would
+take that away. With a WAL nothing changes, because the writes were durable
+before any of this.
+
+### Completing the checkpoint
+
+An explicit `flush`, `fdatasync`, `release` or `commit_txn` writes the
+consistency point: the remaining data, the remaining metadata, the summary, the
+inode inline, and then the inode object. It goes into part 0 of the same
+checkpoint — a checkpoint is one number however many objects it took, so the
+completion reuses the number the first partial took rather than allocating a
+fresh one.
+
+With no partial outstanding, that writes exactly the single segment it always
+did. This is the shape on purpose: partials appear only where memory pressure
+put them, and the ordinary case is one object per checkpoint.
+
+### The one ordering that matters
+
+Metadata pointers are assigned before the nodes are serialized, because a
+parent has to contain its children's pointers. So the data in the same object
+cannot be uploaded before its pointers are assigned either.
+
+What protects a reader instead is that **a block does not leave the dirty tier
+until its upload has landed**. Until then a read finds it in the cache and
+never resolves the pointer; afterwards the pointer resolves to bytes that are
+there. Moving that step earlier would open exactly the window a single-object
+WAL flush keeps a pinned buffer for.
+
+### What partials cost
+
+Writing the metadata early means writing some of it twice: a node written into a
+partial and then dirtied again is written again, and the earlier copy is
+unreferenced. For a write that moves forward through the file — a large repair
+pass, the case this exists for — leaf nodes finalize as the write passes them and
+the duplication is close to nothing. For scattered writes the same nodes keep
+being dirtied and the duplication grows with the number of partials.
+
+On the read side, each partial is a place a run of blocks breaks; see
+[placement.md](placement.md#why-the-two-are-not-the-same-question).
+
+### Interactions
+
+| | |
+|---|---|
+| a failed flush's rollback, or `abort_txn` | discards the accumulated checkpoint; its partials become unreferenced |
+| `publish_every` | does not defer while a checkpoint is pending — deferring says no checkpoint is needed, and partials on storage say one was started |
+| the part index | 14 bits, so 16384 partials to one checkpoint; reaching it is refused, not wrapped |
+| a threshold crossing during recovery | skipped, because recovery replays through the write path while holding the flush lock |
+
 ## Related tests
 
 - `reactor_wal_read_block_in_segment_still_uploading` — a reader against a
@@ -202,3 +303,13 @@ the direction of the effect rather than its magnitude.
 - `integration_reactor_s3_contention` — the drain and its admission
   control, among other things. Run it under `range-lock` as well as
   default features; the two exercise different mechanisms.
+- `integration_s3_parted_segment` — the only suite that produces a partial
+  segment, since it needs a format and a switch no other container uses. A
+  threshold crossing writes one and publishes nothing; the flush after several
+  of them reads back every byte; a partial is marked and an abandoned checkpoint
+  is not openable; and with the switch off the same workload publishes as
+  before.
+- `reactor_wal_partial_segments_still_recover_from_the_log` — the two mechanisms
+  composed. A partial relieves memory and is not durable; the log is what makes
+  the writes durable. What a crash after partials has to produce is every
+  acknowledged write, reached through the log.
