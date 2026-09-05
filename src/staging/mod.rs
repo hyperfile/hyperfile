@@ -49,7 +49,7 @@ pub trait Staging<L> {
     fn load_range(&self, segid: SegmentId, s3_off: usize, buf: &mut [u8]) -> impl Future<Output = Result<()>> + Send;
     fn new_segwr(&self, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> segment::Writer<Self> where Self: Sized;
     /// A writer aimed at exactly the object `segid` names, rather than at the
-    /// summary part of the checkpoint it belongs to. For a partial segment, which
+    /// object its checkpoint's consistency point writes. For a partial segment, which
     /// is one named object and not a checkpoint.
     fn new_segwr_at(&self, segid: SegmentId, hyper_file_config: &HyperFileMetaConfig) -> segment::Writer<Self> where Self: Sized;
     fn dir_filename(&self) -> (&str, &str);

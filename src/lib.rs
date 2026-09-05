@@ -82,12 +82,6 @@ impl SegmentId {
         Self { seq_id, part_id: Some(part_id) }
     }
 
-    /// From what a block pointer decoded to.
-    #[inline]
-    pub const fn from_parts(seq_id: u32, part_id: Option<u16>) -> Self {
-        Self { seq_id, part_id }
-    }
-
     /// The checkpoint this belongs to.
     #[inline]
     pub const fn seq_id(&self) -> u32 {
@@ -100,10 +94,25 @@ impl SegmentId {
         self.part_id
     }
 
-    /// Whether the checkpoint was streamed as several objects.
+    /// Whether this names one piece of a checkpoint that is not complete at this
+    /// object — a partial segment.
+    ///
+    /// Part 0 belongs to the consistency point, so the partials are the parts from
+    /// [`crate::segment::Segment::FIRST_DATA_PART`] up. A checkpoint written as a
+    /// single object has no part and is never a partial.
+    ///
+    /// True only because a partial is written at a part index above zero and the
+    /// consistency point at zero, which `write_partial_segment` is the one place to
+    /// establish. The distinction earns its own name because a flush serves reads
+    /// from a pinned buffer while its upload is outstanding, and that buffer holds
+    /// the object the flush is writing — never a partial, which is on storage before
+    /// any pointer to it is assigned.
     #[inline]
-    pub const fn is_parted(&self) -> bool {
-        self.part_id.is_some()
+    pub const fn is_partial(&self) -> bool {
+        match self.part_id {
+            None => false,
+            Some(p) => p >= crate::segment::Segment::FIRST_DATA_PART,
+        }
     }
 
     /// The checkpoint number as the inode and the segment header store it. Drops
@@ -119,16 +128,6 @@ impl SegmentId {
     #[inline]
     pub const fn whole(&self) -> Self {
         Self::new(self.seq_id)
-    }
-
-    /// Where this checkpoint's summary, metadata and inode live: part 0 when it
-    /// was streamed, and the one object otherwise.
-    #[inline]
-    pub const fn summary(&self) -> Self {
-        match self.part_id {
-            Some(_) => Self::with_part(self.seq_id, 0),
-            None => *self,
-        }
     }
 
     /// From a checkpoint number that came from a persisted field or a u64 API.
@@ -148,13 +147,6 @@ impl SegmentId {
     #[inline]
     pub const fn next(&self) -> Self {
         Self::new(self.seq_id + 1)
-    }
-
-    /// The previous checkpoint, saturating at zero. The log prefix feeding a
-    /// checkpoint is the one below it.
-    #[inline]
-    pub const fn prev(&self) -> Self {
-        Self::new(self.seq_id.saturating_sub(1))
     }
 }
 
@@ -193,13 +185,14 @@ mod segment_id_tests {
         let w = SegmentId::new(12345);
         assert_eq!(w.seq_id(), 12345);
         assert_eq!(w.part_id(), None);
-        assert!(!w.is_parted());
+        assert!(!w.is_partial(), "a checkpoint written as one object is not a partial");
 
         for part in [0u16, 1, 255, 16383] {
             let o = SegmentId::with_part(12345, part);
             assert_eq!(o.seq_id(), 12345);
             assert_eq!(o.part_id(), Some(part));
-            assert!(o.is_parted());
+            assert_eq!(o.is_partial(), part >= crate::segment::Segment::FIRST_DATA_PART,
+                "part {} classified wrongly", part);
         }
     }
 
@@ -211,12 +204,6 @@ mod segment_id_tests {
         assert_ne!(SegmentId::new(7), SegmentId::with_part(7, 0));
     }
 
-    #[test]
-    fn new_follows_what_a_pointer_decoded_to() {
-        assert_eq!(SegmentId::from_parts(9, None), SegmentId::new(9));
-        assert_eq!(SegmentId::from_parts(9, Some(4)), SegmentId::with_part(9, 4));
-    }
-
     /// Ordered by checkpoint first. Recovery and listing order by checkpoint, so
     /// a part index must never outrank one.
     #[test]
@@ -226,10 +213,13 @@ mod segment_id_tests {
         assert!(SegmentId::with_part(5, 1) < SegmentId::with_part(5, 2));
     }
 
+    /// Part 0 is the consistency point's, so it is not a partial however a partial
+    /// is spelled. This is the line the in-flight guard turns on.
     #[test]
-    fn summary_of_names_part_zero_or_itself() {
-        assert_eq!(SegmentId::with_part(3, 9).summary(), SegmentId::with_part(3, 0));
-        assert_eq!(SegmentId::new(3).summary(), SegmentId::new(3));
+    fn part_zero_is_not_a_partial() {
+        assert!(!SegmentId::with_part(3, 0).is_partial());
+        assert!(SegmentId::with_part(3, 1).is_partial());
+        assert!(SegmentId::with_part(3, 9).is_partial());
     }
 
     #[test]
