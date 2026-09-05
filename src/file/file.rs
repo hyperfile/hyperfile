@@ -2299,6 +2299,16 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         if !self.need_flush() {
             return Ok(false);
         }
+        // A write can arrive from inside a flush: recovery replays acknowledged
+        // writes through the ordinary write path while holding the flush lock, and
+        // a replay larger than the dirty threshold crosses it. Taking that lock
+        // again here is a deadlock against the task's own hold on it.
+        //
+        // Skipping is right rather than merely safe: something is already writing
+        // the dirty set out, and the threshold is checked again on the next write.
+        if self.state.is_flushing() {
+            return Ok(false);
+        }
         // A threshold or the interval is not a consistency point, and publishing
         // one here is what couples memory pressure to the checkpoint history. When
         // the container can write a partial instead, it does, and the checkpoint

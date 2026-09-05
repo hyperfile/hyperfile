@@ -3034,3 +3034,73 @@ async fn direct_wal_aborting_a_transaction_undoes_it_for_later_opens_too() {
     let _ = h.fs_release().await;
     cleanup_with_wal(&client, tf.uri()).await;
 }
+
+/// A container that writes partial segments still recovers from the log.
+///
+/// The two answer different questions and have to compose. A partial relieves
+/// memory and is not durable: nothing published, and a crash leaves it referenced
+/// by nothing. The log is what makes the writes durable, and recovery replays from
+/// it — so what a crash after partials must produce is every acknowledged write,
+/// reached through the log rather than through the objects the partials left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn reactor_wal_partial_segments_still_recover_from_the_log() {
+    let _ = env_logger::try_init();
+    let client = make_client().await;
+    const BLK: usize = 4096;
+    const BLOCKS: usize = 20;
+
+    let tf = TestFile::new(&client).await;
+    let d = hyperfile::config::HyperFileMetaConfig::default();
+    let meta = hyperfile::config::HyperFileMetaConfig::new(
+        d.root_size, d.meta_block_size, BLK,
+        hyperfile::meta_format::BlockPtrFormat::PartedSegment);
+    let mut runtime = hyperfile::config::HyperFileRuntimeConfig::default();
+    // Fire every 4 blocks and let a partial be worth writing at 2.
+    runtime.data_cache_dirty_max_blocks_threshold = 4;
+    runtime.data_cache_dirty_max_bytes_threshold = 4 * BLK;
+    runtime.data_cache_dirty_min_bytes_to_part = 2 * BLK;
+    // `segment_buffer_size` is left alone: the WAL path preallocates a buffer of
+    // that size, so a huge value to keep it from firing would try to allocate it.
+    runtime.data_cache_dirty_max_flush_interval = u64::MAX / 2;
+    let config = HyperFileConfigBuilder::new()
+        .with_staging_config(&StagingConfig::new_s3_uri(tf.uri(), None))
+        .with_meta_config(&meta)
+        .with_wal_config(&HyperFileWalConfig::new(&format!("{}/wal", tf.uri())))
+        .with_runtime_config(&runtime)
+        .build();
+
+    {
+        let reactor = make_reactor();
+        let hyper = Hyper::create(
+            client.clone(), config.clone(),
+            HyperFileFlags::from_flags(FileFlags::rdwr()),
+            HyperFileMode::from_mode(FileMode::default_file()),
+        ).await.expect("create");
+        let mut fh = HyperFileHandler::fh_from_hyper(&reactor, hyper).await.expect("spawn");
+        for i in 0..BLOCKS {
+            let b = AlignedDataBlockWrapper::new(i as u64, BLK, false);
+            b.as_mut_slice().fill(0x30 + i as u8);
+            let _ = fh.fh_write_aligned_batch(vec![b]).await.expect("write");
+        }
+        // No flush: the writes are durable because they are in the log, and the
+        // partials written along the way published nothing.
+        drop(fh);
+        drop(reactor);
+    }
+
+    let mut hyper = Hyper::open(
+        client.clone(), config.clone(),
+        HyperFileFlags::from_flags(FileFlags::rdwr()),
+    ).await.expect("reopen recovers");
+    for i in 0..BLOCKS {
+        let mut buf = vec![0u8; BLK];
+        let n = hyper.fs_read(i * BLK, &mut buf).await.expect("read");
+        assert_eq!(n, BLK, "short read at block {}", i);
+        assert!(buf.iter().all(|b| *b == 0x30 + i as u8),
+            "block {} came back {:#x}: an acknowledged write did not survive a crash \
+             after partial segments", i, buf[0]);
+    }
+    let _ = hyper.fs_release().await;
+    cleanup_with_wal(&client, tf.uri()).await;
+}

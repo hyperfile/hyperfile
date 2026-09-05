@@ -79,7 +79,12 @@ impl State {
         self.last_flush = Instant::now();
     }
 
-    #[cfg(feature = "reactor")]
+    /// Whether a flush holds the flush lock right now.
+    ///
+    /// Not feature-gated, because the flag is set and cleared unconditionally and
+    /// the question it answers arises without a reactor: recovery replays through
+    /// the ordinary write path while holding that lock, so a threshold crossing
+    /// during a replay would ask for it again.
     pub(crate) fn is_flushing(&self) -> bool {
         self.flushing.load(Ordering::SeqCst)
     }
