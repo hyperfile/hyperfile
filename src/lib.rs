@@ -171,10 +171,23 @@ impl From<u32> for SegmentId {
 }
 
 impl std::fmt::Display for SegmentId {
+    /// Renders the object name, and through [`Formatter::pad`] so that a width in the
+    /// format string reaches it.
+    ///
+    /// Writing to the formatter directly is the obvious way to do this and it silently
+    /// discards width, fill and alignment. A segment id names a stored object, so it
+    /// turns up in listings and log lines, which is exactly where something asks for a
+    /// column -- and the symptom is a table out of alignment rather than an error.
+    ///
+    /// `pad` and not `pad_integral`: in its parted form this renders as `3.12`, which
+    /// is not an integer, and the sign and radix handling would have nothing to say
+    /// about it. The cost is an allocation on a diagnostic path.
+    ///
+    /// [`Formatter::pad`]: std::fmt::Formatter::pad
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self.part_id {
-            None => write!(f, "{}", self.seq_id),
-            Some(p) => write!(f, "{}.{}", self.seq_id, p),
+            None => f.pad(&self.seq_id.to_string()),
+            Some(p) => f.pad(&format!("{}.{}", self.seq_id, p)),
         }
     }
 }
@@ -230,6 +243,14 @@ mod segment_id_tests {
         assert_eq!(SegmentId::new(3).to_string(), "3");
         assert_eq!(SegmentId::with_part(3, 0).to_string(), "3.0");
         assert_eq!(SegmentId::with_part(3, 12).to_string(), "3.12");
+
+        // A width in the format string has to reach it, which takes going through
+        // `Formatter::pad` rather than writing to the formatter. The assertions above
+        // cannot tell the difference, because `to_string` asks for no width.
+        assert_eq!(format!("[{:<6}]", SegmentId::new(3)), "[3     ]");
+        assert_eq!(format!("[{:>6}]", SegmentId::with_part(3, 12)), "[  3.12]");
+        assert_eq!(format!("[{:^7}]", SegmentId::with_part(3, 0)), "[  3.0  ]");
+        assert_eq!(format!("[{:*>6}]", SegmentId::new(42)), "[****42]");
     }
 }
 
