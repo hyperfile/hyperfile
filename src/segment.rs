@@ -54,6 +54,22 @@ impl Segment {
     /// How many partials one checkpoint may accumulate before the part index runs
     /// out of room in a pointer. Reaching it is refused, not wrapped.
     pub const MAX_PARTS: usize = crate::meta_format::BLOCK_PTR_PARTED_MAX_PARTS;
+
+    /// The object a checkpoint's own contents go into, for a container with this
+    /// meta config.
+    ///
+    /// Part 0 where the format streams checkpoints, and the single unsuffixed object
+    /// otherwise. One function because a second reading of this rule can disagree with
+    /// the first, and it would disagree by naming an object nobody wrote — which is
+    /// what happened to the staging benchmark, whose writer went through
+    /// `new_segwr` and whose reader spelled the name itself.
+    pub fn object_of(segid: SegmentId, config: &HyperFileMetaConfig) -> SegmentId {
+        if config.block_ptr_format.is_parted() {
+            segid.at_part(Self::SUMMARY_PART)
+        } else {
+            segid.checkpoint()
+        }
+    }
 }
 
 pub trait SegmentReadWrite {
@@ -272,11 +288,7 @@ impl<T: SegmentReadWrite> Writer<T> {
             #[cfg(feature = "wal")]
             data: Arc::new(Box::pin(Vec::with_capacity(buf_size))),
             offset: 0,
-            segid: if hyper_file_config.block_ptr_format.is_parted() {
-                segid.at_part(Segment::SUMMARY_PART)
-            } else {
-                segid.checkpoint()
-            },
+            segid: Segment::object_of(segid, hyper_file_config),
             ss: SegmentSum {
                 hdr: hdr,
                 blocks: Vec::new(),

@@ -189,10 +189,18 @@ Runs in about 0.1 s, under every feature combination including
 
 ## The build matrix, and how it was chosen
 
-Every combination below covers at least one `#[cfg]` that no other one reaches. That
-is the whole criterion: the list is derived from the gates in the source rather than
-from a guess at what is interesting, so a new gate either falls under an existing row
-or needs a new one.
+Two rules, and the second exists because the first is not enough on its own.
+
+Every combination below covers at least one `#[cfg]` that no other one reaches, so the
+list is derived from the gates in the source rather than from a guess at what is
+interesting. **And every feature declared in `Cargo.toml` is turned on by some row**,
+which is the half that non-redundancy does not give you: `bench` has exactly one
+`#[cfg]` in the whole crate, fell under no row, and had no row of its own, so it
+compiled nowhere and therefore failed nowhere until a consumer needed it.
+
+The second rule is checked by `every_declared_feature_is_built_somewhere` in
+`src/lib.rs`, which reads `[features]` and fails on anything the matrix does not name.
+Adding a feature fails that test until a row covers it.
 
 ```bash
 cargo build --release --lib                                                    # 1
@@ -202,6 +210,7 @@ cargo build --release --lib --features wal,range-lock,concurrent-segment-build  
 cargo build --release --lib --no-default-features --features blocking          # 5
 cargo build --release --lib --no-default-features --features blocking,wal      # 6
 cargo build --release --lib --no-default-features --features reactor           # 7
+cargo build --release --lib --no-default-features --features blocking,bench    # 8
 ```
 
 | | reaches only here |
@@ -213,6 +222,11 @@ cargo build --release --lib --no-default-features --features reactor           #
 | 5 | `not(reactor)` |
 | 6 | **`all(wal, blocking)`** |
 | 7 | `not(meta_loader_batch)` with a reactor |
+| 8 | `bench` |
+
+Rows 6 and 8 are here because they were missing, and each cost a release. Row 8's
+side is arbitrary — `bench.rs` has no gate on the running model, so `blocking,bench`
+and `reactor,bench` fail and pass together; one row is enough.
 
 Row 6 is here because it was missing. `wal` and `blocking` were each built alone, so
 the two functions gated on both — `wal_flush_process_blocking` and

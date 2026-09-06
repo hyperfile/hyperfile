@@ -443,3 +443,73 @@ mod tests {
         assert_eq!(ud.as_u32() & 0xFF, 0); // Nop = 0
     }
 }
+
+#[cfg(test)]
+mod build_matrix_tests {
+    /// Every feature the matrix in `tests/README.md` turns on somewhere.
+    ///
+    /// Kept here rather than derived from the document, because a test that parses
+    /// prose fails for reasons that have nothing to do with the property. What this
+    /// pins is the one thing that can be checked mechanically: that no declared
+    /// feature is outside the matrix entirely.
+    const COVERED_BY_THE_MATRIX: &[&str] = &[
+        "reactor",
+        "meta_loader_batch",
+        "wal",
+        "range-lock",
+        "concurrent-segment-build",
+        "blocking",
+        "bench",
+    ];
+
+    /// A feature nothing builds is a feature nothing checks.
+    ///
+    /// The matrix's own criterion — every row reaches a `#[cfg]` no other row does —
+    /// keeps the rows from being redundant. It does not say every gate is reached, and
+    /// `bench` fell through that gap: one `#[cfg]` in the whole crate, no row turning
+    /// it on, and four expressions left over from `SegmentId` becoming a type. It
+    /// compiled nowhere, so it failed nowhere, until a consumer needed it.
+    ///
+    /// So this asserts the other half. Adding a feature to `Cargo.toml` fails here
+    /// until the matrix covers it and this list says so.
+    #[test]
+    fn every_declared_feature_is_built_somewhere() {
+        let manifest = include_str!("../Cargo.toml");
+        let mut declared = Vec::new();
+        let mut in_features = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_features = line == "[features]";
+                continue;
+            }
+            if !in_features || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((name, _)) = line.split_once('=') {
+                let name = name.trim();
+                // `default` is not a gate, it is a choice of rows.
+                if !name.is_empty() && name != "default" {
+                    declared.push(name.to_string());
+                }
+            }
+        }
+        assert!(declared.len() >= 7,
+            "parsed only {:?} from [features], so this test is not reading the manifest \
+             it thinks it is", declared);
+
+        let missing: Vec<&String> = declared.iter()
+            .filter(|f| !COVERED_BY_THE_MATRIX.contains(&f.as_str()))
+            .collect();
+        assert!(missing.is_empty(),
+            "{:?} are declared features that the build matrix never turns on. A feature \
+             nothing builds is a feature nothing checks: add a row to the matrix in \
+             tests/README.md and name it in COVERED_BY_THE_MATRIX.", missing);
+
+        let stale: Vec<&&str> = COVERED_BY_THE_MATRIX.iter()
+            .filter(|f| !declared.iter().any(|d| d == *f))
+            .collect();
+        assert!(stale.is_empty(),
+            "{:?} are listed as covered but no longer declared in Cargo.toml", stale);
+    }
+}
