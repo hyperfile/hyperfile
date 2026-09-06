@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.7.1] - 2026-09-06
+
+### Fixed
+
+- **`--no-default-features --features blocking,wal` compiles.** On 0.7.0 it does not,
+  so a consumer using that combination cannot build the crate at all.
+
+  Two functions are gated on both features. Each feature was built alone and no
+  combination built both, so when the flush family's return type changed from a
+  checkpoint number to a `SegmentId`, three paths were updated and the fourth was not.
+  Nothing failed, because nothing compiled it.
+
+  The same combination turned up a `#[cfg]` wider than the code it guards:
+  `add_inflight_read` was gated on `wal` while its only caller is behind `reactor`.
+
+  The build matrix is now written down in `tests/README.md`, derived from the gates in
+  the source: every row covers at least one `#[cfg]` no other row reaches, so a new
+  gate either falls under an existing row or needs a new one. Seven rows, and the one
+  that was missing is marked as such. Zero warnings rather than zero errors is part of
+  the criterion, because a warning in one combination is often a gate that does not
+  match its code — which is how the missing row paid for itself immediately.
+
 ## [0.7.0] - 2026-09-05
 
 A checkpoint no longer has to be one object, which lets a container write data out
