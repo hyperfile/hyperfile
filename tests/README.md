@@ -187,6 +187,49 @@ cargo test --test functional_memory_staging
 Runs in about 0.1 s, under every feature combination including
 `--no-default-features --features blocking`.
 
+## The build matrix, and how it was chosen
+
+Every combination below covers at least one `#[cfg]` that no other one reaches. That
+is the whole criterion: the list is derived from the gates in the source rather than
+from a guess at what is interesting, so a new gate either falls under an existing row
+or needs a new one.
+
+```bash
+cargo build --release --lib                                                    # 1
+cargo build --release --lib --features wal                                     # 2
+cargo build --release --lib --features range-lock                              # 3
+cargo build --release --lib --features wal,range-lock,concurrent-segment-build  # 4
+cargo build --release --lib --no-default-features --features blocking          # 5
+cargo build --release --lib --no-default-features --features blocking,wal      # 6
+cargo build --release --lib --no-default-features --features reactor           # 7
+```
+
+| | reaches only here |
+|---|---|
+| 1 | `not(wal)`, `not(range-lock)`, `not(blocking)`, `meta_loader_batch` |
+| 2 | `wal`, `all(wal, reactor)` |
+| 3 | `range-lock`, `all(reactor, range-lock)` |
+| 4 | `all(concurrent-segment-build, wal)` |
+| 5 | `not(reactor)` |
+| 6 | **`all(wal, blocking)`** |
+| 7 | `not(meta_loader_batch)` with a reactor |
+
+Row 6 is here because it was missing. `wal` and `blocking` were each built alone, so
+the two functions gated on both — `wal_flush_process_blocking` and
+`kick_wal_protected_flush_blocking` — were never compiled, and a change to a return
+type three other flush paths shared left that one broken. Nothing failed, because
+nothing built it.
+
+`reactor` and `blocking` are mutually exclusive and say so through a `compile_error!`,
+so no row combines them.
+
+Zero warnings, not just zero errors. A warning in one combination is often a `#[cfg]`
+that is wider than the code it guards — which is how row 6 turned up a counter gated on
+`wal` whose only caller is behind `reactor`.
+
+Touch `src/lib.rs` between rows: cargo caches by feature set, and a clean rebuild is
+what makes the warning count mean anything.
+
 ### `replay_fsx_log`
 
 Replays an `fsx` operation log against hyperfile, checking every read

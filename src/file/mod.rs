@@ -308,7 +308,9 @@ impl ReadTiming {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "wal")]
+    /// Only the reactor's read path serves a block out of a flush's pinned buffer, so
+    /// only there is there anything to count.
+    #[cfg(all(feature = "wal", feature = "reactor"))]
     #[inline]
     pub(crate) fn add_inflight_read(&self) {
         self.inflight_reads.fetch_add(1, Ordering::Relaxed);
@@ -1100,7 +1102,7 @@ pub trait HyperTrait<T: Staging<L> + segment::SegmentReadWrite + Send + Clone + 
 
         let (segid, dirty_data_blocks) = self.flush_process_pre_build_segment().await?;
         if segid > 0 {
-            return Ok(segid);
+            return Ok(SegmentId::new_from_cno(segid));
         }
         let (segwr, segid, raw_inode, dirty_meta_vec) = self.flush_process_build_segment(dirty_data_blocks).await?;
 
