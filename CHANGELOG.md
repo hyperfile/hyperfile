@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.7.2] - 2026-09-06
+
+### Fixed
+
+- **The `bench` feature compiles.** Four expressions in `src/staging/bench.rs` were
+  left over from `SegmentId` becoming a type. The same shape as the `blocking + wal`
+  breakage 0.7.1 repaired, and worse in one respect: no row of the build matrix turned
+  `bench` on, not even alone, so it compiled nowhere and therefore failed nowhere.
+
+- **The staging benchmark reads the object it wrote.** Fixing the types was not
+  enough. Under this release's default format the writer goes through `new_segwr`,
+  which names part 0, while the reader spelled the bare checkpoint name itself — so
+  every read would have missed. The rule lives in one place now,
+  `Segment::object_of`, called by both.
+
+  Its iteration also advances by checkpoint rather than by part, which is the only
+  choice that works: a segment object is written create-only, so each iteration needs
+  an id nobody has used, and advancing by part would name the same object every time
+  since a checkpoint's contents go in part 0 whatever part the id carries.
+
+### Changed
+
+- **The build matrix has a second rule, because the first was not enough.** "Every row
+  reaches a `#[cfg]` no other row does" keeps the rows from being redundant; it does
+  not say every gate is reached, and `bench` fell through that gap with one `#[cfg]` in
+  the whole crate. So: every feature declared in `Cargo.toml` is turned on by some row.
+
+  `every_declared_feature_is_built_somewhere` checks it by reading the manifest, so
+  adding a feature fails that test until a row covers it. The matrix itself is in
+  `tests/README.md` and now has eight rows.
+
 ## [0.7.1] - 2026-09-06
 
 ### Fixed
