@@ -142,6 +142,42 @@ impl HyperFileFlags {
     }
 }
 
+/// The four `open(2)` flags Linux has and darwin does not.
+///
+/// Given Linux's own values, so that a flag word originating on Linux -- which is the
+/// only way these bits reach a host without them -- still reads as intended. A host
+/// that has no such flag cannot set the bit itself, so the predicate answers no, which
+/// is the right answer there.
+///
+/// Two of the four behave oddly off Linux and are worth knowing before anything starts
+/// deciding on them:
+///
+/// - `O_PATH`'s Linux value is darwin's `O_SYMLINK`, so a darwin caller asking for
+///   `O_SYMLINK` reads as [`FileFlags::is_path`].
+/// - `O_LARGEFILE` is zero on 64-bit Linux, where every file is a large file, and
+///   `(flags & 0) == 0` holds for any input -- so [`FileFlags::is_largefile`] is true
+///   whatever it is given. That is already the answer on x86_64 Linux and not something
+///   this introduces.
+///
+/// Both of those are read only by the `Display` impl. The two that reach behaviour,
+/// `O_DIRECT` (whether reads and writes use the data block cache) and `O_NOATIME`
+/// (whether a read moves the access time), land on bits darwin does not define, so they
+/// answer no there and cannot be turned on by accident.
+#[cfg(target_os = "linux")]
+mod linux_only {
+    pub(super) use libc::{O_DIRECT, O_LARGEFILE, O_NOATIME, O_PATH};
+}
+
+#[cfg(not(target_os = "linux"))]
+mod linux_only {
+    use libc::c_int;
+
+    pub(super) const O_DIRECT: c_int = 0o40000;
+    pub(super) const O_LARGEFILE: c_int = 0;
+    pub(super) const O_NOATIME: c_int = 0o1000000;
+    pub(super) const O_PATH: c_int = 0o10000000;
+}
+
 pub struct FileFlags(libc::c_int);
 
 impl fmt::Display for FileFlags {
@@ -256,7 +292,7 @@ impl FileFlags {
     }
 
     pub fn is_direct(&self) -> bool {
-        (self.0 & libc::O_DIRECT) == libc::O_DIRECT
+        (self.0 & linux_only::O_DIRECT) == linux_only::O_DIRECT
     }
 
     pub fn is_directory(&self) -> bool {
@@ -272,11 +308,11 @@ impl FileFlags {
     }
 
     pub fn is_largefile(&self) -> bool {
-        (self.0 & libc::O_LARGEFILE) == libc::O_LARGEFILE
+        (self.0 & linux_only::O_LARGEFILE) == linux_only::O_LARGEFILE
     }
 
     pub fn is_noatime(&self) -> bool {
-        (self.0 & libc::O_NOATIME) == libc::O_NOATIME
+        (self.0 & linux_only::O_NOATIME) == linux_only::O_NOATIME
     }
 
     pub fn is_noctty(&self) -> bool {
@@ -296,7 +332,7 @@ impl FileFlags {
     }
 
     pub fn is_path(&self) -> bool {
-        (self.0 & libc::O_PATH) == libc::O_PATH
+        (self.0 & linux_only::O_PATH) == linux_only::O_PATH
     }
 
     pub fn is_sync(&self) -> bool {
@@ -353,7 +389,7 @@ mod tests {
 
     #[test]
     fn file_flags_direct_sync_dsync() {
-        let f = FileFlags::from(libc::O_WRONLY | libc::O_DIRECT | libc::O_SYNC | libc::O_DSYNC);
+        let f = FileFlags::from(libc::O_WRONLY | linux_only::O_DIRECT | libc::O_SYNC | libc::O_DSYNC);
         assert!(f.is_wronly());
         assert!(f.is_direct());
         assert!(f.is_sync());
@@ -397,7 +433,7 @@ mod tests {
 
     #[test]
     fn hyper_flags_sync_flush_mode_from_direct() {
-        let f = FileFlags::from(libc::O_WRONLY | libc::O_DIRECT);
+        let f = FileFlags::from(libc::O_WRONLY | linux_only::O_DIRECT);
         let hf = HyperFileFlags::from_flags(f);
         assert!(hf.is_direct());
         assert!(hf.is_sync_flush_mode());
@@ -464,7 +500,7 @@ mod tests {
 
     #[test]
     fn hyper_flags_noatime_set_when_o_noatime() {
-        let f = FileFlags::from(libc::O_RDONLY | libc::O_NOATIME);
+        let f = FileFlags::from(libc::O_RDONLY | linux_only::O_NOATIME);
         let hf = HyperFileFlags::from_flags(f);
         assert!(hf.is_noatime());
         // O_NOATIME alone shouldn't enable sync_flush_mode
@@ -473,7 +509,7 @@ mod tests {
 
     #[test]
     fn hyper_flags_noatime_orthogonal_to_other_flags() {
-        let f = FileFlags::from(libc::O_RDWR | libc::O_NOATIME | libc::O_DIRECT);
+        let f = FileFlags::from(libc::O_RDWR | linux_only::O_NOATIME | linux_only::O_DIRECT);
         let hf = HyperFileFlags::from_flags(f);
         assert!(hf.is_noatime());
         assert!(hf.is_direct());
