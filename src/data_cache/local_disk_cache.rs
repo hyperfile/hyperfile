@@ -48,6 +48,12 @@ pub(crate) struct LocalDiskCache {
     nslots: usize,
     /// Free slot indices, used as a stack.
     free_slots: Vec<u32>,
+    /// The backing file, held to own the descriptor: its `Drop` closes the fd once the
+    /// mapping is torn down.
+    ///
+    /// Read only by `punch`, which is Linux-only, so elsewhere the field is carried and
+    /// never looked at -- which is its job here.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     file: std::fs::File,
     /// Whether the mapping has already been torn down.
     ///
@@ -221,6 +227,18 @@ impl LocalDiskCache {
         self.free_slots.push(slot);
     }
 
+    /// Hand the slot's space back to the filesystem, keeping the file's length.
+    ///
+    /// Space reclamation and nothing else: the slot goes straight onto `free_slots` and
+    /// is written in full before it is read again, so a host that skips this pays in
+    /// footprint. The cache file is created at its full length and is sparse until
+    /// written, so skipping means it ends up fully allocated once every slot has been
+    /// used once.
+    ///
+    /// It does change what a bug in slot accounting would look like. After a punch the
+    /// region reads as zeros; without one it reads as whatever the previous tenant left.
+    /// Neither is correct, but they fail differently.
+    #[cfg(target_os = "linux")]
     fn punch(&self, slot: u32) {
         let fd = self.file.as_raw_fd();
         let offset = self.slot_offset(slot) as libc::off_t;
@@ -232,6 +250,14 @@ impl LocalDiskCache {
             panic!("fallocate failed to punch hole at offset: {}, len: {}, error: {}",
                 offset, len, Error::last_os_error());
         }
+    }
+
+    /// `fallocate` is Linux's. darwin has `fcntl(F_PUNCHHOLE)` and this could use it;
+    /// what it would buy is the footprint of a local cache file, which is why it does
+    /// not. See the Linux one above for what going without costs.
+    #[cfg(not(target_os = "linux"))]
+    fn punch(&self, slot: u32) {
+        let _ = slot;
     }
 
     /// Sync and unmap, exactly once.
