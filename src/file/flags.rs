@@ -263,6 +263,41 @@ impl FileFlags {
         Self(libc::O_RDWR)
     }
 
+    /// Ask for what Linux's `O_DIRECT` names: reads and writes that do not go through
+    /// the data block cache.
+    ///
+    /// A method rather than a bit to hand [`Self::from`], because `from` takes the host's
+    /// own flag word and darwin has no `O_DIRECT` -- there is no bit to set. Without this
+    /// a caller there could not ask for it at all.
+    ///
+    /// Only this and [`Self::noatime`] are spelled out as methods. Every other flag
+    /// hyperfile acts on exists on both platforms, so `from` can carry it.
+    ///
+    /// ```no_run
+    /// # use hyperfile::file::flags::FileFlags;
+    /// let flags = FileFlags::rdwr().direct();
+    /// assert!(flags.is_direct());
+    /// ```
+    pub fn direct(mut self) -> Self {
+        self.0 |= linux_only::O_DIRECT;
+        self
+    }
+
+    /// Ask for what Linux's `O_NOATIME` names: reads that leave the access time alone.
+    ///
+    /// A method for the same reason as [`Self::direct`]: darwin has no such flag, so
+    /// there is no bit a caller could pass.
+    ///
+    /// ```no_run
+    /// # use hyperfile::file::flags::FileFlags;
+    /// let flags = FileFlags::rdonly().noatime();
+    /// assert!(flags.is_noatime());
+    /// ```
+    pub fn noatime(mut self) -> Self {
+        self.0 |= linux_only::O_NOATIME;
+        self
+    }
+
     pub fn is_rdonly(&self) -> bool {
         (self.0 & libc::O_ACCMODE) == libc::O_RDONLY
     }
@@ -347,6 +382,45 @@ impl FileFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_and_noatime_can_be_asked_for_without_naming_a_host_bit() {
+        let d = FileFlags::rdwr().direct();
+        assert!(d.is_direct());
+        assert!(d.is_rdwr());
+        assert!(!d.is_noatime(), "one must not turn the other on");
+
+        let n = FileFlags::rdonly().noatime();
+        assert!(n.is_noatime());
+        assert!(n.is_rdonly());
+        assert!(!n.is_direct());
+
+        let both = FileFlags::rdwr().direct().noatime();
+        assert!(both.is_direct() && both.is_noatime() && both.is_rdwr());
+    }
+
+    /// The other way in, which is the one a caller with a real `open(2)` flag word uses.
+    ///
+    /// Kept as a separate Linux-only test on purpose: the methods above compile
+    /// everywhere and would happily stand in for this, and then nothing would check that
+    /// a flag word carrying the bit still arrives as `is_direct()` -- which is the path
+    /// every caller on Linux actually takes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_host_flag_word_carrying_the_bit_arrives_the_same_way() {
+        let from_word = FileFlags::from(libc::O_RDWR | libc::O_DIRECT | libc::O_NOATIME);
+        assert!(from_word.is_direct());
+        assert!(from_word.is_noatime());
+
+        let from_methods = FileFlags::rdwr().direct().noatime();
+        assert_eq!(
+            HyperFileFlags::from_flags(from_word).direct,
+            HyperFileFlags::from_flags(from_methods).direct,
+            "the two ways in must reach the same decision");
+        assert_eq!(
+            HyperFileFlags::from_flags(FileFlags::from(libc::O_RDWR | libc::O_NOATIME)).noatime,
+            HyperFileFlags::from_flags(FileFlags::rdwr().noatime()).noatime);
+    }
 
     // --- FileFlags constructors ---
 

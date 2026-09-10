@@ -308,7 +308,7 @@ async fn smoke_o_noatime_skips_atime_update_on_read() {
 
     // Test: O_RDONLY | O_NOATIME -- a read must NOT advance atime.
     {
-        let flags = FileFlags::from(libc::O_RDONLY | libc::O_NOATIME);
+        let flags = FileFlags::rdonly().noatime();
         let mut hyper = Hyper::fs_open(&client, tf.uri(), flags)
             .await
             .expect("open w/ O_NOATIME");
@@ -1992,7 +1992,7 @@ async fn smoke_o_direct_read_write_does_not_panic() {
     let tf = TestFile::new(&client).await;
 
     const BLOCK: usize = 4096;
-    let direct = FileFlags::from(libc::O_RDWR | libc::O_DIRECT);
+    let direct = FileFlags::rdwr().direct();
 
     // Create with O_DIRECT and write two blocks.
     {
@@ -2022,7 +2022,7 @@ async fn smoke_o_direct_read_write_does_not_panic() {
 
     // Reopen with O_DIRECT and verify content.
     {
-        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::from(libc::O_RDONLY | libc::O_DIRECT))
+        let mut hyper = Hyper::fs_open(&client, tf.uri(), FileFlags::rdonly().direct())
             .await.expect("reopen with O_DIRECT");
         let mut buf = vec![0u8; BLOCK * 2];
         let n = hyper.fs_read(0, &mut buf).await.expect("read after reopen");
