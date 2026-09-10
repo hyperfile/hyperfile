@@ -5,6 +5,26 @@ const DEFAULT_INODE_BMAP_SIZE: usize = DEFAULT_ROOT_SIZE;
 
 pub type BMapRawType = [u8; DEFAULT_INODE_BMAP_SIZE];
 
+/// The `S_IF*` file-type bits in the width the inode stores its mode.
+///
+/// `mode_t` is 32-bit on Linux and 16-bit on darwin, while [`InodeRaw::i_mode`] is 32-bit
+/// on both: it is an on-disk field, and a format cannot narrow with the host.
+///
+/// Only the width differs. The *values* are identical on both platforms -- POSIX fixed
+/// `S_IFMT` at 0o170000, `S_IFREG` at 0o100000 and so on -- which is why a mode written
+/// on one platform means the same thing read back on the other.
+pub(crate) mod mode_bits {
+    pub(crate) const S_IFMT: u32 = libc::S_IFMT as u32;
+    pub(crate) const S_IFCHR: u32 = libc::S_IFCHR as u32;
+    pub(crate) const S_IFBLK: u32 = libc::S_IFBLK as u32;
+    /// Only the tests compare against these two; the library builds a mode from
+    /// `libc`'s own constants and casts the whole expression once.
+    #[cfg(test)]
+    pub(crate) const S_IFREG: u32 = libc::S_IFREG as u32;
+    #[cfg(test)]
+    pub(crate) const S_IFDIR: u32 = libc::S_IFDIR as u32;
+}
+
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(8))]
 pub struct InodeRaw {
@@ -373,7 +393,7 @@ mod tests {
         // the otherwise-unused i_last_cno slot.
         let rdev: u64 = 0x1234_5678;
         let mut raw = InodeRaw::default();
-        raw.i_mode = libc::S_IFCHR | 0o644;
+        raw.i_mode = mode_bits::S_IFCHR | 0o644;
         raw.set_inline(&[]);   // zeroes the tail, sets FLAG_INLINE, i_size = 0
         raw.set_rdev(rdev);
         assert_eq!(raw.rdev(), rdev);
@@ -387,12 +407,12 @@ mod tests {
         // to_stat surfaces rdev for a device-mode inode (ignoring the param),
         // and 0 for a non-device inode.
         let st = crate::inode::Inode::from_raw(&raw2, None).to_stat(0, 0);
-        assert_eq!(st.st_rdev, rdev, "char device rdev in stat");
+        assert_eq!(st.st_rdev as u64, rdev, "char device rdev in stat");
         assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFCHR);
         assert_eq!(st.st_size, 0);
 
         let mut reg = InodeRaw::default();
-        reg.i_mode = libc::S_IFREG | 0o644;
+        reg.i_mode = mode_bits::S_IFREG | 0o644;
         reg.set_rdev(rdev); // i_last_cno set, but mode isn't a device
         let streg = crate::inode::Inode::from_raw(&reg, None).to_stat(0, 7);
         assert_eq!(streg.st_rdev, 7, "non-device inode uses the passed rdev, not i_last_cno");
@@ -687,7 +707,7 @@ mod tests {
         hdr.s_inode.i_blocks = 2048;
         hdr.s_inode.i_uid = 1001;
         hdr.s_inode.i_gid = 1002;
-        hdr.s_inode.i_mode = libc::S_IFREG | 0o644;
+        hdr.s_inode.i_mode = mode_bits::S_IFREG | 0o644;
         hdr.s_inode.i_nlink = 3;
         hdr.s_inode.i_last_seq = 42;
         hdr.s_inode.i_last_cno = 42;
@@ -703,7 +723,7 @@ mod tests {
         assert_eq!(decoded.s_inode.i_blocks, 2048);
         assert_eq!(decoded.s_inode.i_uid, 1001);
         assert_eq!(decoded.s_inode.i_gid, 1002);
-        assert_eq!(decoded.s_inode.i_mode, libc::S_IFREG | 0o644);
+        assert_eq!(decoded.s_inode.i_mode, mode_bits::S_IFREG | 0o644);
         assert_eq!(decoded.s_inode.i_nlink, 3);
         assert_eq!(decoded.s_inode.i_last_seq, 42);
         assert_eq!(decoded.s_inode.i_last_cno, 42);

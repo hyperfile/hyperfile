@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use chrono::{Utc, TimeZone};
 use crate::SegmentId;
 use crate::Cno;
-use crate::ondisk::{InodeRaw, BMapRawType};
+use crate::ondisk::{InodeRaw, BMapRawType, mode_bits};
 use crate::config::HyperFileMetaConfig;
 use crate::file::mode::{HyperFileMode, FileMode};
 
@@ -137,12 +137,6 @@ impl Inode {
         self.i_attr_dirty = true;
     }
 
-    /// `S_IFMT` in the width the inode stores its mode.
-    ///
-    /// `mode_t` is 32-bit on Linux and 16-bit on darwin; `i_mode` is 32-bit on both
-    /// because it is an on-disk field, and the format cannot narrow with the host.
-    const S_IFMT: u32 = libc::S_IFMT as u32;
-
     pub fn default_dir() -> Self {
         let mut inode = Self::default();
         inode.i_meta_config = HyperFileMetaConfig::default().as_u32();
@@ -174,13 +168,13 @@ impl Inode {
 
     pub fn with_mode(mut self, mode: &HyperFileMode) -> Self {
         let mode_value = mode.to_u32();
-        let file_type =  mode_value & Self::S_IFMT;
+        let file_type =  mode_value & mode_bits::S_IFMT;
         if file_type > 0 {
             // use mode's filetype if it is set
-            self.i_mode = file_type | (mode_value & !Self::S_IFMT);
+            self.i_mode = file_type | (mode_value & !mode_bits::S_IFMT);
         } else {
             // failback to default file type
-            self.i_mode = (self.i_mode & Self::S_IFMT) | (mode_value & !Self::S_IFMT);
+            self.i_mode = (self.i_mode & mode_bits::S_IFMT) | (mode_value & !mode_bits::S_IFMT);
         }
         self
     }
@@ -283,8 +277,8 @@ impl Inode {
 
         // A char/block device node persists its rdev in i_last_cno (it has no
         // segments, so that slot is free); other inodes use the passed value.
-        let fmt = self.i_mode & Self::S_IFMT;
-        let rdev = if fmt == libc::S_IFCHR as u32 || fmt == libc::S_IFBLK as u32 {
+        let fmt = self.i_mode & mode_bits::S_IFMT;
+        let rdev = if fmt == mode_bits::S_IFCHR || fmt == mode_bits::S_IFBLK {
             self.i_last_cno
         } else {
             rdev
@@ -562,7 +556,7 @@ mod tests {
         raw.i_blocks = 128;
         raw.i_uid = 1000;
         raw.i_gid = 1000;
-        raw.i_mode = libc::S_IFREG | 0o644;
+        raw.i_mode = mode_bits::S_IFREG | 0o644;
         raw.i_nlink = 2;
         raw.i_last_seq = 10;
         raw.i_last_cno = 10;
@@ -584,7 +578,7 @@ mod tests {
         assert_eq!(raw2.i_blocks, 128);
         assert_eq!(raw2.i_uid, 1000);
         assert_eq!(raw2.i_gid, 1000);
-        assert_eq!(raw2.i_mode, libc::S_IFREG | 0o644);
+        assert_eq!(raw2.i_mode, mode_bits::S_IFREG | 0o644);
         assert_eq!(raw2.i_nlink, 2);
         assert_eq!(raw2.i_last_seq, 10);
         assert_eq!(raw2.i_last_cno, 10);
@@ -617,7 +611,7 @@ mod tests {
     #[test]
     fn default_file_properties() {
         let inode = Inode::default_file();
-        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(inode.i_mode & mode_bits::S_IFMT, mode_bits::S_IFREG);
         assert_eq!(inode.i_uid, 1000);
         assert_eq!(inode.i_gid, 1000);
         assert_eq!(inode.i_nlink, 1);
@@ -637,7 +631,7 @@ mod tests {
     #[test]
     fn default_dir_properties() {
         let inode = Inode::default_dir();
-        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(inode.i_mode & mode_bits::S_IFMT, mode_bits::S_IFDIR);
         assert_eq!(inode.i_uid, 1000);
         assert_eq!(inode.i_nlink, 1);
         assert!(inode.i_atime > 0, "atime must be set on create");
@@ -785,7 +779,8 @@ mod tests {
         assert_eq!(stat.st_blocks, 16);
         assert_eq!(stat.st_uid, 500);
         assert_eq!(stat.st_gid, 600);
-        assert_eq!(stat.st_mode, inode.i_mode);
+        // `st_mode` is 16-bit on darwin; `i_mode` is the on-disk 32-bit field.
+        assert_eq!(stat.st_mode as u32, inode.i_mode);
         assert_eq!(stat.st_atime, 1000);
         assert_eq!(stat.st_atime_nsec, 111);
         assert_eq!(stat.st_mtime, 2000);
@@ -916,15 +911,15 @@ mod tests {
         let inode = Inode::default_file()
             .with_mode(&HyperFileMode::from_mode(FileMode::from(0o755)));
         // file type should remain S_IFREG since mode had no file type bits
-        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFREG);
-        assert_eq!(inode.i_mode & !libc::S_IFMT, 0o755);
+        assert_eq!(inode.i_mode & mode_bits::S_IFMT, mode_bits::S_IFREG);
+        assert_eq!(inode.i_mode & !mode_bits::S_IFMT, 0o755);
     }
 
     #[test]
     fn with_mode_overrides_file_type_when_set() {
         let inode = Inode::default_file()
             .with_mode(&HyperFileMode::from_mode(FileMode::from(libc::S_IFDIR | 0o755)));
-        assert_eq!(inode.i_mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(inode.i_mode & mode_bits::S_IFMT, mode_bits::S_IFDIR);
     }
 
     // --- meta_config round-trip ---

@@ -64,6 +64,8 @@ impl FileMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `to_u32` is the same 32-bit mode domain the on-disk inode uses.
+    use crate::ondisk::mode_bits;
 
     #[test]
     fn file_mode_default_file() {
@@ -91,16 +93,16 @@ mod tests {
         let fm = FileMode::from(libc::S_IFREG | 0o644);
         let hm = HyperFileMode::from_mode(fm);
         let val = hm.to_u32();
-        assert_eq!(val & libc::S_IFMT, libc::S_IFREG);
-        assert_eq!(val & !libc::S_IFMT, 0o644);
+        assert_eq!(val & mode_bits::S_IFMT, mode_bits::S_IFREG);
+        assert_eq!(val & !mode_bits::S_IFMT, 0o644);
     }
 
     #[test]
     fn hyper_file_mode_permissions_only() {
         let fm = FileMode::from(0o755); // no file type bits
         let hm = HyperFileMode::from_mode(fm);
-        assert_eq!(hm.to_u32() & libc::S_IFMT, 0);
-        assert_eq!(hm.to_u32() & !libc::S_IFMT, 0o755);
+        assert_eq!(hm.to_u32() & mode_bits::S_IFMT, 0);
+        assert_eq!(hm.to_u32() & !mode_bits::S_IFMT, 0o755);
     }
 
     #[test]
