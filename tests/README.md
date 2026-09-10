@@ -244,6 +244,56 @@ that is wider than the code it guards — which is how row 6 turned up a counter
 Touch `src/lib.rs` between rows: cargo caches by feature set, and a clean rebuild is
 what makes the warning count mean anything.
 
+### The other axis: targets
+
+The eight rows above vary features on one target. A platform gate needs a target
+instead, and there are two rows because a library-only check misses half of them:
+
+```bash
+cargo zigbuild --lib   --target aarch64-apple-darwin   # 9
+cargo zigbuild --tests --target aarch64-apple-darwin   # 10
+```
+
+Row 9 reaches every `target_os` and `target_vendor` gate in the crate: the `fallocate`
+punch in `local_disk_cache.rs`, the four `open(2)` flags `linux_only` supplies for hosts
+that lack them, and the per-target `libc::stat` widths in `Inode::to_stat` together with
+the `compile_error!` that refuses a target whose widths are not written down.
+
+**One target, not one per feature row.** Before any of this was fixed, all eight feature
+combinations produced the same 35 errors in the same four files — measured, not assumed.
+The portability surface is entirely in code that compiles unconditionally, so crossing
+the two axes buys nothing.
+
+**Row 10 is the one that is easy to leave out, and leaving it out gives a wrong answer.**
+At the baseline `--lib` had 35 errors and `--tests` had 80, because `src/file/mode.rs`
+and `src/ondisk.rs` fail *only* inside their `#[cfg(test)]` modules. Check the library
+alone and you conclude `mode.rs` needs no changes; it needs ten.
+
+Compiling is all these two rows check. The link step wants the `Security` and
+`CoreFoundation` frameworks from a macOS SDK and fails without one, so count compile
+errors rather than trusting the exit status:
+
+```bash
+cargo zigbuild --tests --target aarch64-apple-darwin 2>&1 | grep -cE '^error\[E'
+```
+
+Running the suite is a macOS job, and so is anything about `mlock`: `src/buffer.rs`
+panics when it fails, macOS has it with its own limits, and no cross build can say
+whether those limits hold.
+
+Setting it up on a Linux host:
+
+```bash
+rustup target add aarch64-apple-darwin
+cargo install cargo-zigbuild          # and zig 0.13 on PATH
+export CFLAGS_aarch64_apple_darwin="-march=armv8.2-a+crypto+sha3"
+```
+
+The `CFLAGS` is for `aws-lc-sys`, whose `cpu_aarch64_apple.c` raises an `#error` without
+it. A C cross-compiler is needed at all because `foyer` is an unconditional dependency
+and pulls `zstd-sys` and `lz4-sys`, which is why a plain `cargo check --target` dies in a
+build script having said nothing about this crate.
+
 ### `replay_fsx_log`
 
 Replays an `fsx` operation log against hyperfile, checking every read
