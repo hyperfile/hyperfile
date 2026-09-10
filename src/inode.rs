@@ -137,11 +137,17 @@ impl Inode {
         self.i_attr_dirty = true;
     }
 
+    /// `S_IFMT` in the width the inode stores its mode.
+    ///
+    /// `mode_t` is 32-bit on Linux and 16-bit on darwin; `i_mode` is 32-bit on both
+    /// because it is an on-disk field, and the format cannot narrow with the host.
+    const S_IFMT: u32 = libc::S_IFMT as u32;
+
     pub fn default_dir() -> Self {
         let mut inode = Self::default();
         inode.i_meta_config = HyperFileMetaConfig::default().as_u32();
         // o755
-        inode.i_mode = libc::S_IFDIR | libc::S_IRWXU | libc::S_IWUSR | libc::S_IRGRP | libc::S_IXGRP | libc::S_IROTH | libc::S_IXOTH;
+        inode.i_mode = (libc::S_IFDIR | libc::S_IRWXU | libc::S_IWUSR | libc::S_IRGRP | libc::S_IXGRP | libc::S_IROTH | libc::S_IXOTH) as u32;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
         inode.i_nlink = 1;
@@ -153,7 +159,7 @@ impl Inode {
         let mut inode = Self::default();
         inode.i_meta_config = HyperFileMetaConfig::default().as_u32();
         // o644
-        inode.i_mode = libc::S_IFREG | libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IROTH;
+        inode.i_mode = (libc::S_IFREG | libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IROTH) as u32;
         inode.i_uid = 1000;
         inode.i_gid = 1000;
         inode.i_nlink = 1;
@@ -168,13 +174,13 @@ impl Inode {
 
     pub fn with_mode(mut self, mode: &HyperFileMode) -> Self {
         let mode_value = mode.to_u32();
-        let file_type =  mode_value & libc::S_IFMT;
+        let file_type =  mode_value & Self::S_IFMT;
         if file_type > 0 {
             // use mode's filetype if it is set
-            self.i_mode = file_type | (mode_value & !libc::S_IFMT);
+            self.i_mode = file_type | (mode_value & !Self::S_IFMT);
         } else {
             // failback to default file type
-            self.i_mode = (self.i_mode & libc::S_IFMT) | (mode_value & !libc::S_IFMT);
+            self.i_mode = (self.i_mode & Self::S_IFMT) | (mode_value & !Self::S_IFMT);
         }
         self
     }
@@ -184,7 +190,8 @@ impl Inode {
     }
 
     pub fn mode(&self) -> HyperFileMode {
-        HyperFileMode::from_mode(FileMode::from(self.i_mode))
+        // `FileMode` works in `mode_t`, which is narrower than `i_mode` on darwin.
+        HyperFileMode::from_mode(FileMode::from(self.i_mode as _))
     }
 
     pub fn is_attr_dirty(&self) -> bool {
@@ -267,33 +274,66 @@ impl Inode {
         // over a field they only report.
         let meta_config = HyperFileMetaConfig::try_from_u32(self.i_meta_config).unwrap_or_default();
         let mut stat: libc::stat = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        stat.st_dev = dev;
+        // Fields whose width is the same on every target we build for.
         stat.st_ino = self.i_ino;
-        #[cfg(target_arch = "x86_64")]
-        {
-            stat.st_nlink = self.i_nlink;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            stat.st_nlink = self.i_nlink as u32;
-        }
-        stat.st_mode = self.i_mode;
         stat.st_uid = self.i_uid;
         stat.st_gid = self.i_gid;
+        stat.st_size = self.i_size as i64;
+        stat.st_blocks = self.i_blocks as i64;
+
         // A char/block device node persists its rdev in i_last_cno (it has no
         // segments, so that slot is free); other inodes use the passed value.
-        let fmt = self.i_mode & libc::S_IFMT;
-        stat.st_rdev = if fmt == libc::S_IFCHR || fmt == libc::S_IFBLK { self.i_last_cno } else { rdev };
-        stat.st_size = self.i_size as i64;
-        #[cfg(target_arch = "x86_64")]
+        let fmt = self.i_mode & Self::S_IFMT;
+        let rdev = if fmt == libc::S_IFCHR as u32 || fmt == libc::S_IFBLK as u32 {
+            self.i_last_cno
+        } else {
+            rdev
+        };
+
+        // The rest have a width that varies, and not only across operating systems:
+        // within Linux, `nlink_t` is 64-bit on x86_64 and 32-bit on aarch64, and
+        // `blksize_t` likewise. darwin narrows further -- `mode_t` and `nlink_t` to
+        // 16-bit, `dev_t` to a *signed* 32-bit.
+        //
+        // Each target spells its own widths out, and one that is not listed fails to
+        // build. The previous form named x86_64 and aarch64 and stopped: on any other
+        // architecture neither arm compiled, so `st_nlink` and `st_blksize` kept the
+        // zero they were initialised with and nothing said so.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
+            stat.st_dev = dev;
+            stat.st_rdev = rdev;
+            stat.st_mode = self.i_mode;
+            stat.st_nlink = self.i_nlink;
             stat.st_blksize = meta_config.data_block_size as i64;
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         {
+            stat.st_dev = dev;
+            stat.st_rdev = rdev;
+            stat.st_mode = self.i_mode;
+            stat.st_nlink = self.i_nlink as u32;
             stat.st_blksize = meta_config.data_block_size as i32;
         }
-        stat.st_blocks = self.i_blocks as i64;
+        #[cfg(target_vendor = "apple")]
+        {
+            stat.st_dev = dev as i32;
+            stat.st_rdev = rdev as i32;
+            stat.st_mode = self.i_mode as u16;
+            stat.st_nlink = self.i_nlink as u16;
+            stat.st_blksize = meta_config.data_block_size as i32;
+            // `st_birthtime` and `st_flags` have no counterpart in the inode and keep
+            // the zero above, so a macOS caller reads the epoch as the creation time.
+        }
+        #[cfg(not(any(
+            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+            target_vendor = "apple",
+        )))]
+        compile_error!(
+            "`libc::stat`'s field widths are not known for this target. Add an arm \
+             giving the widths of st_dev, st_rdev, st_mode, st_nlink and st_blksize \
+             rather than letting them keep the zero they are initialised with."
+        );
         stat.st_atime = self.i_atime as i64;
         stat.st_atime_nsec = self.i_atime_nsec as i64;
         stat.st_mtime = self.i_mtime as i64;
@@ -305,15 +345,11 @@ impl Inode {
 
     pub fn update_stat(&mut self, stat: &libc::stat) -> libc::stat {
         self.i_ino = stat.st_ino;
-        #[cfg(target_arch = "x86_64")]
-        {
-            self.i_nlink = stat.st_nlink;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.i_nlink = stat.st_nlink as u64;
-        }
-        self.i_mode = stat.st_mode;
+        // No platform arms in this direction: the target width is the inode's own and
+        // fixed, so every host's `nlink_t` and `mode_t` -- 64, 32 or 16 bit -- widens
+        // into it with the same cast.
+        self.i_nlink = stat.st_nlink as u64;
+        self.i_mode = stat.st_mode as u32;
         self.i_uid = stat.st_uid;
         self.i_gid = stat.st_gid;
         self.i_size = stat.st_size as u64;

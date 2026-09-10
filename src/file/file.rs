@@ -889,7 +889,8 @@ impl<'a, T, L, C> HyperFile<'a, T, L, C>
         let raw = inode.to_raw(raw_inode.i_bmap);
         let od_state = inode.get_ondisk_state();
         let _ = staging.flush_inode(raw.as_u8_slice(), od_state, FlushInodeFlag::Update).await?;
-        Ok(inode.to_stat(stat.st_dev, stat.st_rdev))
+        // `to_stat` takes the inode's own width; `dev_t` is a signed 32-bit on darwin.
+        Ok(inode.to_stat(stat.st_dev as u64, stat.st_rdev as u64))
     }
 
     pub async fn update_stat(&mut self, stat: &libc::stat) -> Result<libc::stat> {
